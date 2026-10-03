@@ -60,6 +60,11 @@ export async function getBuilderStatus(
     logger.warn("Builder status not available in beacon node");
     return null;
   } catch (e) {
+    if (e instanceof ApiError && e.status === HttpStatusCode.BAD_REQUEST) {
+      // A builder resolved ahead of the fork is not known to the beacon node until the first Gloas block is the head
+      logger.debug("Builder registry is not available at head yet");
+      return null;
+    }
     logger.warn("Couldn't fetch the builder", {}, e as Error);
     return null;
   }

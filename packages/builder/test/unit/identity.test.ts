@@ -57,6 +57,13 @@ describe("Identity", () => {
     );
   });
 
+  it("does not warn if the head state is not a Gloas state yet", async () => {
+    api.beacon.getStateBuilders.mockResolvedValue(await mockApiErrorResponse(400));
+    const res = await getBuilderStatus(api, logger, index);
+    expect(res).toBeNull();
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
   it("distinguishes an empty successful status response from a beacon node failure", async () => {
     api.beacon.getStateBuilders.mockResolvedValue(
       mockApiResponse({data: [], meta: {executionOptimistic: true, finalized: false}})
