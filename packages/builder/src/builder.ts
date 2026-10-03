@@ -198,6 +198,7 @@ export class Builder {
         config,
         logger,
         clock,
+        ledger,
         bidSelector: new BidSelector({config, ledger, builderIndex: index}),
         payloadStore,
         envelopePublisher: new EnvelopePublisher({api, signer: builderSigner, ledger, builderIndex: index}),

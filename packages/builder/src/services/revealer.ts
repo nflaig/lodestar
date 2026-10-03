@@ -1,9 +1,11 @@
 import {ChainForkConfig} from "@lodestar/config";
+import {BUILDER_INDEX_SELF_BUILD} from "@lodestar/params";
 import {IClock} from "@lodestar/state-transition";
 import {BuilderIndex} from "@lodestar/types";
-import {Logger, sleep} from "@lodestar/utils";
+import {Logger, prettyGweiToEth, sleep} from "@lodestar/utils";
 import {defaultOptions} from "../defaults.js";
 import {Metrics, RevealResult} from "../metrics.js";
+import {BidLedger} from "./bidLedger.js";
 import {BidSelector} from "./bidSelector.js";
 import {ObservedBlock} from "./blockObserver.js";
 import {EnvelopePublisher} from "./envelopePublisher.js";
@@ -24,6 +26,7 @@ export type RevealerModules = {
   config: ChainForkConfig;
   logger: Logger;
   clock: IClock;
+  ledger: BidLedger;
   bidSelector: BidSelector;
   payloadStore: PayloadStore;
   envelopePublisher: EnvelopePublisher;
@@ -40,16 +43,28 @@ export class Revealer {
   ) {}
 
   async onBlock(observed: ObservedBlock): Promise<void> {
-    const {bidSelector, clock, config, envelopePublisher, logger, metrics, payloadStore} = this.modules;
+    const {bidSelector, clock, config, envelopePublisher, ledger, logger, metrics, payloadStore} = this.modules;
+    const {blockRoot, slot} = observed;
     const selection = bidSelector.match(observed);
     if (selection.status !== "selected") {
+      const bids = ledger.getBidsForSlot(slot);
+      if (bids.length > 0) {
+        const {builderIndex, value} = observed.signedBid.message;
+        logger.info("Execution payload bid not selected", {
+          slot,
+          blockRoot,
+          value: prettyGweiToEth(Math.max(...bids.map((bid) => bid.valueGwei))),
+          selectedBuilderIndex: builderIndex === BUILDER_INDEX_SELF_BUILD ? "self-build" : builderIndex,
+          selectedValue: prettyGweiToEth(value),
+        });
+      }
       return;
     }
     metrics?.bids.won.inc();
 
-    const {blockRoot, slot} = observed;
     const {blockHash} = selection.bid;
     const logCtx = {slot, blockRoot, blockHash};
+    logger.info("Execution payload bid selected", {...logCtx, value: prettyGweiToEth(selection.bid.valueGwei)});
 
     const storedPayload = payloadStore.get(blockHash);
     if (storedPayload === null) {

@@ -121,6 +121,7 @@ describe("Revealer", () => {
     });
     expect(ledger.hasPublishedReveal(observed.blockRoot)).toBe(true);
     expect(ledger.getUnsettledValueGwei(0)).toBe(5);
+    expect(logger.info).toHaveBeenCalledWith("Execution payload bid selected", expect.objectContaining({slot}));
   });
 
   it("ignores a block that selected another builder", async () => {
@@ -132,6 +133,20 @@ describe("Revealer", () => {
 
     expect(api.beacon.publishExecutionPayloadEnvelope).not.toHaveBeenCalled();
     expect(ledger.getUnsettledValueGwei(0)).toBe(0);
+    expect(logger.info).toHaveBeenCalledExactlyOnceWith(
+      "Execution payload bid not selected",
+      expect.objectContaining({slot, selectedBuilderIndex: builderIndex + 1})
+    );
+  });
+
+  it("does not log a block of a slot it did not bid on", async () => {
+    const observed = selectedBlock({recordBid: false});
+    observed.signedBid.message.builderIndex = builderIndex + 1;
+    observed.blockRoot = toRootHex(ssz.gloas.BeaconBlock.hashTreeRoot(observed.block.message));
+
+    await revealer.onBlock(observed);
+
+    expect(logger.info).not.toHaveBeenCalled();
   });
 
   it("records the win but cannot reveal a payload that is not retained", async () => {
