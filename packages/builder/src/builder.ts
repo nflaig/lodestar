@@ -127,6 +127,7 @@ export class Builder {
     this.clock.runEveryEpoch((epoch) => this.builderStatusTracker.poll(epoch));
     this.clock.start(this.controller.signal);
     this.subscribeToEvents(opts.api);
+    void this.fetchProposerPreferences(opts.api);
 
     this.logger.info("Builder client initialized", {
       index: this.index,
@@ -264,6 +265,24 @@ export class Builder {
     this.proposerPreferencesTracker.prune(slot);
     this.ledger.settlePaymentsBefore(slot - PAYMENT_SETTLEMENT_SLOTS);
     this.ledger.prune(slot);
+  }
+
+  /**
+   * Proposer preferences are only broadcast once, the ones broadcast before the builder subscribed
+   * to them are fetched from the beacon node
+   */
+  private async fetchProposerPreferences(api: ApiClient): Promise<void> {
+    try {
+      const preferences = (await api.beacon.getProposerPreferences()).value();
+      for (const signedProposerPreferences of preferences) {
+        this.proposerPreferencesTracker.onProposerPreferences(signedProposerPreferences);
+      }
+      this.logger.info("Fetched proposer preferences from the beacon node", {count: preferences.length});
+    } catch (e) {
+      if (!isErrorAborted(e)) {
+        this.logger.warn("Unable to fetch proposer preferences from the beacon node", {}, e as Error);
+      }
+    }
   }
 
   private subscribeToEvents(api: ApiClient): void {

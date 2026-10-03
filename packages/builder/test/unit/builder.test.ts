@@ -140,6 +140,36 @@ describe("Builder", () => {
     expect(api.events.eventstream).toHaveBeenCalledOnce();
   });
 
+  it("fetches the proposer preferences known by the beacon node on start", async () => {
+    const preferences = ssz.gloas.SignedProposerPreferences.defaultValue();
+    preferences.message.proposalSlot = 2;
+    api.beacon.getProposerPreferences.mockResolvedValue(
+      mockApiResponse({data: [preferences], meta: {version: ForkName.gloas}})
+    );
+
+    new Builder(modules);
+
+    await vi.waitFor(() =>
+      expect(logger.info).toHaveBeenCalledWith("Fetched proposer preferences from the beacon node", {count: 1})
+    );
+    expect(modules.proposerPreferencesTracker.get(2, toRootHex(preferences.message.dependentRoot))).toBe(preferences);
+  });
+
+  it("starts without the proposer preferences of the beacon node if they can not be fetched", async () => {
+    api.beacon.getProposerPreferences.mockRejectedValue(new Error("not found"));
+
+    new Builder(modules);
+
+    await vi.waitFor(() =>
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Unable to fetch proposer preferences from the beacon node",
+        {},
+        expect.any(Error)
+      )
+    );
+    expect(api.events.eventstream).toHaveBeenCalledOnce();
+  });
+
   it("dispatches payload attributes to the bidder and observed blocks to the revealer", async () => {
     const onPayloadAttributes = vi.spyOn(modules.bidder, "onPayloadAttributes").mockResolvedValue();
     const onBlock = vi.spyOn(modules.revealer, "onBlock").mockResolvedValue();
