@@ -50,7 +50,8 @@ export class BuilderRestApiServer extends RestApiServer {
 
       const {slot, proposer_pubkey: proposer} = (req.params ?? {}) as {slot?: number; proposer_pubkey?: string};
       const dateMs = Number(req.headers[DATE_MILLISECONDS_HEADER]);
-      const logCtx = {
+      // Routes without path params or timing headers only log the fields they have
+      const logCtx = removeUndefined({
         operationId,
         status: res.statusCode,
         slot,
@@ -62,7 +63,7 @@ export class BuilderRestApiServer extends RestApiServer {
         // Time the request took to arrive, based on the send time reported by the caller
         transitMs: Number.isFinite(dateMs) ? Math.round(Date.now() - res.elapsedTime - dateMs) : undefined,
         durationMs: Math.round(res.elapsedTime),
-      };
+      });
 
       if (operationId === "getExecutionPayloadBid" || operationId === "submitSignedBeaconBlock") {
         this.logger.info("Builder API request", logCtx);
@@ -88,4 +89,8 @@ export class BuilderRestApiServer extends RestApiServer {
 function firstHeaderValue(value: string | string[] | undefined): string | undefined {
   const first = Array.isArray(value) ? value[0] : value;
   return first?.split(",")[0].trim();
+}
+
+function removeUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
+  return Object.fromEntries(Object.entries(obj).filter(([_, value]) => value !== undefined)) as Partial<T>;
 }

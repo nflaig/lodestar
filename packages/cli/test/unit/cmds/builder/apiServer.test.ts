@@ -103,6 +103,39 @@ describe("cmds / builder / api server", () => {
     expect(context.transitMs).toBeGreaterThanOrEqual(40);
   });
 
+  it("only logs the fields a request has", async () => {
+    const logger = testLogger();
+    const info = vi.spyOn(logger, LogLevel.info);
+    server = new TestBuilderRestApiServer(
+      {},
+      {
+        config,
+        logger,
+        metrics: null,
+        api: {
+          status: vi.fn(),
+          getExecutionPayloadBid: vi.fn(),
+          submitSignedBeaconBlock: vi.fn().mockResolvedValue({status: 202}),
+          submitBuilderPreferences: vi.fn(),
+        },
+      }
+    );
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/eth/v1/builder/beacon_blocks",
+      headers: {"Eth-Consensus-Version": "gloas", "User-Agent": "Lodestar/v1.0.0"},
+      payload: ssz.gloas.SignedBeaconBlock.toJson(ssz.gloas.SignedBeaconBlock.defaultValue()) as object,
+    });
+
+    expect(res.statusCode).toBe(202);
+    const context = info.mock.calls.find(([message]) => message === "Builder API request")?.[1] as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(context).sort()).toEqual(["durationMs", "ip", "operationId", "status", "userAgent"]);
+  });
+
   it("returns the status code of a rejected request", async () => {
     const submitBuilderPreferences = vi.fn().mockRejectedValue(new ApiError(401, "signature verification failed"));
 
