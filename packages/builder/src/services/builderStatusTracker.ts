@@ -17,11 +17,20 @@ export class BuilderStatusTracker {
   private status?: BuilderStatus;
   private balanceGwei?: number;
 
-  constructor(api: ApiClient, logger: Logger, index: BuilderIndex, metrics: Metrics | null) {
+  constructor(
+    api: ApiClient,
+    logger: Logger,
+    index: BuilderIndex,
+    metrics: Metrics | null,
+    /** Status the builder was resolved with, the beacon node can't be polled for it before the first Gloas block */
+    initial?: {status: BuilderStatus; balance: number}
+  ) {
     this.api = api;
     this.logger = logger;
     this.index = index;
     this.metrics = metrics;
+    this.status = initial?.status;
+    this.balanceGwei = initial?.balance;
   }
 
   async poll(currentEpoch: Epoch) {
