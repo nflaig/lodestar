@@ -3,7 +3,7 @@ import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {routes} from "@lodestar/api";
 import {createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
-import {ForkName} from "@lodestar/params";
+import {ForkName, SLOTS_PER_EPOCH} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
 import {ErrorAborted, defer, toRootHex} from "@lodestar/utils";
 import {Builder, BuilderModules} from "../../src/builder.js";
@@ -137,6 +137,51 @@ describe("Builder", () => {
     onEvent({type: EventType.proposerPreferences, message: {version, data: preferences}});
     expect(modules.proposerPreferencesTracker.get(0, root)).toBe(preferences);
     expect(api.events.eventstream).toHaveBeenCalledOnce();
+  });
+
+  it("dispatches payload attributes to the bidder and observed blocks to the revealer", async () => {
+    const onPayloadAttributes = vi.spyOn(modules.bidder, "onPayloadAttributes").mockResolvedValue();
+    const onBlock = vi.spyOn(modules.revealer, "onBlock").mockResolvedValue();
+    const block = ssz.gloas.SignedBeaconBlock.defaultValue();
+    api.beacon.getBlockV2.mockResolvedValue(
+      mockApiResponse({data: block, meta: {version: ForkName.gloas, executionOptimistic: false, finalized: false}})
+    );
+    new Builder(modules);
+    const {onEvent} = api.events.eventstream.mock.calls[0][0];
+
+    const payloadAttributes = {version: ForkName.gloas, data: ssz.gloas.SSEPayloadAttributes.defaultValue()};
+    onEvent({type: EventType.payloadAttributes, message: payloadAttributes});
+    expect(onPayloadAttributes).toHaveBeenCalledExactlyOnceWith(payloadAttributes);
+
+    const blockRoot = toRootHex(Buffer.alloc(32, 1));
+    onEvent({type: EventType.block, message: {slot: 0, block: blockRoot, executionOptimistic: false}});
+    await vi.waitFor(() => expect(onBlock).toHaveBeenCalledOnce());
+    expect(onBlock.mock.calls[0][0]).toMatchObject({
+      blockRoot,
+      slot: 0,
+      signedBid: block.message.body.signedExecutionPayloadBid,
+    });
+  });
+
+  it("settles and prunes won bids on slot ticks", async () => {
+    const bid = {
+      slot: 1,
+      parentBlockHash: toRootHex(Buffer.alloc(32, 2)),
+      parentBlockRoot: toRootHex(Buffer.alloc(32, 3)),
+      blockHash: toRootHex(Buffer.alloc(32, 4)),
+      valueGwei: 5,
+      signedBidRoot: toRootHex(Buffer.alloc(32, 5)),
+    };
+    modules.ledger.recordBid(bid);
+    modules.ledger.recordWin(bid, toRootHex(Buffer.alloc(32, 6)));
+    new Builder(modules);
+
+    await clock.tickSlotFns(bid.slot + 3 * SLOTS_PER_EPOCH, controller.signal);
+    expect(modules.ledger.getUnsettledValueGwei(0)).toBe(bid.valueGwei);
+
+    await clock.tickSlotFns(bid.slot + 3 * SLOTS_PER_EPOCH + 1, controller.signal);
+    expect(modules.ledger.getUnsettledValueGwei(0)).toBe(0);
+    expect(modules.ledger.getBidsForSlot(bid.slot)).toEqual([]);
   });
 
   it("does not block preferences while a block consumer is pending", async () => {
