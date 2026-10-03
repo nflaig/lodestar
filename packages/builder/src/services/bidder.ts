@@ -71,6 +71,8 @@ export class Bidder {
       return;
     }
 
+    // TODO: the beacon node emits payload attributes once per slot, late in the slot and only for the parent
+    // payload variant it would build on, revisit to start the build earlier and to bid on both variants
     const buildId = `${slot}:${parentBlockRoot}:${parentBlockHash}`;
     if (this.activeBuilds.has(buildId) || ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)) {
       return;
