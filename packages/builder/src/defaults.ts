@@ -7,6 +7,7 @@ export const defaultOptions = {
     /** Share of the payload value offered to the proposer */
     shareBps: 9000,
     fixedCostGwei: 0,
+    subsidyGwei: 0,
     minValueGwei: 0,
     /** Retrieve the payload and publish the bid at 95% of the slot before the proposal slot */
     deadlineBps: 9500,

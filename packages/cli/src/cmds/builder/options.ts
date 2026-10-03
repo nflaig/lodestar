@@ -26,6 +26,7 @@ export type IBuilderCliArgs = LogArgs & {
 
   "bidding.shareBps": number;
   "bidding.fixedCostGwei": number;
+  "bidding.subsidyGwei": number;
   "bidding.minValueGwei": number;
   "bidding.maxValueGwei"?: number;
   "bidding.deadlineBps": number;
@@ -138,6 +139,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     description: "Fixed amount in gwei deducted from the proposer share of every bid",
     type: "number",
     default: defaultOptions.bidding.fixedCostGwei,
+    group: "bidding",
+  },
+
+  "bidding.subsidyGwei": {
+    description: "Fixed amount in gwei added on top of the proposer share of every bid, paid from the builder balance",
+    type: "number",
+    default: defaultOptions.bidding.subsidyGwei,
     group: "bidding",
   },
 
