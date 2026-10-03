@@ -34,4 +34,16 @@ export class BuilderRestApiServer extends RestApiServer {
       this.server.route(routes[operationId] as FastifyRoute<Endpoint>);
     }
   }
+
+  /** Unlike the other REST API servers, the builder API is meant to be reachable by untrusted proposers */
+  async listen(): Promise<void> {
+    try {
+      await this.server.listen({port: this.opts.port, host: this.opts.address});
+      const {address, port} = this.server.addresses()[0];
+      this.logger.info("Started builder API server", {address: `http://${address}:${port}`});
+    } catch (e) {
+      this.logger.error("Error starting builder API server", this.opts, e as Error);
+      throw e;
+    }
+  }
 }
