@@ -1,6 +1,6 @@
 import {Endpoint} from "@lodestar/api";
 import {BuilderApiMethods, getRoutes} from "@lodestar/api/builder/server";
-import {FastifyRoute} from "@lodestar/api/server";
+import {ApiError, FastifyRoute} from "@lodestar/api/server";
 import {RestApiServer, RestApiServerModules, RestApiServerOpts} from "@lodestar/beacon-node";
 import {BuilderApi} from "@lodestar/builder";
 import {ChainForkConfig} from "@lodestar/config";
@@ -23,6 +23,44 @@ export type BuilderRestApiServerModules = RestApiServerModules & {
   config: ChainForkConfig;
   api: BuilderApi;
 };
+
+/**
+ * Builder API that can be served before the builder is initialized. Until then the builder is reported
+ * as healthy, has no bids and does not accept requests it would have to validate.
+ */
+export function getBuilderApiBeforeInit(config: ChainForkConfig, getBuilderApi: () => BuilderApi | null): BuilderApi {
+  return {
+    async status(args, context) {
+      return getBuilderApi()?.status(args, context);
+    },
+
+    async getExecutionPayloadBid(args, context) {
+      return (
+        getBuilderApi()?.getExecutionPayloadBid(args, context) ?? {
+          data: undefined,
+          meta: {version: config.getForkName(args.slot)},
+          status: 204,
+        }
+      );
+    },
+
+    async submitSignedBeaconBlock(args, context) {
+      const builderApi = getBuilderApi();
+      if (builderApi === null) {
+        throw new ApiError(503, "Builder is not ready");
+      }
+      return builderApi.submitSignedBeaconBlock(args, context);
+    },
+
+    async submitBuilderPreferences(args, context) {
+      const builderApi = getBuilderApi();
+      if (builderApi === null) {
+        throw new ApiError(503, "Builder is not ready");
+      }
+      return builderApi.submitBuilderPreferences(args, context);
+    },
+  };
+}
 
 export class BuilderRestApiServer extends RestApiServer {
   constructor(optsArg: Partial<RestApiServerOpts>, modules: BuilderRestApiServerModules) {
