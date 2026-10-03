@@ -61,6 +61,7 @@ describe("Builder", () => {
       clock,
       index: 1,
       payloadStore,
+      builderApi: null,
       ...createBiddingModules({
         api,
         config,

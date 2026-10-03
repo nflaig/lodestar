@@ -2,6 +2,7 @@ import {defaultExecutionEngineHttpOpts} from "@lodestar/beacon-node";
 import {defaultOptions} from "@lodestar/builder";
 import {CliCommandOptions} from "@lodestar/utils";
 import {LogArgs, logOptions} from "../../options/logOptions.js";
+import {builderRestApiServerOptsDefault} from "./apiServer.js";
 
 export const builderMetricsDefaultOptions = {
   enabled: false,
@@ -37,6 +38,12 @@ export type IBuilderCliArgs = LogArgs & {
   "adversarial.withhold.executionPayload": boolean;
   "adversarial.delay.executionPayload": boolean;
   "adversarial.delay.executionPayloadBps": number;
+
+  builderApi?: boolean;
+  "builderApi.port"?: number;
+  "builderApi.address"?: string;
+  "builderApi.publicUrl"?: string;
+  "builderApi.authData"?: string;
 
   metrics?: boolean;
   "metrics.port"?: number;
@@ -221,6 +228,43 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
       "ADVERSARIAL (devnet test only): target time within the slot for the delayed execution payload reveal, in basis points of the slot duration",
     default: defaultOptions.reveal.adversarialDelayExecutionPayloadBps,
     group: "adversarial",
+  },
+
+  // Builder API
+
+  builderApi: {
+    type: "boolean",
+    description: "Enable builder API server, proposers can request the published bids from it directly",
+    default: false,
+    group: "builderApi",
+  },
+
+  "builderApi.port": {
+    type: "number",
+    description: "Set port for builder API",
+    defaultDescription: String(builderRestApiServerOptsDefault.port),
+    group: "builderApi",
+  },
+
+  "builderApi.address": {
+    type: "string",
+    description: "Set host for builder API",
+    defaultDescription: builderRestApiServerOptsDefault.address,
+    group: "builderApi",
+  },
+
+  "builderApi.publicUrl": {
+    type: "string",
+    description:
+      "URL proposers reach the builder API at. Proposers must sign their requests with its hostname as auth data unless `--builderApi.authData` is set",
+    group: "builderApi",
+  },
+
+  "builderApi.authData": {
+    type: "string",
+    description:
+      "Auth data agreed with proposers out of band as a hex string, proposers must sign their requests with it. Takes precedence over the hostname of `--builderApi.publicUrl`",
+    group: "builderApi",
   },
 
   // Metrics

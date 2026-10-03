@@ -55,6 +55,7 @@ describe("Builder preference tracking", () => {
       clock,
       index: 1,
       payloadStore,
+      builderApi: null,
       ...createBiddingModules({
         api,
         config,
