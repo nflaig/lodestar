@@ -15,6 +15,8 @@ export type ProportionalBidPolicyOpts = {
   shareBps: number;
   /** Fixed amount deducted from the share, e.g. to cover operating cost */
   fixedCostGwei: number;
+  /** Fixed amount added on top of the share, paid from the builder balance */
+  subsidyGwei?: number;
   /** Never bid below this value */
   minValueGwei: number;
   /** Never bid above this value */
@@ -22,8 +24,8 @@ export type ProportionalBidPolicyOpts = {
 };
 
 /**
- * Offers a fixed share of the payload value, bounded by the configured limits and the
- * builder's coverable balance. Independent of competing bids.
+ * Offers a fixed share of the payload value plus an optional subsidy, bounded by the configured
+ * limits and the builder's coverable balance. Independent of competing bids.
  */
 export class ProportionalBidPolicy implements BidPolicy {
   constructor(private readonly opts: ProportionalBidPolicyOpts) {
@@ -33,6 +35,10 @@ export class ProportionalBidPolicy implements BidPolicy {
 
     if (!Number.isSafeInteger(opts.fixedCostGwei) || opts.fixedCostGwei < 0) {
       throw Error(`Invalid fixedCostGwei=${opts.fixedCostGwei}, must be a non-negative safe integer`);
+    }
+
+    if (opts.subsidyGwei !== undefined && (!Number.isSafeInteger(opts.subsidyGwei) || opts.subsidyGwei < 0)) {
+      throw Error(`Invalid subsidyGwei=${opts.subsidyGwei}, must be a non-negative safe integer`);
     }
 
     if (!Number.isSafeInteger(opts.minValueGwei) || opts.minValueGwei < 0) {
@@ -51,7 +57,7 @@ export class ProportionalBidPolicy implements BidPolicy {
 
   computeValue({payloadValueGwei, coverableGwei}: BidContext): number | null {
     const proportionalValue = Number((BigInt(payloadValueGwei) * BigInt(this.opts.shareBps)) / 10_000n);
-    const share = proportionalValue - this.opts.fixedCostGwei;
+    const share = proportionalValue - this.opts.fixedCostGwei + (this.opts.subsidyGwei ?? 0);
     // This will override `fixedCostGwei` for the sake of fulfilling `minValueGwei`
     let value = Math.max(this.opts.minValueGwei, share);
     if (this.opts.maxValueGwei !== undefined) {
