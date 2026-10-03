@@ -1,7 +1,8 @@
 import {ChainForkConfig} from "@lodestar/config";
 import {IClock} from "@lodestar/state-transition";
 import {BuilderIndex} from "@lodestar/types";
-import {Logger} from "@lodestar/utils";
+import {Logger, sleep} from "@lodestar/utils";
+import {defaultOptions} from "../defaults.js";
 import {Metrics, RevealResult} from "../metrics.js";
 import {BidSelector} from "./bidSelector.js";
 import {ObservedBlock} from "./blockObserver.js";
@@ -12,6 +13,11 @@ import {PayloadStore} from "./payloadStore.js";
 export type RevealerOptions = {
   /** Do not reveal after this point within the block's slot, in basis points */
   cutoffBps: number;
+  /** Devnet test only, never reveal the payload of a selected bid */
+  adversarialWithholdExecutionPayload?: boolean;
+  /** Devnet test only, hold the reveal until adversarialDelayExecutionPayloadBps within the block's slot */
+  adversarialDelayExecutionPayload?: boolean;
+  adversarialDelayExecutionPayloadBps?: number;
 };
 
 export type RevealerModules = {
@@ -60,12 +66,26 @@ export class Revealer {
       return;
     }
 
+    if (this.opts.adversarialWithholdExecutionPayload) {
+      logger.warn("ADVERSARIAL: Withholding execution payload", logCtx);
+      metrics?.reveals.total.inc({result: RevealResult.withheld});
+      return;
+    }
+
     const contents = createExecutionPayloadEnvelopeContents({
       blockRoot,
       builderIndex: this.modules.builderIndex,
       selectedBid: observed.signedBid.message,
       storedPayload,
     });
+
+    if (this.opts.adversarialDelayExecutionPayload) {
+      const delayBps =
+        this.opts.adversarialDelayExecutionPayloadBps ?? defaultOptions.reveal.adversarialDelayExecutionPayloadBps;
+      const delayMs = Math.max(config.getSlotComponentDurationMs(delayBps) - msFromSlot, 0);
+      logger.warn("ADVERSARIAL: Delaying execution payload reveal", {...logCtx, delayBps, delayMs});
+      await sleep(delayMs, this.modules.signal);
+    }
 
     try {
       await envelopePublisher.publish(contents, this.modules.signal);

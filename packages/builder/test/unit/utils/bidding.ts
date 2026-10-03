@@ -15,7 +15,7 @@ import {PayloadOrchestrator} from "../../../src/services/payloadOrchestrator.js"
 import {PayloadSource} from "../../../src/services/payloadSource.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
 import {ProposerPreferencesTracker} from "../../../src/services/proposerPreferencesTracker.js";
-import {Revealer} from "../../../src/services/revealer.js";
+import {Revealer, RevealerOptions} from "../../../src/services/revealer.js";
 
 export const biddingOptions = {
   shareBps: 9000,
@@ -46,6 +46,7 @@ export function createBiddingModules({
   signal,
   index = 1,
   getBuilderStatus = () => ({status: "active", balance: 10_000_000_000}),
+  revealOptions,
 }: {
   api: ApiClient;
   config: ChainForkConfig;
@@ -58,6 +59,7 @@ export function createBiddingModules({
   signal: AbortSignal;
   index?: BuilderIndex;
   getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined};
+  revealOptions?: Partial<RevealerOptions>;
 }): {ledger: BidLedger; bidder: Bidder; revealer: Revealer} {
   const ledger = new BidLedger();
   const bidder = new Bidder(
@@ -103,7 +105,7 @@ export function createBiddingModules({
       metrics: null,
       signal,
     },
-    {cutoffBps: config.PAYLOAD_ATTESTATION_DUE_BPS}
+    {cutoffBps: config.PAYLOAD_ATTESTATION_DUE_BPS, ...revealOptions}
   );
   return {ledger, bidder, revealer};
 }

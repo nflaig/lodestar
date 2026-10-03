@@ -15,4 +15,9 @@ export const defaultOptions = {
     /** Do not bid when the builder balance falls below this, 1.1 ETH leaves headroom above MIN_DEPOSIT_AMOUNT */
     minOperatingBalanceGwei: 1_100_000_000,
   },
+
+  reveal: {
+    /** Past the payload attestation deadline, the PTC votes the payload as not present */
+    adversarialDelayExecutionPayloadBps: 8000,
+  },
 };

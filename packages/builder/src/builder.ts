@@ -21,7 +21,7 @@ import {PayloadOrchestrator} from "./services/payloadOrchestrator.js";
 import {PayloadSource} from "./services/payloadSource.js";
 import {PayloadStore} from "./services/payloadStore.js";
 import {ProposerPreferencesTracker} from "./services/proposerPreferencesTracker.js";
-import {Revealer} from "./services/revealer.js";
+import {Revealer, RevealerOptions} from "./services/revealer.js";
 
 // Payments of won bids are reflected in the builder balance after this many slots
 const PAYMENT_SETTLEMENT_SLOTS = 3 * SLOTS_PER_EPOCH;
@@ -57,7 +57,7 @@ export type BuilderOptions = {
       /** Maximum time in milliseconds to wait for payload retrieval at the bid deadline */
       getPayloadTimeout: number;
     };
-  reveal: {
+  reveal: Omit<RevealerOptions, "cutoffBps"> & {
     /** Defaults to PAYLOAD_ATTESTATION_DUE_BPS of the network */
     cutoffBps?: number;
   };
@@ -205,7 +205,7 @@ export class Builder {
         metrics: opts.metrics,
         signal,
       },
-      {cutoffBps: opts.reveal.cutoffBps ?? config.PAYLOAD_ATTESTATION_DUE_BPS}
+      {...opts.reveal, cutoffBps: opts.reveal.cutoffBps ?? config.PAYLOAD_ATTESTATION_DUE_BPS}
     );
 
     return new Builder({

@@ -127,7 +127,12 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       getPayloadTimeout: args["bidding.getPayloadTimeout"],
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
-    reveal: {cutoffBps: args["reveal.cutoffBps"]},
+    reveal: {
+      cutoffBps: args["reveal.cutoffBps"],
+      adversarialWithholdExecutionPayload: args["adversarial.withhold.executionPayload"],
+      adversarialDelayExecutionPayload: args["adversarial.delay.executionPayload"],
+      adversarialDelayExecutionPayloadBps: args["adversarial.delay.executionPayloadBps"],
+    },
   });
 
   onGracefulShutdownCbs.push(() => builder.close());

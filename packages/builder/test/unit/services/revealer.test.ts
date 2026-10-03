@@ -1,4 +1,4 @@
-import {beforeEach, describe, expect, it, vi} from "vitest";
+import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
@@ -10,7 +10,7 @@ import {ObservedBlock} from "../../../src/services/blockObserver.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
 import {ProposerPreferencesTracker} from "../../../src/services/proposerPreferencesTracker.js";
-import {Revealer} from "../../../src/services/revealer.js";
+import {Revealer, RevealerOptions} from "../../../src/services/revealer.js";
 import {getApiClientStub, mockApiResponse} from "../utils/apiStub.js";
 import {createBiddingModules, getPayloadSourceStub} from "../utils/bidding.js";
 import {ClockMock} from "../utils/clock.js";
@@ -35,6 +35,14 @@ describe("Revealer", () => {
     logger = getMockedLogger();
     clock = new ClockMock();
     payloadStore = new PayloadStore();
+    createRevealer();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function createRevealer(revealOptions?: Partial<RevealerOptions>): void {
     const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1));
     ({ledger, revealer} = createBiddingModules({
       api,
@@ -50,8 +58,9 @@ describe("Revealer", () => {
       payloadSource: getPayloadSourceStub(),
       signal: new AbortController().signal,
       index: builderIndex,
+      revealOptions,
     }));
-  });
+  }
 
   /** Block that selected a bid for a payload, optionally recorded as our bid and retained */
   function selectedBlock({recordBid = true, retainPayload = true} = {}): ObservedBlock {
@@ -146,6 +155,32 @@ describe("Revealer", () => {
     expect(api.beacon.publishExecutionPayloadEnvelope).not.toHaveBeenCalled();
     expect(ledger.hasRevealed(observed.blockRoot)).toBe(false);
     expect(ledger.getUnsettledValueGwei(0)).toBe(5);
+  });
+
+  it("withholds the payload of a selected bid", async () => {
+    createRevealer({adversarialWithholdExecutionPayload: true});
+    const observed = selectedBlock();
+
+    await revealer.onBlock(observed);
+
+    expect(api.beacon.publishExecutionPayloadEnvelope).not.toHaveBeenCalled();
+    expect(ledger.hasRevealed(observed.blockRoot)).toBe(false);
+    expect(ledger.getUnsettledValueGwei(0)).toBe(5);
+  });
+
+  it("delays the reveal until the configured point in the slot", async () => {
+    vi.useFakeTimers();
+    createRevealer({adversarialDelayExecutionPayload: true, adversarialDelayExecutionPayloadBps: 8000});
+    const observed = selectedBlock();
+
+    const revealing = revealer.onBlock(observed);
+    await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(8000) - 1);
+    expect(api.beacon.publishExecutionPayloadEnvelope).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await revealing;
+    expect(api.beacon.publishExecutionPayloadEnvelope).toHaveBeenCalledOnce();
+    expect(ledger.hasPublishedReveal(observed.blockRoot)).toBe(true);
   });
 
   it("rejects a selected bid of our builder that was not recorded", async () => {

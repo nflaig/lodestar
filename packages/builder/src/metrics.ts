@@ -27,6 +27,7 @@ export enum RevealResult {
   published = "published",
   unknownPayload = "unknown_payload",
   late = "late",
+  withheld = "withheld",
   error = "error",
 }
 

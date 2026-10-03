@@ -34,6 +34,10 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.minOperatingBalanceGwei": number;
   "reveal.cutoffBps"?: number;
 
+  "adversarial.withhold.executionPayload": boolean;
+  "adversarial.delay.executionPayload": boolean;
+  "adversarial.delay.executionPayloadBps": number;
+
   metrics?: boolean;
   "metrics.port"?: number;
   "metrics.address"?: string;
@@ -189,6 +193,34 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
       "Do not reveal the payload if the block committing to our bid arrives after this point within its slot, in basis points. Defaults to PAYLOAD_ATTESTATION_DUE_BPS of the network",
     type: "number",
     group: "reveal",
+  },
+
+  // Adversarial
+
+  "adversarial.withhold.executionPayload": {
+    hidden: true,
+    type: "boolean",
+    description: "ADVERSARIAL (devnet test only): never reveal the execution payload of a selected bid",
+    default: false,
+    group: "adversarial",
+  },
+
+  "adversarial.delay.executionPayload": {
+    hidden: true,
+    type: "boolean",
+    description:
+      "ADVERSARIAL (devnet test only): delay revealing the execution payload of a selected bid until the configured point in the slot",
+    default: false,
+    group: "adversarial",
+  },
+
+  "adversarial.delay.executionPayloadBps": {
+    hidden: true,
+    type: "number",
+    description:
+      "ADVERSARIAL (devnet test only): target time within the slot for the delayed execution payload reveal, in basis points of the slot duration",
+    default: defaultOptions.reveal.adversarialDelayExecutionPayloadBps,
+    group: "adversarial",
   },
 
   // Metrics
