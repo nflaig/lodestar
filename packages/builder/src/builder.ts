@@ -157,7 +157,7 @@ export class Builder {
 
     const clock = new Clock(config, logger, {genesisTime: Number(genesis.genesisTime), ...opts.clock});
 
-    const index = await resolveBuilderIdentity(
+    const identity = await resolveBuilderIdentity(
       api,
       logger,
       builderSigner.getPubkeyHex(),
@@ -165,9 +165,16 @@ export class Builder {
       clock,
       config
     );
+    const index = identity.index;
 
-    const builderStatusTracker = new BuilderStatusTracker(api, logger, index, opts.metrics);
-    await builderStatusTracker.poll(clock.getCurrentEpoch());
+    const builderStatusTracker = new BuilderStatusTracker(api, logger, index, opts.metrics, {
+      status: identity.status,
+      balance: identity.builder.balance,
+    });
+    // A builder resolved ahead of the fork is not known to the beacon node yet
+    if (clock.getCurrentEpoch() >= config.GLOAS_FORK_EPOCH) {
+      await builderStatusTracker.poll(clock.getCurrentEpoch());
+    }
     const blockObserver = new BlockObserver(config, logger, api);
     const proposerPreferencesTracker = new ProposerPreferencesTracker();
 

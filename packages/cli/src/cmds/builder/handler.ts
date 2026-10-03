@@ -22,7 +22,7 @@ import {
   parseLoggerArgs,
 } from "../../util/index.js";
 import {getVersionData} from "../../util/version.js";
-import {BuilderRestApiServer} from "./apiServer.js";
+import {BuilderRestApiServer, getBuilderApiBeforeInit} from "./apiServer.js";
 import {loadBuilderKeypair} from "./loadKeypair.js";
 import {IBuilderCliArgs, builderMetricsDefaultOptions} from "./options.js";
 
@@ -110,7 +110,21 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     getPayload: async (fork, payloadId) => (await engine.getPayload(fork, payloadId)) as EnginePayloadResult,
   });
 
-  const builder = await Builder.init({
+  const builderApiOpts = args.builderApi ? {authData: getBuilderApiAuthData(args)} : undefined;
+
+  // The builder is only initialized once it is active, which can take until after the fork. The builder
+  // API is served before that, so proposers can already reach it
+  let builder: Builder | null = null;
+  if (builderApiOpts !== undefined) {
+    const builderApiServer = new BuilderRestApiServer(
+      {address: args["builderApi.address"], port: args["builderApi.port"]},
+      {config, logger, api: getBuilderApiBeforeInit(config, () => builder?.builderApi ?? null), metrics: null}
+    );
+    onGracefulShutdownCbs.push(() => builderApiServer.close());
+    await builderApiServer.listen();
+  }
+
+  builder = await Builder.init({
     keypair,
     logger,
     config,
@@ -129,7 +143,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       getPayloadTimeout: args["bidding.getPayloadTimeout"],
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
-    builderApi: args.builderApi ? {authData: getBuilderApiAuthData(args)} : undefined,
+    builderApi: builderApiOpts,
     reveal: {
       cutoffBps: args["reveal.cutoffBps"],
       adversarialWithholdExecutionPayload: args["adversarial.withhold.executionPayload"],
@@ -138,16 +152,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     },
   });
 
-  onGracefulShutdownCbs.push(() => builder.close());
-
-  if (builder.builderApi !== null) {
-    const builderApiServer = new BuilderRestApiServer(
-      {address: args["builderApi.address"], port: args["builderApi.port"]},
-      {config, logger, api: builder.builderApi, metrics: null}
-    );
-    onGracefulShutdownCbs.push(() => builderApiServer.close());
-    await builderApiServer.listen();
-  }
+  onGracefulShutdownCbs.push(() => builder?.close());
 }
 
 function getBuilderApiAuthData(args: IBuilderCliArgs): Uint8Array {

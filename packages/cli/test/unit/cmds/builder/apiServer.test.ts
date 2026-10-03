@@ -4,7 +4,7 @@ import {BuilderApi} from "@lodestar/builder";
 import {config} from "@lodestar/config/default";
 import {ssz} from "@lodestar/types";
 import {LogLevel, toHex} from "@lodestar/utils";
-import {BuilderRestApiServer} from "../../../../src/cmds/builder/apiServer.js";
+import {BuilderRestApiServer, getBuilderApiBeforeInit} from "../../../../src/cmds/builder/apiServer.js";
 import {testLogger} from "../../../utils.js";
 
 class TestBuilderRestApiServer extends BuilderRestApiServer {
@@ -134,6 +134,44 @@ describe("cmds / builder / api server", () => {
       unknown
     >;
     expect(Object.keys(context).sort()).toEqual(["durationMs", "ip", "operationId", "status", "userAgent"]);
+  });
+
+  it("serves the status and no bids before the builder is initialized", async () => {
+    const getExecutionPayloadBid = vi
+      .fn()
+      .mockResolvedValue({data: ssz.gloas.SignedExecutionPayloadBid.defaultValue(), meta: {version: "gloas"}});
+    let builderApi: BuilderApi | null = null;
+    server = new TestBuilderRestApiServer(
+      {},
+      {config, logger: testLogger(), metrics: null, api: getBuilderApiBeforeInit(config, () => builderApi)}
+    );
+    const root = toHex(Buffer.alloc(32, 2));
+    const bidRequest = {
+      method: "POST" as const,
+      url: `/eth/v1/builder/execution_payload_bid/5/${root}/${root}/${toHex(Buffer.alloc(48, 1))}`,
+      headers: {"Eth-Consensus-Version": "gloas", "Date-Milliseconds": String(Date.now()), "X-Timeout-Ms": "500"},
+      payload: ssz.gloas.SignedBuilderRequestAuth.toJson(ssz.gloas.SignedBuilderRequestAuth.defaultValue()) as object,
+    };
+
+    expect((await server.inject({method: "GET", url: "/eth/v1/builder/status"})).statusCode).toBe(200);
+    expect((await server.inject(bidRequest)).statusCode).toBe(204);
+    const preferences = await server.inject({
+      method: "POST",
+      url: `/eth/v1/builder/builder_preferences/${toHex(Buffer.alloc(48, 1))}`,
+      headers: {"Eth-Consensus-Version": "gloas"},
+      payload: ssz.gloas.BuilderPreferencesRequest.toJson(ssz.gloas.BuilderPreferencesRequest.defaultValue()) as object,
+    });
+    expect(preferences.statusCode).toBe(503);
+
+    builderApi = {
+      status: vi.fn(),
+      getExecutionPayloadBid,
+      submitSignedBeaconBlock: vi.fn(),
+      submitBuilderPreferences: vi.fn(),
+    };
+
+    expect((await server.inject(bidRequest)).statusCode).toBe(200);
+    expect(getExecutionPayloadBid).toHaveBeenCalledOnce();
   });
 
   it("returns the status code of a rejected request", async () => {
