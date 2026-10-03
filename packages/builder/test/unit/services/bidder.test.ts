@@ -7,6 +7,7 @@ import {BuilderStatus, ssz} from "@lodestar/types";
 import {toHex, toRootHex} from "@lodestar/utils";
 import {Bidder, PayloadAttributesEvent} from "../../../src/services/bidder.js";
 import {BidLedger} from "../../../src/services/bidLedger.js";
+import {BidStore} from "../../../src/services/bidStore.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
 import {ProposerPreferencesTracker} from "../../../src/services/proposerPreferencesTracker.js";
@@ -61,6 +62,7 @@ describe("Bidder", () => {
   function createBidder(getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined}): {
     bidder: Bidder;
     ledger: BidLedger;
+    bidStore: BidStore;
   } {
     const config = getConfig(ForkName.gloas);
     const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1));
@@ -105,7 +107,7 @@ describe("Bidder", () => {
 
   it("builds on the emitted parent and publishes a bid at the deadline", async () => {
     addProposerPreferences();
-    const {bidder, ledger} = createBidder();
+    const {bidder, ledger, bidStore} = createBidder();
 
     const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
     await vi.advanceTimersByTimeAsync(msToDeadline - 1);
@@ -145,6 +147,7 @@ describe("Bidder", () => {
     const blockHash = toRootHex(signedExecutionPayloadBid.message.blockHash);
     expect(payloadStore.has(blockHash)).toBe(true);
     expect(ledger.hasSubmitted(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBe(true);
+    expect(bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBe(signedExecutionPayloadBid);
     expect(logger.error).not.toHaveBeenCalled();
   });
 

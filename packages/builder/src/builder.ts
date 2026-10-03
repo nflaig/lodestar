@@ -4,6 +4,7 @@ import {SLOTS_PER_EPOCH} from "@lodestar/params";
 import {Clock, ClockOptions, IClock} from "@lodestar/state-transition";
 import {BuilderIndex, ExecutionAddress} from "@lodestar/types";
 import {Logger, isErrorAborted, toHex, toRootHex} from "@lodestar/utils";
+import {BuilderApi, BuilderApiOptions, getBuilderApi} from "./api/impl.js";
 import {waitForGenesis} from "./genesis.js";
 import {resolveBuilderIdentity} from "./identity.js";
 import {Metrics} from "./metrics.js";
@@ -13,6 +14,7 @@ import {BidLedger} from "./services/bidLedger.js";
 import {ProportionalBidPolicy, ProportionalBidPolicyOpts} from "./services/bidPolicy.js";
 import {BidPublisher} from "./services/bidPublisher.js";
 import {BidSelector} from "./services/bidSelector.js";
+import {BidStore} from "./services/bidStore.js";
 import {BlockObserver} from "./services/blockObserver.js";
 import {BuilderSigner, Keypair} from "./services/builderSigner.js";
 import {BuilderStatusTracker} from "./services/builderStatusTracker.js";
@@ -20,6 +22,7 @@ import {EnvelopePublisher} from "./services/envelopePublisher.js";
 import {PayloadOrchestrator} from "./services/payloadOrchestrator.js";
 import {PayloadSource} from "./services/payloadSource.js";
 import {PayloadStore} from "./services/payloadStore.js";
+import {ProposerDutiesTracker} from "./services/proposerDutiesTracker.js";
 import {ProposerPreferencesTracker} from "./services/proposerPreferencesTracker.js";
 import {Revealer, RevealerOptions} from "./services/revealer.js";
 
@@ -35,9 +38,11 @@ export type BuilderModules = {
   clock: IClock;
   index: BuilderIndex;
   payloadStore: PayloadStore;
+  bidStore: BidStore;
   ledger: BidLedger;
   bidder: Bidder;
   revealer: Revealer;
+  builderApi: BuilderApi | null;
 };
 
 export type BuilderOptions = {
@@ -61,6 +66,8 @@ export type BuilderOptions = {
     /** Defaults to PAYLOAD_ATTESTATION_DUE_BPS of the network */
     cutoffBps?: number;
   };
+  /** The builder API is only served if set */
+  builderApi?: BuilderApiOptions;
 };
 
 /**
@@ -69,6 +76,7 @@ export type BuilderOptions = {
 export class Builder {
   readonly builderSigner: BuilderSigner;
   readonly proposerPreferencesTracker: ProposerPreferencesTracker;
+  readonly builderApi: BuilderApi | null;
   private readonly blockObserver: BlockObserver;
   private readonly builderStatusTracker: BuilderStatusTracker;
   private readonly controller: AbortController;
@@ -77,6 +85,7 @@ export class Builder {
   private readonly logger: Logger;
   private readonly executionFeeRecipient: ExecutionAddress;
   private readonly payloadStore: PayloadStore;
+  private readonly bidStore: BidStore;
   private readonly ledger: BidLedger;
   private readonly bidder: Bidder;
   private readonly revealer: Revealer;
@@ -90,9 +99,11 @@ export class Builder {
     clock,
     index,
     payloadStore,
+    bidStore,
     ledger,
     bidder,
     revealer,
+    builderApi,
   }: BuilderModules) {
     this.builderSigner = builderSigner;
     this.blockObserver = blockObserver;
@@ -103,9 +114,11 @@ export class Builder {
     this.logger = opts.logger;
     this.index = index;
     this.payloadStore = payloadStore;
+    this.bidStore = bidStore;
     this.ledger = ledger;
     this.bidder = bidder;
     this.revealer = revealer;
+    this.builderApi = builderApi;
 
     this.executionFeeRecipient = opts.executionFeeRecipient;
 
@@ -158,6 +171,7 @@ export class Builder {
     const proposerPreferencesTracker = new ProposerPreferencesTracker();
 
     const payloadStore = new PayloadStore();
+    const bidStore = new BidStore();
     const ledger = new BidLedger();
     const signal = opts.abortController.signal;
 
@@ -183,6 +197,7 @@ export class Builder {
           builderIndex: index,
           hasPayload: ({blockHash}) => payloadStore.has(blockHash),
         }),
+        bidStore,
         proposerPreferencesTracker,
         getBuilderStatus: () => builderStatusTracker.getStatus(),
         builderIndex: index,
@@ -209,6 +224,23 @@ export class Builder {
       {...opts.reveal, cutoffBps: opts.reveal.cutoffBps ?? config.PAYLOAD_ATTESTATION_DUE_BPS}
     );
 
+    const builderApi =
+      opts.builderApi !== undefined
+        ? getBuilderApi(
+            {
+              config,
+              logger,
+              clock,
+              api,
+              bidStore,
+              proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
+              builderIndex: index,
+              metrics: opts.metrics,
+            },
+            opts.builderApi
+          )
+        : null;
+
     return new Builder({
       opts,
       builderSigner,
@@ -218,14 +250,17 @@ export class Builder {
       clock,
       index,
       payloadStore,
+      bidStore,
       ledger,
       bidder,
       revealer,
+      builderApi,
     });
   }
 
   private async onSlot(slot: number): Promise<void> {
     this.payloadStore.prune(slot);
+    this.bidStore.prune(slot);
     this.proposerPreferencesTracker.prune(slot);
     this.ledger.settlePaymentsBefore(slot - PAYMENT_SETTLEMENT_SLOTS);
     this.ledger.prune(slot);

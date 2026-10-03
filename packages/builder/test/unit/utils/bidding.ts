@@ -9,6 +9,7 @@ import {BidLedger} from "../../../src/services/bidLedger.js";
 import {ProportionalBidPolicy} from "../../../src/services/bidPolicy.js";
 import {BidPublisher} from "../../../src/services/bidPublisher.js";
 import {BidSelector} from "../../../src/services/bidSelector.js";
+import {BidStore} from "../../../src/services/bidStore.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import {EnvelopePublisher} from "../../../src/services/envelopePublisher.js";
 import {PayloadOrchestrator} from "../../../src/services/payloadOrchestrator.js";
@@ -60,8 +61,9 @@ export function createBiddingModules({
   index?: BuilderIndex;
   getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined};
   revealOptions?: Partial<RevealerOptions>;
-}): {ledger: BidLedger; bidder: Bidder; revealer: Revealer} {
+}): {ledger: BidLedger; bidStore: BidStore; bidder: Bidder; revealer: Revealer} {
   const ledger = new BidLedger();
+  const bidStore = new BidStore();
   const bidder = new Bidder(
     {
       config,
@@ -84,6 +86,7 @@ export function createBiddingModules({
         builderIndex: index,
         hasPayload: ({blockHash}) => payloadStore.has(blockHash),
       }),
+      bidStore,
       proposerPreferencesTracker,
       getBuilderStatus,
       builderIndex: index,
@@ -108,5 +111,5 @@ export function createBiddingModules({
     },
     {cutoffBps: config.PAYLOAD_ATTESTATION_DUE_BPS, ...revealOptions}
   );
-  return {ledger, bidder, revealer};
+  return {ledger, bidStore, bidder, revealer};
 }

@@ -8,6 +8,7 @@ import {BidResult, Metrics} from "../metrics.js";
 import {BidLedger} from "./bidLedger.js";
 import {BidPolicy} from "./bidPolicy.js";
 import {BidPublisher} from "./bidPublisher.js";
+import {BidStore} from "./bidStore.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import {PayloadOrchestrator} from "./payloadOrchestrator.js";
 import {PayloadStore} from "./payloadStore.js";
@@ -34,6 +35,7 @@ export type BidderModules = {
   ledger: BidLedger;
   policy: BidPolicy;
   bidPublisher: BidPublisher;
+  bidStore: BidStore;
   proposerPreferencesTracker: ProposerPreferencesTracker;
   getBuilderStatus: () => {status: BuilderStatus | undefined; balance: number | undefined};
   builderIndex: BuilderIndex;
@@ -156,7 +158,8 @@ export class Bidder {
         value,
         payload: {...payload, fork: ForkName.gloas},
       });
-      await this.modules.bidPublisher.publish(bid, this.modules.signal);
+      const signedBid = await this.modules.bidPublisher.publish(bid, this.modules.signal);
+      this.modules.bidStore.add(signedBid);
 
       metrics?.bids.total.inc({result: BidResult.published});
       logger.info("Published execution payload bid", {
