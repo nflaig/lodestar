@@ -3,7 +3,7 @@ import {ApiError} from "@lodestar/api/server";
 import {BuilderApi} from "@lodestar/builder";
 import {config} from "@lodestar/config/default";
 import {ssz} from "@lodestar/types";
-import {toHex} from "@lodestar/utils";
+import {LogLevel, toHex} from "@lodestar/utils";
 import {BuilderRestApiServer} from "../../../../src/cmds/builder/apiServer.js";
 import {testLogger} from "../../../utils.js";
 
@@ -48,6 +48,59 @@ describe("cmds / builder / api server", () => {
     const res = await getServer().inject({method: "POST", url: "/eth/v1/builder/validators", payload: []});
 
     expect(res.statusCode).toBe(404);
+  });
+
+  it("logs a bid request with the details of the caller", async () => {
+    const logger = testLogger();
+    const info = vi.spyOn(logger, LogLevel.info);
+    const proposer = toHex(Buffer.alloc(48, 1));
+    const root = toHex(Buffer.alloc(32, 2));
+    server = new TestBuilderRestApiServer(
+      {},
+      {
+        config,
+        logger,
+        metrics: null,
+        api: {
+          status: vi.fn(),
+          getExecutionPayloadBid: vi.fn().mockResolvedValue({data: undefined, meta: {version: "gloas"}, status: 204}),
+          submitSignedBeaconBlock: vi.fn(),
+          submitBuilderPreferences: vi.fn(),
+        },
+      }
+    );
+
+    const res = await server.inject({
+      method: "POST",
+      url: `/eth/v1/builder/execution_payload_bid/5/${root}/${root}/${proposer}`,
+      headers: {
+        "Eth-Consensus-Version": "gloas",
+        "Date-Milliseconds": String(Date.now() - 40),
+        "X-Timeout-Ms": "500",
+        "User-Agent": "Lodestar/v1.0.0",
+        "X-Forwarded-For": "203.0.113.7, 10.0.0.1",
+      },
+      payload: ssz.gloas.SignedBuilderRequestAuth.toJson(ssz.gloas.SignedBuilderRequestAuth.defaultValue()) as object,
+    });
+
+    expect(res.statusCode).toBe(204);
+    expect(info).toHaveBeenCalledWith(
+      "Builder API request",
+      expect.objectContaining({
+        operationId: "getExecutionPayloadBid",
+        status: 204,
+        slot: 5,
+        proposer,
+        userAgent: "Lodestar/v1.0.0",
+        ip: "203.0.113.7",
+        timeoutMs: "500",
+      })
+    );
+    const context = info.mock.calls.find(([message]) => message === "Builder API request")?.[1] as Record<
+      string,
+      unknown
+    >;
+    expect(context.transitMs).toBeGreaterThanOrEqual(40);
   });
 
   it("returns the status code of a rejected request", async () => {
