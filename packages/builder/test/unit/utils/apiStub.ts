@@ -9,6 +9,11 @@ export function getApiClientStub(): ApiClientStub {
       getGenesis: vi.fn(),
       getStateBuilders: vi.fn(),
       getBlockV2: vi.fn(),
+      publishExecutionPayloadBid: vi.fn(),
+      publishExecutionPayloadEnvelope: vi.fn(),
+    },
+    validator: {
+      getProposerDutiesV2: vi.fn(),
     },
     events: {
       eventstream: vi.fn(),
