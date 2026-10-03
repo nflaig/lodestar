@@ -13,12 +13,13 @@ import {BuilderStatusTracker} from "../../src/services/builderStatusTracker.js";
 import {PayloadStore} from "../../src/services/payloadStore.js";
 import {ProposerPreferencesTracker} from "../../src/services/proposerPreferencesTracker.js";
 import {getApiClientStub, mockApiResponse} from "./utils/apiStub.js";
+import {biddingOptions, createBiddingModules, getPayloadSourceStub} from "./utils/bidding.js";
 import {ClockMock} from "./utils/clock.js";
 import {getMockedLogger} from "./utils/logger.js";
 import {mockBuiltPayload} from "./utils/payload.js";
 
 const {EventType} = routes.events;
-const topics = [EventType.block, EventType.proposerPreferences];
+const topics = [EventType.block, EventType.proposerPreferences, EventType.payloadAttributes];
 
 describe("Builder", () => {
   let api: ReturnType<typeof getApiClientStub>;
@@ -36,6 +37,10 @@ describe("Builder", () => {
     clock = new ClockMock();
     const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1));
     const keypair = {secretKey, publicKey: secretKey.toPublicKey()};
+    const builderSigner = new BuilderSigner(createBeaconConfig(config, Buffer.alloc(32)), keypair);
+    const proposerPreferencesTracker = new ProposerPreferencesTracker();
+    const payloadStore = new PayloadStore();
+    const payloadSource = getPayloadSourceStub();
     modules = {
       opts: {
         logger,
@@ -45,14 +50,28 @@ describe("Builder", () => {
         api,
         executionFeeRecipient: Buffer.alloc(20),
         metrics: null,
+        payloadSource,
+        bidding: biddingOptions,
+        reveal: {},
       },
-      builderSigner: new BuilderSigner(createBeaconConfig(config, Buffer.alloc(32)), keypair),
+      builderSigner,
       builderStatusTracker: new BuilderStatusTracker(api, logger, 1, null),
       blockObserver: new BlockObserver(config, logger, api),
-      proposerPreferencesTracker: new ProposerPreferencesTracker(),
+      proposerPreferencesTracker,
       clock,
       index: 1,
-      payloadStore: new PayloadStore(),
+      payloadStore,
+      ...createBiddingModules({
+        api,
+        config,
+        logger,
+        clock,
+        builderSigner,
+        proposerPreferencesTracker,
+        payloadStore,
+        payloadSource,
+        signal: controller.signal,
+      }),
     };
   });
 
