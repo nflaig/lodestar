@@ -15,6 +15,7 @@ export type LodestarGitData = {
 export const builderStatusValue: Record<BuilderStatus, number> = {pending: 0, active: 1, exited: 2};
 
 export enum BidResult {
+  dryRun = "dry_run",
   published = "published",
   noProposerPreferences = "no_proposer_preferences",
   inactive = "inactive",

@@ -59,7 +59,10 @@ describe("Bidder", () => {
     vi.useRealTimers();
   });
 
-  function createBidder(getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined}): {
+  function createBidder(
+    getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined},
+    dryRun = false
+  ): {
     bidder: Bidder;
     ledger: BidLedger;
     bidStore: BidStore;
@@ -81,6 +84,7 @@ describe("Bidder", () => {
       signal: controller.signal,
       index: builderIndex,
       getBuilderStatus,
+      dryRun,
     });
   }
 
@@ -104,6 +108,24 @@ describe("Bidder", () => {
     data.payloadAttributes.targetGasLimit = 30_000_000n;
     return {version: ForkName.gloas, data};
   }
+
+  it("builds in dry-run mode without signing, publishing, or storing a bid", async () => {
+    const sign = vi.spyOn(BuilderSigner.prototype, "signExecutionPayloadBid");
+    addProposerPreferences();
+    const {bidder, ledger, bidStore} = createBidder(undefined, true);
+    const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+    await vi.advanceTimersByTimeAsync(msToDeadline);
+    await bidding;
+
+    expect(payloadSource.getPayload).toHaveBeenCalledOnce();
+    expect(sign).not.toHaveBeenCalled();
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+    expect(ledger.hasSubmitted(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBe(false);
+    expect(bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBeNull();
+    expect(payloadStore.has(toRootHex(mockBuiltPayload().executionPayload.blockHash))).toBe(false);
+    expect(logger.info).toHaveBeenCalledWith("Built payload without bidding", expect.objectContaining({slot}));
+    sign.mockRestore();
+  });
 
   it("builds on the emitted parent and publishes a bid at the deadline", async () => {
     addProposerPreferences();
