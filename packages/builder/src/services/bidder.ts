@@ -19,6 +19,7 @@ const GWEI_TO_WEI = 1_000_000_000n;
 export type PayloadAttributesEvent = routes.events.EventData[routes.events.EventType.payloadAttributes];
 
 export type BidderOptions = {
+  dryRun?: boolean;
   /** Point within the slot before the proposal slot at which the payload is retrieved and bid on, in basis points */
   deadlineBps: number;
   /** Do not bid while the builder balance is below this value */
@@ -118,6 +119,16 @@ export class Bidder {
         },
         getPayloadAt: Date.now() + msToDeadline,
       });
+
+      if (this.opts.dryRun) {
+        metrics?.bids.total.inc({result: BidResult.dryRun});
+        logger.info("Built payload without bidding", {
+          ...logCtx,
+          blockHash: toRootHex(payload.executionPayload.blockHash),
+          transactions: payload.executionPayload.transactions.length,
+        });
+        return;
+      }
 
       const {status, balance} = this.modules.getBuilderStatus();
       if (status !== "active" || balance === undefined) {

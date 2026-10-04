@@ -25,6 +25,11 @@ export type IBuilderCliArgs = LogArgs & {
   jwtSecret?: string;
   jwtId?: string;
 
+  "payload.transactionsFile"?: string;
+  "payload.testingUrl"?: string;
+  "payload.outputDir"?: string;
+  "payload.dryRun"?: boolean;
+
   "bidding.shareBps": number;
   "bidding.fixedCostGwei": number;
   "bidding.subsidyGwei": number;
@@ -135,6 +140,33 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
       "An optional identifier to be set in the id field of the claims included in jwt tokens used for authentication with EL client's rpc server hosting engine apis",
     type: "string",
     group: "execution",
+  },
+
+  // Controlled payloads
+
+  "payload.transactionsFile": {
+    description: "Devnet testing: JSON file containing the exact ordered signed transactions to build",
+    type: "string",
+    group: "payload",
+  },
+
+  "payload.testingUrl": {
+    description: "Private execution RPC URL exposing the eth and testing namespaces for controlled payload builds",
+    type: "string",
+    group: "payload",
+  },
+
+  "payload.outputDir": {
+    description: "Directory in which to save controlled payload build requests and responses",
+    type: "string",
+    group: "payload",
+  },
+
+  "payload.dryRun": {
+    description: "Build and capture controlled payloads without publishing bids",
+    type: "boolean",
+    default: false,
+    group: "payload",
   },
 
   // Bidding
