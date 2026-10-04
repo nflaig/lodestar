@@ -151,7 +151,7 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
   },
 
   "payload.testingUrl": {
-    description: "Private execution RPC URL exposing eth and testing_buildBlockV1 for controlled payload builds",
+    description: "Private execution RPC URL exposing the eth and testing namespaces for controlled payload builds",
     type: "string",
     group: "payload",
   },
