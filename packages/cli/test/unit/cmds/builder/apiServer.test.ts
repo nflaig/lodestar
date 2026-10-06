@@ -136,7 +136,7 @@ describe("cmds / builder / api server", () => {
     expect(Object.keys(context).sort()).toEqual(["durationMs", "ip", "operationId", "status", "userAgent"]);
   });
 
-  it("serves the status and no bids before the builder is initialized", async () => {
+  it("serves the status, no bids and accepts preferences before the builder is initialized", async () => {
     const getExecutionPayloadBid = vi
       .fn()
       .mockResolvedValue({data: ssz.gloas.SignedExecutionPayloadBid.defaultValue(), meta: {version: "gloas"}});
@@ -161,7 +161,7 @@ describe("cmds / builder / api server", () => {
       headers: {"Eth-Consensus-Version": "gloas"},
       payload: ssz.gloas.BuilderPreferencesRequest.toJson(ssz.gloas.BuilderPreferencesRequest.defaultValue()) as object,
     });
-    expect(preferences.statusCode).toBe(503);
+    expect(preferences.statusCode).toBe(202);
 
     builderApi = {
       status: vi.fn(),
