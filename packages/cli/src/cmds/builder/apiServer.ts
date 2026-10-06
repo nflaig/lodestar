@@ -53,11 +53,8 @@ export function getBuilderApiBeforeInit(config: ChainForkConfig, getBuilderApi: 
     },
 
     async submitBuilderPreferences(args, context) {
-      const builderApi = getBuilderApi();
-      if (builderApi === null) {
-        throw new ApiError(503, "Builder is not ready");
-      }
-      return builderApi.submitBuilderPreferences(args, context);
+      // Preferences are not stored, accepting them before init avoids spurious warnings on proposers
+      return getBuilderApi()?.submitBuilderPreferences(args, context) ?? {status: 202};
     },
   };
 }
