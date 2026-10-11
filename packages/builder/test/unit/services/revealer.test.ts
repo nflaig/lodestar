@@ -124,6 +124,48 @@ describe("Revealer", () => {
     expect(logger.info).toHaveBeenCalledWith("Execution payload bid selected", expect.objectContaining({slot}));
   });
 
+  it("reveals either retained revision after a higher API bid has been prepared", async () => {
+    const first = selectedBlock();
+    const block = structuredClone(first.block);
+    const signedBid = block.message.body.signedExecutionPayloadBid;
+    signedBid.message.blockHash = Buffer.alloc(32, 17);
+    signedBid.message.value = 20;
+    const blockHash = toRootHex(signedBid.message.blockHash);
+    const old = payloadStore.get(toRootHex(first.signedBid.message.blockHash));
+    if (!old) throw Error("Expected retained first payload");
+    payloadStore.add({
+      ...old,
+      blockHash,
+      payload: {
+        ...old.payload,
+        executionPayload: {...old.payload.executionPayload, blockHash: signedBid.message.blockHash},
+      },
+    });
+    ledger.recordRevision({
+      slot,
+      parentBlockHash: toRootHex(signedBid.message.parentBlockHash),
+      parentBlockRoot: toRootHex(signedBid.message.parentBlockRoot),
+      blockHash,
+      valueGwei: 20,
+      signedBidRoot: toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid)),
+    });
+    const second = {
+      ...first,
+      block,
+      signedBid,
+      blockRoot: toRootHex(ssz.gloas.BeaconBlock.hashTreeRoot(block.message)),
+    };
+    await revealer.onBlock(first);
+    await revealer.onBlock(second);
+    expect(api.beacon.publishExecutionPayloadEnvelope).toHaveBeenCalledTimes(2);
+    for (const [index, expected] of [first, second].entries()) {
+      expect(api.beacon.publishExecutionPayloadEnvelope.mock.calls[index][0].signedEnvelopeOrContents).toMatchObject({
+        signedExecutionPayloadEnvelope: {message: {payload: {blockHash: expected.signedBid.message.blockHash}}},
+      });
+    }
+    expect(ledger.getUnsettledValueGwei(0)).toBe(20);
+  });
+
   it("ignores a block that selected another builder", async () => {
     const observed = selectedBlock();
     observed.signedBid.message.builderIndex = builderIndex + 1;

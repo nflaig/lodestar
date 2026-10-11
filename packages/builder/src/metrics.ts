@@ -16,6 +16,7 @@ export const builderStatusValue: Record<BuilderStatus, number> = {pending: 0, ac
 
 export enum BidResult {
   dryRun = "dry_run",
+  prepared = "prepared",
   published = "published",
   noProposerPreferences = "no_proposer_preferences",
   inactive = "inactive",

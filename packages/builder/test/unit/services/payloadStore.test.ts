@@ -14,6 +14,21 @@ describe("PayloadStore", () => {
     expect(store.size).toBe(0);
   });
 
+  it("rejects a new payload at capacity without evicting an earlier commitment", () => {
+    const store = new PayloadStore(256 * 1024 * 1024, 1);
+    const first = {slot: 5, parentBlockRoot: Buffer.alloc(32), blockHash, payload: mockBuiltPayload()};
+    store.add(first);
+    const bytes = store.bytes;
+    expect(() => store.add({...first, blockHash: "0x" + "dd".repeat(32)})).toThrow();
+    expect(store.get(blockHash)).toBe(first);
+    expect(store.bytes).toBe(bytes);
+    const tooSmall = new PayloadStore(bytes - 1);
+    expect(() => tooSmall.add(first)).toThrow();
+    expect(tooSmall.size).toBe(0);
+    store.prune(8);
+    expect(store.bytes).toBe(0);
+  });
+
   it("stores and prunes payloads by slot", () => {
     const store = new PayloadStore();
     store.add({slot: 5, parentBlockRoot: Buffer.alloc(32), blockHash, payload: mockBuiltPayload()});

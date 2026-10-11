@@ -1,5 +1,5 @@
-import {LodestarError, TimeoutError, retry, sleep, withTimeout} from "@lodestar/utils";
-import type {BuildRequest, BuiltPayload, PayloadSource} from "./payloadSource.js";
+import {ErrorAborted, LodestarError, TimeoutError, retry, sleep, withTimeout} from "@lodestar/utils";
+import type {BuildHandle, BuildRequest, BuiltPayload, PayloadSource} from "./payloadSource.js";
 
 const PREPARE_RETRY_DELAY = 100;
 
@@ -46,6 +46,7 @@ export class PayloadOrchestratorError extends LodestarError<PayloadOrchestratorE
  */
 export class PayloadOrchestrator {
   private readonly jobs = new Map<string, Promise<BuiltPayload>>();
+  private readonly updateJobs = new Map<string, Promise<void>>();
 
   constructor(
     private readonly source: PayloadSource,
@@ -53,17 +54,78 @@ export class PayloadOrchestrator {
     private readonly signal: AbortSignal
   ) {}
 
-  run(job: PayloadBuildJob): Promise<BuiltPayload> {
+  get supportsUpdates(): boolean {
+    return this.source.supportsUpdates === true;
+  }
+
+  run(job: PayloadBuildJob, signal: AbortSignal = this.signal): Promise<BuiltPayload> {
     const {id} = job;
     let promise = this.jobs.get(id);
     if (promise === undefined) {
-      promise = this.runJob(job).finally(() => this.jobs.delete(id));
+      promise = this.runJob(job, AbortSignal.any([this.signal, signal])).finally(() => this.jobs.delete(id));
       this.jobs.set(id, promise);
     }
     return promise;
   }
 
-  private async runJob({id, request, getPayloadAt}: PayloadBuildJob): Promise<BuiltPayload> {
+  /** Poll ready snapshots until the cutoff. A callback completes before the next poll. */
+  runUpdates(
+    job: PayloadBuildJob,
+    options: {intervalMs: number; until: number},
+    onPayload: (payload: BuiltPayload) => Promise<void>,
+    signal: AbortSignal = this.signal
+  ): Promise<void> {
+    let promise = this.updateJobs.get(job.id);
+    if (promise === undefined) {
+      promise = this.runUpdateJob(job, options, onPayload, AbortSignal.any([this.signal, signal])).finally(() =>
+        this.updateJobs.delete(job.id)
+      );
+      this.updateJobs.set(job.id, promise);
+    }
+    return promise;
+  }
+
+  private async runUpdateJob(
+    job: PayloadBuildJob,
+    {intervalMs, until}: {intervalMs: number; until: number},
+    onPayload: (payload: BuiltPayload) => Promise<void>,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (!Number.isSafeInteger(intervalMs) || intervalMs < 25) throw new RangeError("Invalid payload update interval");
+    const handle = await this.prepare({...job, getPayloadAt: until}, signal);
+    let previous: BuiltPayload | undefined;
+    try {
+      while (Date.now() < until) {
+        const payload = await this.retrieve(
+          job.id,
+          handle,
+          signal,
+          Math.min(this.options.getPayloadTimeout, until - Date.now())
+        );
+        signal.throwIfAborted();
+        if (Date.now() >= until) break;
+        if (payload !== previous) {
+          await onPayload(payload);
+          previous = payload;
+        }
+        await sleep(Math.min(intervalMs, Math.max(0, until - Date.now())), signal);
+      }
+    } finally {
+      await this.release(handle);
+    }
+  }
+
+  private async runJob(job: PayloadBuildJob, signal: AbortSignal): Promise<BuiltPayload> {
+    const handle = await this.prepare(job, signal);
+    try {
+      await sleep(job.getPayloadAt - Date.now(), signal);
+      return await this.retrieve(job.id, handle, signal);
+    } finally {
+      await this.release(handle);
+    }
+  }
+
+  private async prepare({id, request, getPayloadAt}: PayloadBuildJob, signal: AbortSignal): Promise<BuildHandle> {
     const prepareTimeout = getPayloadAt - Date.now();
     if (!(prepareTimeout > 0)) {
       throw new PayloadOrchestratorError(
@@ -73,18 +135,28 @@ export class PayloadOrchestrator {
     }
 
     let lastError: Error | null = null;
-    const handle = await withTimeout(
-      (signal = this.signal) =>
-        retry(() => this.source.prepare(request, signal), {
-          retries: Infinity,
-          retryDelay: PREPARE_RETRY_DELAY,
-          onRetry: (error) => {
-            lastError = error;
+    return withTimeout(
+      (prepareSignal = signal) =>
+        retry(
+          async () => {
+            const handle = await this.source.prepare(request, prepareSignal);
+            if (prepareSignal.aborted) {
+              await this.release(handle);
+              throw new ErrorAborted();
+            }
+            return handle;
           },
-          signal,
-        }),
+          {
+            retries: Infinity,
+            retryDelay: PREPARE_RETRY_DELAY,
+            onRetry: (error) => {
+              lastError = error;
+            },
+            signal: prepareSignal,
+          }
+        ),
       prepareTimeout,
-      this.signal
+      signal
     ).catch((error: unknown) => {
       if (error instanceof TimeoutError) {
         throw new PayloadOrchestratorError(
@@ -94,18 +166,33 @@ export class PayloadOrchestrator {
       }
       throw error;
     });
+  }
 
-    await sleep(getPayloadAt - Date.now(), this.signal);
-
+  private retrieve(
+    id: string,
+    handle: BuildHandle,
+    signal: AbortSignal,
+    timeout = this.options.getPayloadTimeout
+  ): Promise<BuiltPayload> {
     return withTimeout(
-      (signal = this.signal) => this.source.getPayload(handle, signal),
-      this.options.getPayloadTimeout,
-      this.signal
+      (retrieveSignal = signal) => this.source.getPayload(handle, retrieveSignal),
+      timeout,
+      signal
     ).catch((error: unknown) => {
       if (error instanceof TimeoutError) {
         throw new PayloadOrchestratorError({code: PayloadOrchestratorErrorCode.GET_PAYLOAD_TIMEOUT, jobId: id});
       }
       throw error;
     });
+  }
+
+  private async release(handle: BuildHandle): Promise<void> {
+    // Cleanup must still run after the job's signal has been cancelled. Sources
+    // also expire abandoned handles if transport fails during release.
+    const release = this.source.release;
+    if (!release) return;
+    await withTimeout((signal = AbortSignal.timeout(1000)) => release.call(this.source, handle, signal), 1000).catch(
+      () => {}
+    );
   }
 }

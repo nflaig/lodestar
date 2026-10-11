@@ -63,6 +63,45 @@ building again. A completed build that fails validation or capture is not retrie
 The adapter checks transaction order and returned attributes. Validate captures with another EL before
 using a new workload on a shared devnet; these checks do not independently verify execution or roots.
 
+## Incremental payload constructor
+
+An external constructor can keep one session alive and return improving Gloas
+payloads without blob transactions. Add these flags to the existing builder command:
+
+```sh
+--payload.constructorUrl http://127.0.0.1:8547 \
+--bidding.updateIntervalMs 100 \
+--bidding.updateCutoffBps 1000
+```
+
+The constructor implements the private JSON-RPC methods `zbuilder_beginV1(parentHash,
+payloadAttributes, extraData)`, `zbuilder_getPayloadV1(sessionId, knownBlockHash?)` and
+`zbuilder_endV1(sessionId)`. Begin returns `{sessionId}`. Get returns a complete Engine
+payload response or `null` when the supplied hash is still current. The constructor
+must validate execution before exposing a result. Lodestar additionally checks the
+parent and attributes. Construction and intake remain external; Lodestar owns pricing,
+signing, bid publication and reveal obligations.
+
+With updates enabled, the API immediately offers each strictly higher bid permitted by
+the pricing policy. Earlier signed revisions and payloads remain selectable. Gossip
+still publishes at most one bid per slot and parent tuple for the configured identity,
+using the best ready bid at `bidding.deadlineBps` in the preceding slot. API polling
+continues until `updateCutoffBps` of the proposal slot; 1000 is 1.2 seconds into a
+12-second slot. Parent changes cancel construction without deleting old commitments.
+
+The default update interval is zero, retaining one retrieval at the usual deadline.
+Positive intervals require this constructor source and must be at least 25 ms. This
+source cannot be combined with the controlled transaction-file source or its capture
+directory. `--payload.dryRun` builds without signing or publishing.
+
+The commitment journal permits 64 signed revisions per slot across all parents.
+Payload storage is capped at 192 payloads and 256 MiB of serialized content plus entry
+allowances, which is not an RSS limit. Exhaustion rejects new work rather than evicting
+advertised payloads. These stores are in memory: restart recovery and multiple builder
+identities are not implemented. Keep the constructor RPC private and use bounded devnet
+trials until durable reveal obligations are supported. Metrics distinguish prepared API
+revisions (`prepared`) from successful gossip publication (`published`).
+
 ## License
 
 Apache-2.0 [ChainSafe Systems](https://chainsafe.io)

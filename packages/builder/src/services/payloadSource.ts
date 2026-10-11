@@ -64,8 +64,12 @@ export interface PayloadSourceEngine {
 /** Source that prepares and retrieves complete execution payloads without owning build scheduling policy. */
 export interface PayloadSource {
   readonly id: string;
+  /** getPayload may return successive immutable snapshots from the same handle. */
+  readonly supportsUpdates?: boolean;
   prepare(request: BuildRequest, signal: AbortSignal): Promise<BuildHandle>;
   getPayload(handle: BuildHandle, signal: AbortSignal): Promise<BuiltPayload>;
+  /** Release construction resources without invalidating previously returned payloads. */
+  release?(handle: BuildHandle, signal: AbortSignal): Promise<void>;
 }
 
 export enum PayloadSourceErrorCode {

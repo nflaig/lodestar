@@ -109,13 +109,8 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
       const blockRoot = toRootHex(config.getForkTypes(slot).BeaconBlock.hashTreeRoot(block.message));
       const logCtx = {slot, blockRoot, blockHash: toRootHex(bid.blockHash)};
 
-      const signedBid = bidStore.get(slot, toRootHex(bid.parentBlockHash), toRootHex(bid.parentBlockRoot));
-      if (
-        bid.builderIndex !== builderIndex ||
-        signedBid === null ||
-        !byteArrayEquals(signedBid.message.blockHash, bid.blockHash)
-      ) {
-        throw new ApiError(400, "Invalid signed beacon block: does not commit to a bid of this builder");
+      if (bid.builderIndex !== builderIndex || !bidStore.has(block.message.body.signedExecutionPayloadBid)) {
+        throw new ApiError(400, "Invalid signed beacon block: does not commit to a retained bid of this builder");
       }
 
       const proposer = await proposerDutiesTracker.getProposer(slot);

@@ -12,6 +12,8 @@ export const defaultOptions = {
     /** Retrieve the payload and publish the bid at 95% of the slot before the proposal slot */
     deadlineBps: 9500,
     getPayloadTimeout: 1000,
+    updateIntervalMs: 0,
+    updateCutoffBps: 1000,
     /** Do not bid when the builder balance falls below this, 1.1 ETH leaves headroom above MIN_DEPOSIT_AMOUNT */
     minOperatingBalanceGwei: 1_100_000_000,
   },
