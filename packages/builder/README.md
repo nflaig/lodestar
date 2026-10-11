@@ -83,7 +83,7 @@ parent and attributes. Construction and intake remain external; Lodestar owns pr
 signing, bid publication and reveal obligations.
 
 With updates enabled, the API immediately offers each strictly higher bid permitted by
-the pricing policy. Earlier signed revisions and payloads remain selectable. Gossip
+the pricing policy. Earlier signed revisions and payloads remain available for selection. Gossip
 still publishes at most one bid per slot and parent tuple for the configured identity,
 using the best ready bid at `bidding.deadlineBps` in the preceding slot. API polling
 continues until `updateCutoffBps` of the proposal slot; 1000 is 1.2 seconds into a
@@ -96,7 +96,7 @@ directory. `--payload.dryRun` builds without signing or publishing.
 
 The commitment journal permits 64 signed revisions per slot across all parents.
 Payload storage is capped at 192 payloads and 256 MiB of serialized content plus entry
-allowances, which is not an RSS limit. Exhaustion rejects new work rather than evicting
+allowances, which is not a resident memory limit. Exhaustion rejects new work rather than evicting
 advertised payloads. These stores are in memory: restart recovery and multiple builder
 identities are not implemented. Keep the constructor RPC private and use bounded devnet
 trials until durable reveal obligations are supported. Metrics distinguish prepared API
