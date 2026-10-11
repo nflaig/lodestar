@@ -167,6 +167,20 @@ describe("builder api", () => {
   });
 
   describe("submitSignedBeaconBlock", () => {
+    it("serves B but still accepts a proposer selecting an earlier A", async () => {
+      const first = (await builderApi.getExecutionPayloadBid(bidRequest())).data;
+      const oldBlock = signBlock();
+      const newer = {...signedBid, message: {...signedBid.message, blockHash: Buffer.alloc(32, 9), value: 10}};
+      bidStore.add(newer);
+      expect((await builderApi.getExecutionPayloadBid(bidRequest())).data).toBe(newer);
+      expect(first).toBe(signedBid);
+      await expect(builderApi.submitSignedBeaconBlock({signedBlock: {data: oldBlock}})).resolves.toEqual({status: 202});
+      signedBid = {...signedBid, message: {...signedBid.message, value: 6}};
+      await expect(builderApi.submitSignedBeaconBlock({signedBlock: {data: signBlock()}})).rejects.toMatchObject({
+        statusCode: 400,
+      });
+    });
+
     it("publishes a block that commits to one of our bids", async () => {
       const block = signBlock();
 

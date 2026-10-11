@@ -78,6 +78,7 @@ MEV
 MacOS
 Metamask
 MevBoost
+MiB
 ModuleNotFoundError
 Monorepo
 NPM
@@ -274,3 +275,4 @@ xcode
 yaml
 yamux
 yml
+zbuilder

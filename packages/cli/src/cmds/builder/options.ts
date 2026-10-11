@@ -27,6 +27,7 @@ export type IBuilderCliArgs = LogArgs & {
 
   "payload.transactionsFile"?: string;
   "payload.testingUrl"?: string;
+  "payload.constructorUrl"?: string;
   "payload.outputDir"?: string;
   "payload.dryRun"?: boolean;
 
@@ -37,6 +38,8 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.maxValueGwei"?: number;
   "bidding.deadlineBps": number;
   "bidding.getPayloadTimeout": number;
+  "bidding.updateIntervalMs": number;
+  "bidding.updateCutoffBps": number;
   "bidding.minOperatingBalanceGwei": number;
   "reveal.cutoffBps"?: number;
 
@@ -144,6 +147,12 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
 
   // Controlled payloads
 
+  "payload.constructorUrl": {
+    description: "Private zbuilder session RPC URL for incrementally constructed, validated payloads",
+    type: "string",
+    group: "payload",
+  },
+
   "payload.transactionsFile": {
     description: "Devnet testing: JSON file containing the exact ordered signed transactions to build",
     type: "string",
@@ -170,6 +179,20 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
   },
 
   // Bidding
+
+  "bidding.updateIntervalMs": {
+    description: "Poll session payload snapshots at this interval in milliseconds; zero disables API bid updates",
+    type: "number",
+    default: defaultOptions.bidding.updateIntervalMs,
+    group: "bidding",
+  },
+
+  "bidding.updateCutoffBps": {
+    description: "Stop session updates at this point within the proposal slot, in basis points",
+    type: "number",
+    default: defaultOptions.bidding.updateCutoffBps,
+    group: "bidding",
+  },
 
   "bidding.shareBps": {
     description: "Share of the payload value offered to the proposer, in basis points",

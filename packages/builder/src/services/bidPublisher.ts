@@ -14,17 +14,20 @@ export type BidPublisherModules = {
   ledger: BidLedger;
   builderIndex: BuilderIndex;
   hasPayload: (identity: BidIdentity) => boolean;
+  /** Must finish durable retention before the signature can be exposed. */
+  retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => void;
 };
 
 export enum BidPublisherErrorCode {
   BUILDER_INDEX_MISMATCH = "BID_PUBLISHER_ERROR_BUILDER_INDEX_MISMATCH",
   PAYLOAD_NOT_RETAINED = "BID_PUBLISHER_ERROR_PAYLOAD_NOT_RETAINED",
   PRE_GLOAS_BID = "BID_PUBLISHER_ERROR_PRE_GLOAS_BID",
+  BID_NOT_PREPARED = "BID_PUBLISHER_ERROR_BID_NOT_PREPARED",
 }
 
 export type BidPublisherErrorType =
   | {
-      code: BidPublisherErrorCode.PRE_GLOAS_BID;
+      code: BidPublisherErrorCode.PRE_GLOAS_BID | BidPublisherErrorCode.BID_NOT_PREPARED;
       slot: Slot;
     }
   | {
@@ -50,8 +53,19 @@ export class BidPublisher {
   publish(bid: gloas.ExecutionPayloadBid, signal: AbortSignal): Promise<gloas.SignedExecutionPayloadBid>;
   async publish(bid: gloas.ExecutionPayloadBid, signal: AbortSignal): Promise<gloas.SignedExecutionPayloadBid> {
     signal.throwIfAborted();
+    this.modules.ledger.assertCanRecordBid({
+      slot: bid.slot,
+      parentBlockHash: toRootHex(bid.parentBlockHash),
+      parentBlockRoot: toRootHex(bid.parentBlockRoot),
+    });
+    const signed = this.prepare(bid);
+    await this.gossip(signed, signal);
+    return signed;
+  }
 
-    const {api, config, builderIndex, hasPayload, ledger, signer} = this.modules;
+  /** Sign a retained payload and journal the commitment before the API can expose it. */
+  prepare(bid: gloas.ExecutionPayloadBid): gloas.SignedExecutionPayloadBid {
+    const {config, builderIndex, hasPayload, ledger, signer} = this.modules;
     const fork = config.getForkName(bid.slot);
     if (!isForkPostGloas(fork)) {
       throw new BidPublisherError({code: BidPublisherErrorCode.PRE_GLOAS_BID, slot: bid.slot});
@@ -80,16 +94,46 @@ export class BidPublisher {
       );
     }
 
-    ledger.assertCanRecordBid(identity);
-
     const signedExecutionPayloadBid = signer.signExecutionPayloadBid(bid);
     const signedBidRoot = toRootHex(
       sszTypesFor(fork, "SignedExecutionPayloadBid").hashTreeRoot(signedExecutionPayloadBid)
     );
-    ledger.recordBid({...identity, valueGwei: bid.value, signedBidRoot});
+    ledger.recordRevision({...identity, valueGwei: bid.value, signedBidRoot});
+    this.modules.retainCommitment?.(signedExecutionPayloadBid);
+    return signedExecutionPayloadBid;
+  }
+
+  async gossip(signedExecutionPayloadBid: gloas.SignedExecutionPayloadBid, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    const {api, ledger, config, hasPayload, builderIndex} = this.modules;
+    const bid = signedExecutionPayloadBid.message;
+    const fork = config.getForkName(bid.slot);
+    if (!isForkPostGloas(fork))
+      throw new BidPublisherError({code: BidPublisherErrorCode.PRE_GLOAS_BID, slot: bid.slot});
+    const identity = {
+      slot: bid.slot,
+      parentBlockHash: toRootHex(bid.parentBlockHash),
+      parentBlockRoot: toRootHex(bid.parentBlockRoot),
+      blockHash: toRootHex(bid.blockHash),
+    };
+    const signedBidRoot = toRootHex(
+      sszTypesFor(fork, "SignedExecutionPayloadBid").hashTreeRoot(signedExecutionPayloadBid)
+    );
+    if (
+      bid.builderIndex !== builderIndex ||
+      !ledger.getBidsForSlot(bid.slot).some((record) => record.signedBidRoot === signedBidRoot)
+    ) {
+      throw new BidPublisherError({code: BidPublisherErrorCode.BID_NOT_PREPARED, slot: bid.slot});
+    }
+    if (!hasPayload(identity))
+      throw new BidPublisherError({code: BidPublisherErrorCode.PAYLOAD_NOT_RETAINED, ...identity});
+    ledger.recordBid({
+      ...identity,
+      valueGwei: bid.value,
+      signedBidRoot,
+    });
 
     const response = await api.beacon.publishExecutionPayloadBid({signedExecutionPayloadBid}, {signal});
     response.assertOk();
-    return signedExecutionPayloadBid;
   }
 }

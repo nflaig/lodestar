@@ -26,6 +26,7 @@ import {getVersionData} from "../../util/version.js";
 import {BuilderRestApiServer, getBuilderApiBeforeInit} from "./apiServer.js";
 import {loadBuilderKeypair} from "./loadKeypair.js";
 import {IBuilderCliArgs, builderMetricsDefaultOptions} from "./options.js";
+import {SessionPayloadSource} from "./sessionPayloadSource.js";
 import {TestingPayloadSource} from "./testingPayloadSource.js";
 
 const ZERO_ADDRESS = "0x" + "0".repeat(40);
@@ -39,14 +40,29 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
 
   const transactionsFile = args["payload.transactionsFile"];
   const testingUrl = args["payload.testingUrl"];
-  if (!transactionsFile && (testingUrl || args["payload.outputDir"] || args["payload.dryRun"])) {
+  const constructorUrl = args["payload.constructorUrl"];
+  if (constructorUrl && (transactionsFile || testingUrl || args["payload.outputDir"])) {
+    throw new YargsError("--payload.constructorUrl cannot be combined with controlled transaction file options");
+  }
+  if (!transactionsFile && (testingUrl || args["payload.outputDir"] || (args["payload.dryRun"] && !constructorUrl))) {
     throw new YargsError("--payload.transactionsFile is required for controlled payload options");
   }
   if (transactionsFile && !testingUrl) {
     throw new YargsError("--payload.transactionsFile requires --payload.testingUrl");
   }
-  if (args["payload.dryRun"] && !args["payload.outputDir"]) {
+  if (args["payload.dryRun"] && !constructorUrl && !args["payload.outputDir"]) {
     throw new YargsError("--payload.dryRun requires --payload.outputDir");
+  }
+  const updateIntervalMs = args["bidding.updateIntervalMs"];
+  const updateCutoffBps = args["bidding.updateCutoffBps"];
+  if (
+    !Number.isSafeInteger(updateIntervalMs) ||
+    (updateIntervalMs !== 0 && (updateIntervalMs < 25 || !constructorUrl))
+  ) {
+    throw new YargsError("Payload updates require --payload.constructorUrl and an interval of at least 25 ms");
+  }
+  if (!Number.isSafeInteger(updateCutoffBps) || updateCutoffBps < 0 || updateCutoffBps > 10000) {
+    throw new YargsError("--bidding.updateCutoffBps must be between 0 and 10000");
   }
 
   const globalPaths = getGlobalPaths(args, network);
@@ -100,7 +116,22 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   logger.info("Beacon node", {beaconNode: toPrintableUrl(args.beaconNodeUrl), timeoutMs: args.requestTimeout});
 
   let payloadSource: PayloadSource;
-  if (transactionsFile && testingUrl) {
+  if (constructorUrl) {
+    payloadSource = new SessionPayloadSource(
+      toPrintableUrl(constructorUrl),
+      (signal) =>
+        new JsonRpcHttpClient([constructorUrl], {
+          signal,
+          timeout: args["execution.timeout"],
+        })
+    );
+    logger.info("Session payload source", {
+      url: toPrintableUrl(constructorUrl),
+      updateIntervalMs,
+      updateCutoffBps,
+      dryRun: args["payload.dryRun"],
+    });
+  } else if (transactionsFile && testingUrl) {
     const rpc = new JsonRpcHttpClient([testingUrl], {
       signal: abortController.signal,
       timeout: args["execution.timeout"],
@@ -164,6 +195,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     executionFeeRecipient: fromHex(executionFeeRecipient),
     metrics,
     payloadSource,
+    commitmentDir: args["payload.dryRun"] ? undefined : path.join(globalPaths.dataDir, "builder-commitments"),
     bidding: {
       dryRun: args["payload.dryRun"],
       shareBps: args["bidding.shareBps"],
@@ -173,6 +205,8 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       maxValueGwei: args["bidding.maxValueGwei"],
       deadlineBps: args["bidding.deadlineBps"],
       getPayloadTimeout: args["bidding.getPayloadTimeout"],
+      updateIntervalMs,
+      updateCutoffBps,
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
     builderApi: builderApiOpts,

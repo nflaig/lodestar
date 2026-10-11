@@ -5,7 +5,7 @@ import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName} from "@lodestar/params";
 import {BuilderStatus, ssz} from "@lodestar/types";
 import {toHex, toRootHex} from "@lodestar/utils";
-import {Bidder, PayloadAttributesEvent} from "../../../src/services/bidder.js";
+import {Bidder, type BidderOptions, PayloadAttributesEvent} from "../../../src/services/bidder.js";
 import {BidLedger} from "../../../src/services/bidLedger.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
@@ -61,7 +61,8 @@ describe("Bidder", () => {
 
   function createBidder(
     getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined},
-    dryRun = false
+    dryRun = false,
+    updateOptions?: Pick<BidderOptions, "updateIntervalMs" | "updateCutoffBps">
   ): {
     bidder: Bidder;
     ledger: BidLedger;
@@ -85,6 +86,7 @@ describe("Bidder", () => {
       index: builderIndex,
       getBuilderStatus,
       dryRun,
+      updateOptions,
     });
   }
 
@@ -186,6 +188,61 @@ describe("Bidder", () => {
     expect(payloadSource.prepare).toHaveBeenCalledOnce();
     expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
     expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("improves API bids after gossip while retaining both payload commitments", async () => {
+    addProposerPreferences();
+    payloadSource.supportsUpdates = true;
+    const {bidder, ledger, bidStore} = createBidder(undefined, false, {updateIntervalMs: 100, updateCutoffBps: 1000});
+    const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+    await vi.advanceTimersByTimeAsync(0);
+    const first = bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot));
+    expect(first).not.toBeNull();
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(msToDeadline);
+    expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+    const next = {
+      ...mockBuiltPayload({slot, parentHash: parentBlockHash, prevRandao, blockHash: Buffer.alloc(32, 12)}),
+      fork: ForkName.gloas as const,
+      executionPayloadValue: 2_000_000_000_000_000_000n,
+    };
+    payloadSource.getPayload.mockResolvedValue(next);
+    await vi.advanceTimersByTimeAsync(100);
+    const second = bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot));
+    if (!first || !second) throw Error("Expected both bid revisions");
+    expect(second.message.value).toBeGreaterThan(first.message.value);
+    if (!first) throw Error("Expected first bid");
+    expect(bidStore.has(first)).toBe(true);
+    expect(payloadStore.has(toRootHex(first.message.blockHash))).toBe(true);
+    expect(payloadStore.has(toRootHex(second.message.blockHash))).toBe(true);
+    expect(ledger.getBidsForSlot(slot)).toHaveLength(2);
+    expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(3000);
+    await bidding;
+    expect(payloadSource.prepare).toHaveBeenCalledOnce();
+    expect(payloadSource.release).toHaveBeenCalledOnce();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("cancels a replaced parent without deleting its already advertised bid", async () => {
+    addProposerPreferences();
+    payloadSource.supportsUpdates = true;
+    const {bidder, bidStore} = createBidder(undefined, false, {updateIntervalMs: 100, updateCutoffBps: 1000});
+    const firstBuild = bidder.onPayloadAttributes(payloadAttributesEvent());
+    await vi.advanceTimersByTimeAsync(0);
+    const first = bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot));
+    const event = payloadAttributesEvent();
+    event.data.parentBlockRoot = Buffer.alloc(32, 15);
+    const secondBuild = bidder.onPayloadAttributes(event);
+    await vi.advanceTimersByTimeAsync(0);
+    await firstBuild;
+    expect(payloadSource.release).toHaveBeenCalledOnce();
+    if (!first) throw Error("Expected first bid");
+    expect(bidStore.has(first)).toBe(true);
+    controller.abort();
+    await secondBuild;
+    expect(payloadSource.release).toHaveBeenCalledTimes(2);
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
   });
 
   it("does not build without proposer preferences", async () => {
