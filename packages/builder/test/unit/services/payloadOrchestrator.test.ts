@@ -362,4 +362,32 @@ describe("PayloadOrchestrator", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(source.prepareCalls).toHaveLength(2);
   });
+
+  it.each([
+    {name: "normal cutoff after a ready payload", untilMs: 60, firstReady: true, succeeds: true},
+    {name: "retrieval timeout before the cutoff", untilMs: 100, firstReady: true, succeeds: false},
+    {name: "cutoff without any ready payload", untilMs: 30, firstReady: false, succeeds: false},
+  ])("handles $name and releases the constructor", async ({untilMs, firstReady, succeeds}) => {
+    const source = new StubPayloadSource();
+    const release = vi.fn(async () => {});
+    const pending = defer<BuiltPayload>();
+    source.getPayloadImpl = async (handle) =>
+      firstReady && source.getPayloadCalls.length === 1 ? builtPayload(handle) : pending.promise;
+    const orchestrator = createOrchestrator(Object.assign(source, {release}));
+    const onPayload = vi.fn(async () => {});
+    const result = orchestrator.runUpdates(buildJob(), {intervalMs: 25, until: NOW + untilMs}, onPayload);
+    const outcome = result.then(
+      () => ({error: undefined}),
+      (error: unknown) => ({error})
+    );
+    await vi.advanceTimersByTimeAsync(untilMs);
+    if (succeeds) expect((await outcome).error).toBeUndefined();
+    else expect((await outcome).error).toMatchObject({type: {code: PayloadOrchestratorErrorCode.GET_PAYLOAD_TIMEOUT}});
+    expect(onPayload).toHaveBeenCalledTimes(firstReady ? 1 : 0);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(source.getPayloadSignals.at(-1)?.aborted).toBe(true);
+    pending.resolve(builtPayload());
+    await vi.advanceTimersByTimeAsync(100);
+    expect(onPayload).toHaveBeenCalledTimes(firstReady ? 1 : 0);
+  });
 });

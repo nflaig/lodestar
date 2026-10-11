@@ -96,12 +96,27 @@ export class PayloadOrchestrator {
     let previous: BuiltPayload | undefined;
     try {
       while (Date.now() < until) {
-        const payload = await this.retrieve(
-          job.id,
-          handle,
-          signal,
-          Math.min(this.options.getPayloadTimeout, until - Date.now())
-        );
+        let payload: BuiltPayload;
+        try {
+          payload = await this.retrieve(
+            job.id,
+            handle,
+            signal,
+            Math.min(this.options.getPayloadTimeout, until - Date.now())
+          );
+        } catch (error) {
+          // Ending the final poll at the cutoff does not invalidate a ready
+          // revision. Earlier timeouts and jobs with no result remain errors.
+          if (
+            previous !== undefined &&
+            !signal.aborted &&
+            Date.now() >= until &&
+            error instanceof PayloadOrchestratorError &&
+            error.type.code === PayloadOrchestratorErrorCode.GET_PAYLOAD_TIMEOUT
+          )
+            break;
+          throw error;
+        }
         signal.throwIfAborted();
         if (Date.now() >= until) break;
         if (payload !== previous) {
