@@ -1,6 +1,6 @@
 import {ApiClient, routes} from "@lodestar/api";
 import {ChainForkConfig, assertEqualParams, createBeaconConfig} from "@lodestar/config";
-import {SLOTS_PER_EPOCH} from "@lodestar/params";
+import {ForkName, SLOTS_PER_EPOCH} from "@lodestar/params";
 import {Clock, ClockOptions, IClock} from "@lodestar/state-transition";
 import {BuilderIndex, ExecutionAddress} from "@lodestar/types";
 import {Logger, isErrorAborted, toHex, toRootHex} from "@lodestar/utils";
@@ -18,6 +18,7 @@ import {BidStore} from "./services/bidStore.js";
 import {BlockObserver} from "./services/blockObserver.js";
 import {BuilderSigner, Keypair} from "./services/builderSigner.js";
 import {BuilderStatusTracker} from "./services/builderStatusTracker.js";
+import {CommitmentJournal} from "./services/commitmentJournal.js";
 import {EnvelopePublisher} from "./services/envelopePublisher.js";
 import {PayloadOrchestrator} from "./services/payloadOrchestrator.js";
 import {PayloadSource} from "./services/payloadSource.js";
@@ -43,6 +44,7 @@ export type BuilderModules = {
   bidder: Bidder;
   revealer: Revealer;
   builderApi: BuilderApi | null;
+  journal?: CommitmentJournal;
 };
 
 export type BuilderOptions = {
@@ -68,6 +70,8 @@ export type BuilderOptions = {
   };
   /** The builder API is only served if set */
   builderApi?: BuilderApiOptions;
+  /** Single-owner directory for durable Gloas bids, payloads and reveal conflicts. */
+  commitmentDir?: string;
 };
 
 /**
@@ -89,6 +93,7 @@ export class Builder {
   private readonly ledger: BidLedger;
   private readonly bidder: Bidder;
   private readonly revealer: Revealer;
+  private readonly journal?: CommitmentJournal;
 
   constructor({
     opts,
@@ -104,6 +109,7 @@ export class Builder {
     bidder,
     revealer,
     builderApi,
+    journal,
   }: BuilderModules) {
     this.builderSigner = builderSigner;
     this.blockObserver = blockObserver;
@@ -119,6 +125,7 @@ export class Builder {
     this.bidder = bidder;
     this.revealer = revealer;
     this.builderApi = builderApi;
+    this.journal = journal;
 
     this.executionFeeRecipient = opts.executionFeeRecipient;
 
@@ -127,6 +134,7 @@ export class Builder {
     this.clock.runEveryEpoch((epoch) => this.builderStatusTracker.poll(epoch));
     this.clock.start(this.controller.signal);
     this.subscribeToEvents(opts.api);
+    if (journal) void this.recoverHead(opts.api);
     void this.fetchProposerPreferences(opts.api);
 
     this.logger.info("Builder client initialized", {
@@ -181,6 +189,17 @@ export class Builder {
     const payloadStore = new PayloadStore();
     const bidStore = new BidStore();
     const ledger = new BidLedger();
+    const journal = opts.commitmentDir
+      ? new CommitmentJournal(opts.commitmentDir, {
+          genesisValidatorsRoot: toRootHex(genesis.genesisValidatorsRoot),
+          pubkey: builderSigner.getPubkeyHex(),
+        })
+      : undefined;
+    if (journal) {
+      const recovered = journal.recover(clock.getCurrentSlot(), payloadStore, bidStore, ledger);
+      ledger.persistReveal = (record) => journal.retainReveal(record);
+      logger.info("Recovered builder commitments", {recovered});
+    }
     const signal = opts.abortController.signal;
 
     const bidder = new Bidder(
@@ -204,6 +223,19 @@ export class Builder {
           ledger,
           builderIndex: index,
           hasPayload: ({blockHash}) => payloadStore.has(blockHash),
+          retainCommitment: journal
+            ? (bid) => {
+                if (config.getForkName(bid.message.slot) !== ForkName.gloas) throw Error("COMMITMENT_UNSUPPORTED_FORK");
+                const stored = payloadStore.get(toRootHex(bid.message.blockHash));
+                if (!stored) throw Error("COMMITMENT_PAYLOAD_MISSING");
+                const started = performance.now();
+                journal.retain(bid, stored);
+                logger.debug("Persisted builder commitment", {
+                  slot: bid.message.slot,
+                  elapsedMs: performance.now() - started,
+                });
+              }
+            : undefined,
         }),
         bidStore,
         proposerPreferencesTracker,
@@ -263,6 +295,7 @@ export class Builder {
       bidder,
       revealer,
       builderApi,
+      journal,
     });
   }
 
@@ -272,6 +305,25 @@ export class Builder {
     this.proposerPreferencesTracker.prune(slot);
     this.ledger.settlePaymentsBefore(slot - PAYMENT_SETTLEMENT_SLOTS);
     this.ledger.prune(slot);
+    this.journal?.prune(slot);
+  }
+
+  /** SSE does not replay a selection received while the process was offline. */
+  private async recoverHead(api: ApiClient): Promise<void> {
+    try {
+      const response = await api.beacon.getBlockHeader({blockId: "head"}, {signal: this.controller.signal});
+      const head = response.value();
+      await this.blockObserver.processBlockEvent(
+        {
+          slot: head.header.message.slot,
+          block: toRootHex(head.root),
+          executionOptimistic: response.meta().executionOptimistic,
+        },
+        this.controller.signal
+      );
+    } catch (error) {
+      if (!isErrorAborted(error)) this.logger.warn("Unable to recover current head selection", {}, error as Error);
+    }
   }
 
   /**

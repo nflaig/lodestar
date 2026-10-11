@@ -15,6 +15,17 @@ import {getApiClientStub, mockApiErrorResponse, mockApiResponse} from "../utils/
 const builderIndex = 7;
 
 describe("BidPublisher", () => {
+  it("does not expose a signature or gossip when durable retention fails", async () => {
+    const {api, publisher} = createPublisher({
+      hasPayload: () => true,
+      retainCommitment: () => {
+        throw Error("disk failed");
+      },
+    });
+    expect(() => publisher.prepare(createBid())).toThrow("disk failed");
+    await expect(publisher.publish(createBid(), new AbortController().signal)).rejects.toThrow("disk failed");
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+  });
   it("signs, records, and submits a bid with a retained payload", async () => {
     const bid = createBid();
     const blockHash = toRootHex(bid.blockHash);
@@ -204,9 +215,11 @@ describe("BidPublisher", () => {
 function createPublisher({
   hasPayload,
   fork = ForkName.gloas,
+  retainCommitment,
 }: {
   hasPayload: (identity: BidIdentity) => boolean;
   fork?: ForkName;
+  retainCommitment?: ConstructorParameters<typeof BidPublisher>[0]["retainCommitment"];
 }) {
   const config = createBeaconConfig(getConfig(fork), Buffer.alloc(32, 9));
   const keys = keypair(Buffer.alloc(32, 1));
@@ -215,7 +228,7 @@ function createPublisher({
   Object.assign(api.beacon, {publishExecutionPayloadBid: vi.fn()});
   api.beacon.publishExecutionPayloadBid.mockResolvedValue(mockApiResponse({}));
   const ledger = new BidLedger();
-  const publisher = new BidPublisher({api, config, signer, ledger, builderIndex, hasPayload});
+  const publisher = new BidPublisher({api, config, signer, ledger, builderIndex, hasPayload, retainCommitment});
   return {api, config, keys, ledger, publisher, signer};
 }
 

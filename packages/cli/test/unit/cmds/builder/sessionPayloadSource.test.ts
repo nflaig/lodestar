@@ -96,7 +96,6 @@ describe("SessionPayloadSource", () => {
     expect(fetch.mock.calls[0][0].params).toEqual([
       request.forkchoiceState.headBlockHash,
       serializePayloadAttributes(request.payloadAttributes),
-      "0x",
     ]);
     expect(signals.every((value) => value === signal)).toBe(true);
     expect(a.executionPayload.transactions).toHaveLength(0);
@@ -106,7 +105,7 @@ describe("SessionPayloadSource", () => {
     });
   });
 
-  it.each(["parentHash", "timestamp", "slotNumber", "prevRandao", "feeRecipient", "extraData", "withdrawals"] as const)(
+  it.each(["parentHash", "timestamp", "slotNumber", "prevRandao", "feeRecipient", "withdrawals"] as const)(
     "rejects a snapshot with changed %s",
     async (field) => {
       const {source, fetch, request} = setup();
@@ -123,6 +122,19 @@ describe("SessionPayloadSource", () => {
       });
     }
   );
+
+  it("preserves constructor extra data and rejects more than 32 bytes", async () => {
+    const {source, fetch, request} = setup();
+    const output = payloadResponse(request);
+    output.executionPayload.extraData = "0x" + Buffer.from("zbuilder 0123456789ab").toString("hex");
+    fetch.mockResolvedValueOnce({sessionId: "session-1"}).mockResolvedValueOnce(output);
+    const handle = await source.prepare(request, signal);
+    const payload = await source.getPayload(handle, signal);
+    expect(Buffer.from(payload.executionPayload.extraData).toString()).toBe("zbuilder 0123456789ab");
+    output.executionPayload.extraData = "0x" + "aa".repeat(33);
+    fetch.mockResolvedValueOnce(output);
+    await expect(source.getPayload(handle, signal)).rejects.toThrow();
+  });
 
   it("releases a begin response arriving after cancellation", async () => {
     const {source, fetch, request} = setup();

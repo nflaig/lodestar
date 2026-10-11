@@ -74,6 +74,9 @@ const KEEP_SLOTS = RECORD_RETENTION_EPOCHS * SLOTS_PER_EPOCH;
 
 /** Retains signed revisions and tracks the separate first-gossip allowance for each parent tuple. */
 export class BidLedger {
+  private readonly recoveredLiabilityBySlot = new Map<Slot, number>();
+  /** Optional durable conflict record; invoked before signing an envelope. */
+  persistReveal?: (record: {slot: Slot; blockRoot: RootHex; blockHash: RootHex; envelopeRoot: RootHex}) => void;
   private readonly gossipBySlot = new Map<Slot, Set<string>>();
   private readonly bidsBySlot = new Map<Slot, Map<string, MutableBidLedgerRecord>>();
   private readonly revealedPayloadByBlockRoot = new Map<RootHex, RevealedPayload>();
@@ -206,6 +209,7 @@ export class BidLedger {
       return;
     }
 
+    this.persistReveal?.({slot, blockRoot, blockHash, envelopeRoot});
     this.revealedPayloadByBlockRoot.set(blockRoot, {slot, blockHash, envelopeRoot, published: false});
   }
 
@@ -219,6 +223,9 @@ export class BidLedger {
 
   /** Marks won bids before the given slot as settled, by then their payment is reflected in the builder balance. */
   settlePaymentsBefore(slot: Slot): void {
+    for (const recoveredSlot of this.recoveredLiabilityBySlot.keys()) {
+      if (recoveredSlot < slot) this.recoveredLiabilityBySlot.delete(recoveredSlot);
+    }
     for (const [bidSlot, bidsForSlot] of this.bidsBySlot) {
       if (bidSlot >= slot) {
         continue;
@@ -234,8 +241,8 @@ export class BidLedger {
 
   getUnsettledValueGwei(currentEpoch: Epoch): number {
     let total = 0;
-    for (const bidsForSlot of this.bidsBySlot.values()) {
-      let slotValue = 0;
+    for (const [slot, bidsForSlot] of this.bidsBySlot) {
+      let slotValue = this.recoveredLiabilityBySlot.get(slot) ?? 0;
       for (const record of bidsForSlot.values()) {
         if (record.wonBlockRoots.size === 0 || record.paymentSettled) {
           continue;
@@ -252,6 +259,13 @@ export class BidLedger {
     return total;
   }
 
+  /** Selection events may have been missed while offline. Reserve the largest
+   * recovered offer per slot until its payment would be reflected in balance. */
+  reserveRecoveredSlot(slot: Slot, valueGwei: number): void {
+    if (!Number.isSafeInteger(valueGwei) || valueGwei < 0) throw Error("INVALID_RECOVERED_LIABILITY");
+    this.recoveredLiabilityBySlot.set(slot, Math.max(this.recoveredLiabilityBySlot.get(slot) ?? 0, valueGwei));
+  }
+
   getBidsForSlot(slot: Slot): BidLedgerRecord[] {
     return Array.from(this.bidsBySlot.get(slot)?.values() ?? [], toRecord);
   }
@@ -266,7 +280,7 @@ export class BidLedger {
       }
 
       for (const [key, record] of bidsForSlot) {
-        if (record.wonBlockRoots.size === 0 || record.paymentSettled) {
+        if (!this.recoveredLiabilityBySlot.has(slot) && (record.wonBlockRoots.size === 0 || record.paymentSettled)) {
           bidsForSlot.delete(key);
           removed++;
         }

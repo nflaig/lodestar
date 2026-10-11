@@ -75,10 +75,12 @@ payloads without blob transactions. Add these flags to the existing builder comm
 ```
 
 The constructor implements the private JSON-RPC methods `zbuilder_beginV1(parentHash,
-payloadAttributes, extraData)`, `zbuilder_getPayloadV1(sessionId, knownBlockHash?)` and
+payloadAttributes, extraData?)`, `zbuilder_getPayloadV1(sessionId, knownBlockHash?)` and
 `zbuilder_endV1(sessionId)`. Begin returns `{sessionId}`. Get returns a complete Engine
 payload response or `null` when the supplied hash is still current. The constructor
-must validate execution before exposing a result. Lodestar additionally checks the
+must validate execution before exposing a result. When extra data is omitted, the
+constructor chooses it, for example to identify its software revision; the result
+must fit the execution payload's 32-byte limit. Lodestar additionally checks the
 parent and attributes. Construction and intake remain external; Lodestar owns pricing,
 signing, bid publication and reveal obligations.
 
@@ -97,10 +99,24 @@ directory. `--payload.dryRun` builds without signing or publishing.
 The commitment journal permits 64 signed revisions per slot across all parents.
 Payload storage is capped at 192 payloads and 256 MiB of serialized content plus entry
 allowances, which is not a resident memory limit. Exhaustion rejects new work rather than evicting
-advertised payloads. These stores are in memory: restart recovery and multiple builder
-identities are not implemented. Keep the constructor RPC private and use bounded devnet
-trials until durable reveal obligations are supported. Metrics distinguish prepared API
-revisions (`prepared`) from successful gossip publication (`published`).
+advertised payloads. Metrics distinguish prepared API revisions (`prepared`) from
+successful gossip publication (`published`). Keep the constructor RPC private.
+
+Live CLI builders persist Gloas commitments to `<dataDir>/builder-commitments`.
+Payloads and signed bids are synced before exposure; reveal conflict records are
+synced before signing. Recovery restores eligible revisions and checks identity,
+checksums and required payloads before serving. The disk journal is limited to
+768 MiB, 20,000 files and 128 MiB per file. Payloads expire after two slots;
+bid and reveal metadata expire after three epochs. Dry runs do not write it.
+
+Recovery conservatively consumes each recorded parent tuple's gossip allowance
+and reserves the largest offer per recent slot as a possible unsettled liability.
+This covers missed selection events while offline, but can reduce available bidding
+balance until reconciliation or expiry. Startup also processes the current beacon
+head. An uncertain write stops new journal writes. Use one process per journal
+with local filesystem atomic-rename/fsync semantics, retain the data directory
+across upgrades, and drain existing offers before switching publisher identities.
+Multiple builder identities and replicated recovery are not implemented.
 
 ## License
 

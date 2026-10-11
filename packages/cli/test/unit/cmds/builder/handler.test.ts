@@ -18,6 +18,8 @@ describe("cmds / builder / args handler", () => {
       logFileLevel: LogLevel.debug,
       dataDir: testFilesDir,
       executionFeeRecipient: VALID_FEE_RECIPIENT,
+      "bidding.updateIntervalMs": 0,
+      "bidding.updateCutoffBps": 1000,
       ...args,
     } as unknown as IBuilderCliArgs & GlobalArgs);
   }

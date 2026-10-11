@@ -14,6 +14,8 @@ export type BidPublisherModules = {
   ledger: BidLedger;
   builderIndex: BuilderIndex;
   hasPayload: (identity: BidIdentity) => boolean;
+  /** Must finish durable retention before the signature can be exposed. */
+  retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => void;
 };
 
 export enum BidPublisherErrorCode {
@@ -97,6 +99,7 @@ export class BidPublisher {
       sszTypesFor(fork, "SignedExecutionPayloadBid").hashTreeRoot(signedExecutionPayloadBid)
     );
     ledger.recordRevision({...identity, valueGwei: bid.value, signedBidRoot});
+    this.modules.retainCommitment?.(signedExecutionPayloadBid);
     return signedExecutionPayloadBid;
   }
 

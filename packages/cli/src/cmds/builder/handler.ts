@@ -195,6 +195,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     executionFeeRecipient: fromHex(executionFeeRecipient),
     metrics,
     payloadSource,
+    commitmentDir: args["payload.dryRun"] ? undefined : path.join(globalPaths.dataDir, "builder-commitments"),
     bidding: {
       dryRun: args["payload.dryRun"],
       shareBps: args["bidding.shareBps"],

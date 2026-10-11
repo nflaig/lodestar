@@ -38,7 +38,7 @@ export class SessionPayloadSource implements PayloadSource {
     }
     const call = {
       method: "zbuilder_beginV1",
-      params: [request.forkchoiceState.headBlockHash, serializePayloadAttributes(request.payloadAttributes), "0x"],
+      params: [request.forkchoiceState.headBlockHash, serializePayloadAttributes(request.payloadAttributes)],
     };
     const result = await this.rpc(signal).fetch<{sessionId: string}, typeof call.params>(call);
     if (typeof result?.sessionId !== "string" || result.sessionId.length === 0 || result.sessionId.length > 128) {
@@ -104,7 +104,7 @@ function validateSessionPayload(sourceId: string, request: BuildRequest, respons
     toHex(executionPayload.prevRandao) !== toHex(attrs.prevRandao) ||
     toHex(executionPayload.feeRecipient).toLowerCase() !== attrs.suggestedFeeRecipient.toLowerCase() ||
     !ssz.capella.Withdrawals.equals(executionPayload.withdrawals, attrs.withdrawals) ||
-    executionPayload.extraData.length !== 0
+    executionPayload.extraData.length > 32
   )
     return fail("Payload differs from the session parent or attributes");
   if (
