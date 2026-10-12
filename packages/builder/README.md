@@ -96,6 +96,15 @@ Positive intervals require this constructor source and must be at least 25 ms. T
 source cannot be combined with the controlled transaction-file source or its capture
 directory. `--payload.dryRun` builds without signing or publishing.
 
+The beacon node emits `payload_attributes` once per slot, at two thirds of the slot before
+the proposal. To start construction earlier, run the builder's beacon node with
+`--emitPayloadAttributes --chain.emitPayloadAttributesEarly`. It then also emits as soon
+as the parent of the next slot is known: the empty tuple when the block is imported and
+the full tuple when its execution payload is imported. The regular emission before the
+slot still follows, so one slot may deliver the same tuple twice and the empty tuple before
+the full one. The builder keys builds by tuple, and a changed tuple cancels the earlier build.
+Epoch boundaries keep the regular timing only.
+
 The commitment journal permits 64 signed revisions per slot across all parents.
 Payload storage is capped at 192 payloads and 256 MiB of serialized content plus entry
 allowances, which is not a resident memory limit. Exhaustion rejects new work rather than evicting

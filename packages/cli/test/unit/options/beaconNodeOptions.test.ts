@@ -49,6 +49,7 @@ describe("options / beaconNodeOptions", () => {
       "chain.maxCPStateEpochsOnDisk": 1000,
       "chain.archiveMode": ArchiveMode.Frequency,
       emitPayloadAttributes: false,
+      "chain.emitPayloadAttributesEarly": true,
       graffitiAppend: false,
 
       "execution.urls": ["http://localhost:8551"],
@@ -142,6 +143,7 @@ describe("options / beaconNodeOptions", () => {
         disableProposerSlashings: true,
         archiveStateEpochFrequency: 1024,
         emitPayloadAttributes: false,
+        emitPayloadAttributesEarly: true,
         minSameMessageSignatureSetsToBatch: 32,
         maxShufflingCacheEpochs: 100,
         archiveDataEpochs: 10000,

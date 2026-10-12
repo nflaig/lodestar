@@ -28,6 +28,7 @@ export type ChainArgs = {
   "chain.maxSkipSlots"?: number;
   "chain.disableProposerSlashings"?: boolean;
   emitPayloadAttributes?: boolean;
+  "chain.emitPayloadAttributesEarly"?: boolean;
   broadcastValidationStrictness?: string;
   "chain.minSameMessageSignatureSetsToBatch"?: number;
   "chain.maxShufflingCacheEpochs"?: number;
@@ -70,6 +71,7 @@ export function parseArgs(args: ChainArgs & CircuitBreakerArgs): IBeaconNodeOpti
     maxSkipSlots: args["chain.maxSkipSlots"],
     disableProposerSlashings: args["chain.disableProposerSlashings"],
     emitPayloadAttributes: args.emitPayloadAttributes,
+    emitPayloadAttributesEarly: args["chain.emitPayloadAttributesEarly"],
     broadcastValidationStrictness: args.broadcastValidationStrictness,
     minSameMessageSignatureSetsToBatch:
       args["chain.minSameMessageSignatureSetsToBatch"] ?? defaultOptions.chain.minSameMessageSignatureSetsToBatch,
@@ -103,6 +105,14 @@ export const options: CliCommandOptions<ChainArgs> = {
     type: "boolean",
     defaultDescription: String(defaultOptions.chain.emitPayloadAttributes),
     description: "Flag to SSE emit execution `payloadAttributes` before every slot",
+    group: "chain",
+  },
+
+  "chain.emitPayloadAttributesEarly": {
+    type: "boolean",
+    defaultDescription: String(defaultOptions.chain.emitPayloadAttributesEarly),
+    description:
+      "Post-Gloas, also SSE emit execution `payloadAttributes` as soon as the parent of the next slot is known, on block and execution payload import. Requires `--emitPayloadAttributes`. The regular emission before the slot still runs.",
     group: "chain",
   },
 

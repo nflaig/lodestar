@@ -79,8 +79,10 @@ export class Bidder {
       return;
     }
 
-    // TODO: the beacon node emits payload attributes once per slot, late in the slot and only for the parent
-    // payload variant it would build on, revisit to start the build earlier and to bid on both variants
+    // The beacon node emits attributes before the slot for the parent variant it would build on. With
+    // `--chain.emitPayloadAttributesEarly` it also emits on block and payload import, so one slot may see
+    // the empty tuple, then the full one, then a repeat. Builds are keyed by tuple to absorb that.
+    // TODO: bid on both variants instead of cancelling the empty build once the full tuple arrives
     const buildId = `${slot}:${parentBlockRoot}:${parentBlockHash}`;
     const updates = (this.opts.updateIntervalMs ?? 0) > 0 && orchestrator.supportsUpdates;
     if (this.activeBuilds.has(buildId) || (!updates && ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot))) {

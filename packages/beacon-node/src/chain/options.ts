@@ -75,6 +75,11 @@ export type BlockProcessOpts = {
    */
   disableImportExecutionFcU?: boolean;
   emitPayloadAttributes?: boolean;
+  /**
+   * Post-Gloas, also emit `payload_attributes` as soon as the next slot's parent is known, on block and
+   * execution payload import. Requires `emitPayloadAttributes`. The regular emission before the slot still runs.
+   */
+  emitPayloadAttributesEarly?: boolean;
 
   /**
    * Used to specify to specify to run verifications only and not
@@ -117,6 +122,7 @@ export const defaultChainOptions: IChainOptions = {
   archiveMode: DEFAULT_ARCHIVE_MODE,
   pruneHistory: false,
   emitPayloadAttributes: false,
+  emitPayloadAttributesEarly: false,
   // for gossip block validation, it's unlikely we see a reorg with 32 slots
   // for attestation validation, having this value ensures we don't have to regen states most of the time
   maxSkipSlots: 32,
