@@ -185,6 +185,7 @@ describe("Bidder", () => {
     await Promise.all([first, duplicate]);
     await bidder.onPayloadAttributes(payloadAttributesEvent());
 
+    expect(api.validator.getProposerDutiesV2).toHaveBeenCalledOnce();
     expect(payloadSource.prepare).toHaveBeenCalledOnce();
     expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
     expect(logger.error).not.toHaveBeenCalled();
@@ -252,6 +253,33 @@ describe("Bidder", () => {
 
     expect(payloadSource.prepare).not.toHaveBeenCalled();
     expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the preference dependent root for a changed parent in the same epoch", async () => {
+    const {bidder} = createBidder();
+    await bidder.onPayloadAttributes(payloadAttributesEvent());
+    expect(payloadSource.prepare).not.toHaveBeenCalled();
+
+    const nextRoot = Buffer.alloc(32, 19);
+    const preferences = ssz.gloas.SignedProposerPreferences.defaultValue();
+    preferences.message.proposalSlot = slot;
+    preferences.message.dependentRoot = nextRoot;
+    preferences.message.feeRecipient = proposerFeeRecipient;
+    preferences.message.targetGasLimit = 60_000_000n;
+    proposerPreferencesTracker.onProposerPreferences(preferences);
+    api.validator.getProposerDutiesV2.mockResolvedValue(
+      mockApiResponse({data: [], meta: {executionOptimistic: false, dependentRoot: toRootHex(nextRoot)}})
+    );
+
+    const event = payloadAttributesEvent();
+    event.data.parentBlockRoot = Buffer.alloc(32, 15);
+    const bidding = bidder.onPayloadAttributes(event);
+    await vi.advanceTimersByTimeAsync(msToDeadline);
+    await bidding;
+
+    expect(api.validator.getProposerDutiesV2).toHaveBeenCalledTimes(2);
+    expect(payloadSource.prepare).toHaveBeenCalledOnce();
+    expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
   });
 
   it.each([

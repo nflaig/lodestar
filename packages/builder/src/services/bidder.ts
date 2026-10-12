@@ -55,7 +55,6 @@ export type BidderModules = {
  * while each parent tuple retains one gossip publication allowance.
  */
 export class Bidder {
-  private readonly dependentRootByEpoch = new Map<Epoch, RootHex>();
   private readonly activeBuilds = new Map<string, {slot: number; controller: AbortController}>();
 
   constructor(
@@ -103,7 +102,7 @@ export class Bidder {
         return;
       }
 
-      const dependentRoot = await this.getDependentRoot(computeEpochAtSlot(slot));
+      const dependentRoot = await this.getDependentRoot(computeEpochAtSlot(slot), signal);
       signal.throwIfAborted();
       const proposerPreferences = proposerPreferencesTracker.get(slot, dependentRoot);
       if (proposerPreferences === null) {
@@ -307,18 +306,8 @@ export class Bidder {
     return signedBid;
   }
 
-  /** Dependent root of the proposer duties in the given epoch, identifies the proposer preferences to bid against */
-  private async getDependentRoot(epoch: Epoch): Promise<RootHex> {
-    let dependentRoot = this.dependentRootByEpoch.get(epoch);
-    if (dependentRoot === undefined) {
-      dependentRoot = (await this.modules.api.validator.getProposerDutiesV2({epoch})).meta().dependentRoot;
-      this.dependentRootByEpoch.set(epoch, dependentRoot);
-      for (const cachedEpoch of this.dependentRootByEpoch.keys()) {
-        if (cachedEpoch < epoch - 1) {
-          this.dependentRootByEpoch.delete(cachedEpoch);
-        }
-      }
-    }
-    return dependentRoot;
+  /** A reorg can change the dependent root within an epoch. Active builds already coalesce repeated attributes. */
+  private async getDependentRoot(epoch: Epoch, signal: AbortSignal): Promise<RootHex> {
+    return (await this.modules.api.validator.getProposerDutiesV2({epoch}, {signal})).meta().dependentRoot;
   }
 }
