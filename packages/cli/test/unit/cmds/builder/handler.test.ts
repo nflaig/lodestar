@@ -1,8 +1,8 @@
 import {describe, expect, it} from "vitest";
 import {chainConfig} from "@lodestar/config/default";
 import {LogLevel} from "@lodestar/utils";
-import {builderHandler} from "../../../../src/cmds/builder/handler.js";
-import {IBuilderCliArgs} from "../../../../src/cmds/builder/options.js";
+import {builderHandler, parseProposerPreferencesUrls} from "../../../../src/cmds/builder/handler.js";
+import {IBuilderCliArgs, builderOptions} from "../../../../src/cmds/builder/options.js";
 import {GlobalArgs} from "../../../../src/options/index.js";
 import {testFilesDir} from "../../../utils.js";
 
@@ -20,6 +20,8 @@ describe("cmds / builder / args handler", () => {
       executionFeeRecipient: VALID_FEE_RECIPIENT,
       "bidding.updateIntervalMs": 0,
       "bidding.updateCutoffBps": 1000,
+      beaconNodeUrl: "http://127.0.0.1:9596",
+      "proposerPreferences.timeout": 1000,
       ...args,
     } as unknown as IBuilderCliArgs & GlobalArgs);
   }
@@ -52,5 +54,28 @@ describe("cmds / builder / args handler", () => {
     ],
   ])("rejects incomplete controlled payload options before loading keys", async (args, message) => {
     await expect(runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", ...args})).rejects.toThrow(message);
+  });
+
+  it.each([
+    [
+      {"proposerPreferences.urls": ["http://a:9596", "http://b:9596", "http://c:9596", "http://d:9596"]},
+      "accepts at most 3 urls",
+    ],
+    [{"proposerPreferences.urls": ["127.0.0.1:9596"]}, "urls[0] is not a valid http(s) url"],
+    [{"proposerPreferences.urls": ["http://127.0.0.1:9596"]}, "urls[0] duplicates --beaconNodeUrl"],
+    [{"proposerPreferences.urls": ["http://a:9596", "http://a:9596/"]}, "urls[1] duplicates"],
+    [{"proposerPreferences.urls": ["http://a:9596"], "proposerPreferences.timeout": 50}, "at least 100 ms"],
+  ])("rejects invalid proposer preferences options before loading keys", async (args, message) => {
+    await expect(runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", ...args})).rejects.toThrow(message);
+  });
+
+  it("parses comma separated proposer preferences urls without echoing credentials", () => {
+    const coerce = builderOptions["proposerPreferences.urls"].coerce as (urls: string[]) => string[];
+    const urls = coerce(["http://user:pass@a:9596,http://b:9596", "http://c:9596"]);
+    expect(urls).toEqual(["http://user:pass@a:9596", "http://b:9596", "http://c:9596"]);
+    expect(parseProposerPreferencesUrls(urls, "http://127.0.0.1:9596")).toBe(urls);
+    expect(() => parseProposerPreferencesUrls(["http://user:pass@a:9596", "http://user:pass@a:9596/"], "nope")).toThrow(
+      /^--proposerPreferences.urls\[1\] duplicates --beaconNodeUrl or an earlier url$/
+    );
   });
 });

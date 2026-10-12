@@ -3,6 +3,11 @@ export const defaultOptions = {
   beaconNodeUrl: "http://127.0.0.1:9596",
   requestTimeout: 10_000,
 
+  proposerPreferences: {
+    /** Deadline for polling proposer preferences from a beacon node, keeps slot ticks short */
+    timeoutMs: 1000,
+  },
+
   bidding: {
     /** Share of the payload value offered to the proposer */
     shareBps: 9000,

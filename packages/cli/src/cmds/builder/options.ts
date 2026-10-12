@@ -1,5 +1,5 @@
 import {defaultExecutionEngineHttpOpts} from "@lodestar/beacon-node";
-import {defaultOptions} from "@lodestar/builder";
+import {MAX_ADDITIONAL_PROPOSER_PREFERENCES_SOURCES, defaultOptions} from "@lodestar/builder";
 import {CliCommandOptions} from "@lodestar/utils";
 import {LogArgs, logOptions} from "../../options/logOptions.js";
 import {builderRestApiServerOptsDefault} from "./apiServer.js";
@@ -17,6 +17,8 @@ export type IBuilderCliArgs = LogArgs & {
   builderPubkey?: string;
   executionFeeRecipient: string;
   requestTimeout: number;
+  "proposerPreferences.urls"?: string[];
+  "proposerPreferences.timeout": number;
 
   "execution.urls": string[];
   "execution.timeout"?: number;
@@ -94,6 +96,25 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     description: "Timeout in milliseconds for HTTP requests to the beacon node",
     type: "number",
     default: defaultOptions.requestTimeout,
+  },
+
+  // Proposer preferences
+
+  "proposerPreferences.urls": {
+    description: `Urls to additional trusted beacon nodes on the same network, polled once per slot for signed proposer preferences the beacon node missed. At most ${MAX_ADDITIONAL_PROPOSER_PREFERENCES_SOURCES} urls`,
+    type: "array",
+    string: true,
+    coerce: (urls: string[]): string[] =>
+      // Parse ["url1,url2"] to ["url1", "url2"]
+      urls.flatMap((item) => item.split(",")),
+    group: "proposerPreferences",
+  },
+
+  "proposerPreferences.timeout": {
+    description: "Timeout in milliseconds for polling proposer preferences from beacon nodes",
+    type: "number",
+    default: defaultOptions.proposerPreferences.timeoutMs,
+    group: "proposerPreferences",
   },
 
   // Execution

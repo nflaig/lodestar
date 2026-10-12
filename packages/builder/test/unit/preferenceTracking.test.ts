@@ -11,6 +11,7 @@ import {BlockObserver} from "../../src/services/blockObserver.js";
 import {BuilderSigner} from "../../src/services/builderSigner.js";
 import {BuilderStatusTracker} from "../../src/services/builderStatusTracker.js";
 import {PayloadStore} from "../../src/services/payloadStore.js";
+import {ProposerPreferencesRecovery} from "../../src/services/proposerPreferencesRecovery.js";
 import {ProposerPreferencesTracker} from "../../src/services/proposerPreferencesTracker.js";
 import {getApiClientStub, mockApiResponse} from "./utils/apiStub.js";
 import {biddingOptions, createBiddingModules, getPayloadSourceStub} from "./utils/bidding.js";
@@ -52,6 +53,16 @@ describe("Builder preference tracking", () => {
       blockObserver,
       builderStatusTracker,
       proposerPreferencesTracker,
+      proposerPreferencesRecovery: new ProposerPreferencesRecovery(
+        {config, logger, tracker: proposerPreferencesTracker, metrics: null, signal: controller.signal},
+        {
+          primary: {id: "primary", api},
+          additional: [],
+          genesisValidatorsRoot: toRootHex(Buffer.alloc(32)),
+          genesisTime: 0,
+          timeoutMs: 1000,
+        }
+      ),
       clock,
       index: 1,
       payloadStore,

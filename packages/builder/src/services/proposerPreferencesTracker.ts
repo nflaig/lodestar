@@ -24,6 +24,10 @@ export class ProposerPreferencesTracker {
     return this.byDependentRootBySlot.get(slot)?.get(dependentRoot) ?? null;
   }
 
+  count(slot: Slot): number {
+    return this.byDependentRootBySlot.get(slot)?.size ?? 0;
+  }
+
   prune(currentSlot: Slot): number {
     let removed = 0;
     for (const [slot, byDependentRoot] of this.byDependentRootBySlot) {

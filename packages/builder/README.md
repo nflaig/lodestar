@@ -14,6 +14,25 @@ Typescript implementation of the Ethereum Consensus builder client.
 - Follow the [installation guide](https://chainsafe.github.io/lodestar/) to install Lodestar.
 - Quickly try out the whole stack by [starting a local testnet](https://chainsafe.github.io/lodestar/contribution/advanced-topics/setting-up-a-testnet/).
 
+## Recovering proposer preferences
+
+Proposers gossip their signed preferences once. A beacon node that misses the message never
+emits the matching event, and the builder does not bid for that slot. The builder polls the
+pool of its beacon node at startup and once per slot. Additional trusted beacon nodes on the
+same network can be polled as well:
+
+```sh
+--proposerPreferences.urls http://127.0.0.1:9597,http://127.0.0.1:9598
+```
+
+At most three additional URLs are accepted. Each is verified against the genesis and config of
+the primary beacon node before its pool is used; a node on a different network is excluded for
+the rest of the process. Only signed preferences for the current and next epoch are retained, and
+entries are merged by proposal slot and dependent root, so an entry already known is never
+replaced. The primary beacon node still provides payload attributes, duties and builder status.
+Polls share one deadline, `--proposerPreferences.timeout`, and run outside the bidding path; a
+failing node is reported once and skipped until it responds again.
+
 ## Controlled payloads on a devnet
 
 The builder can use Geth's `testing_buildBlockV1` to build an exact, ordered list of signed transactions.

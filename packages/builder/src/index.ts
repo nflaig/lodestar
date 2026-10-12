@@ -12,3 +12,7 @@ export {
   type PayloadSource,
   type PayloadSourceEngine,
 } from "./services/payloadSource.js";
+export {
+  MAX_ADDITIONAL_PROPOSER_PREFERENCES_SOURCES,
+  type ProposerPreferencesSource,
+} from "./services/proposerPreferencesRecovery.js";

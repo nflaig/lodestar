@@ -5,6 +5,7 @@ import {Clock, ClockOptions, IClock} from "@lodestar/state-transition";
 import {BuilderIndex, ExecutionAddress} from "@lodestar/types";
 import {Logger, isErrorAborted, toHex, toRootHex} from "@lodestar/utils";
 import {BuilderApi, BuilderApiOptions, getBuilderApi} from "./api/impl.js";
+import {defaultOptions} from "./defaults.js";
 import {waitForGenesis} from "./genesis.js";
 import {resolveBuilderIdentity} from "./identity.js";
 import {Metrics} from "./metrics.js";
@@ -24,6 +25,7 @@ import {PayloadOrchestrator} from "./services/payloadOrchestrator.js";
 import {PayloadSource} from "./services/payloadSource.js";
 import {PayloadStore} from "./services/payloadStore.js";
 import {ProposerDutiesTracker} from "./services/proposerDutiesTracker.js";
+import {ProposerPreferencesRecovery, ProposerPreferencesSource} from "./services/proposerPreferencesRecovery.js";
 import {ProposerPreferencesTracker} from "./services/proposerPreferencesTracker.js";
 import {Revealer, RevealerOptions} from "./services/revealer.js";
 
@@ -36,6 +38,7 @@ export type BuilderModules = {
   blockObserver: BlockObserver;
   builderStatusTracker: BuilderStatusTracker;
   proposerPreferencesTracker: ProposerPreferencesTracker;
+  proposerPreferencesRecovery: ProposerPreferencesRecovery;
   clock: IClock;
   index: BuilderIndex;
   payloadStore: PayloadStore;
@@ -72,6 +75,12 @@ export type BuilderOptions = {
   builderApi?: BuilderApiOptions;
   /** Single-owner directory for durable Gloas bids, payloads and reveal conflicts. */
   commitmentDir?: string;
+  proposerPreferences?: {
+    /** Trusted beacon nodes on the same network whose pools are polled for preferences `api` missed */
+    sources: ProposerPreferencesSource[];
+    /** Deadline per poll in milliseconds, defaults to 1000 */
+    timeoutMs?: number;
+  };
 };
 
 /**
@@ -81,6 +90,7 @@ export class Builder {
   readonly builderSigner: BuilderSigner;
   readonly proposerPreferencesTracker: ProposerPreferencesTracker;
   readonly builderApi: BuilderApi | null;
+  private readonly proposerPreferencesRecovery: ProposerPreferencesRecovery;
   private readonly blockObserver: BlockObserver;
   private readonly builderStatusTracker: BuilderStatusTracker;
   private readonly controller: AbortController;
@@ -101,6 +111,7 @@ export class Builder {
     blockObserver,
     builderStatusTracker,
     proposerPreferencesTracker,
+    proposerPreferencesRecovery,
     clock,
     index,
     payloadStore,
@@ -115,6 +126,7 @@ export class Builder {
     this.blockObserver = blockObserver;
     this.builderStatusTracker = builderStatusTracker;
     this.proposerPreferencesTracker = proposerPreferencesTracker;
+    this.proposerPreferencesRecovery = proposerPreferencesRecovery;
     this.clock = clock;
     this.controller = opts.abortController;
     this.logger = opts.logger;
@@ -135,12 +147,13 @@ export class Builder {
     this.clock.start(this.controller.signal);
     this.subscribeToEvents(opts.api);
     if (journal) void this.recoverHead(opts.api);
-    void this.fetchProposerPreferences(opts.api);
+    void this.proposerPreferencesRecovery.refresh(this.clock.getCurrentSlot());
 
     this.logger.info("Builder client initialized", {
       index: this.index,
       executionFeeRecipient: toHex(this.executionFeeRecipient),
       payloadSource: opts.payloadSource.id,
+      proposerPreferencesSources: this.proposerPreferencesRecovery.getSourceIds().join(","),
       shareBps: opts.bidding.shareBps,
       deadlineBps: opts.bidding.deadlineBps,
     });
@@ -185,6 +198,16 @@ export class Builder {
     }
     const blockObserver = new BlockObserver(config, logger, api);
     const proposerPreferencesTracker = new ProposerPreferencesTracker();
+    const proposerPreferencesRecovery = new ProposerPreferencesRecovery(
+      {config, logger, tracker: proposerPreferencesTracker, metrics: opts.metrics, signal: opts.abortController.signal},
+      {
+        primary: {id: "primary", api},
+        additional: opts.proposerPreferences?.sources ?? [],
+        genesisValidatorsRoot: toRootHex(genesis.genesisValidatorsRoot),
+        genesisTime: Number(genesis.genesisTime),
+        timeoutMs: opts.proposerPreferences?.timeoutMs ?? defaultOptions.proposerPreferences.timeoutMs,
+      }
+    );
 
     const payloadStore = new PayloadStore();
     const bidStore = new BidStore();
@@ -287,6 +310,7 @@ export class Builder {
       blockObserver,
       builderStatusTracker,
       proposerPreferencesTracker,
+      proposerPreferencesRecovery,
       clock,
       index,
       payloadStore,
@@ -306,6 +330,7 @@ export class Builder {
     this.ledger.settlePaymentsBefore(slot - PAYMENT_SETTLEMENT_SLOTS);
     this.ledger.prune(slot);
     this.journal?.prune(slot);
+    void this.proposerPreferencesRecovery.refresh(slot);
   }
 
   /** SSE does not replay a selection received while the process was offline. */
@@ -323,24 +348,6 @@ export class Builder {
       );
     } catch (error) {
       if (!isErrorAborted(error)) this.logger.warn("Unable to recover current head selection", {}, error as Error);
-    }
-  }
-
-  /**
-   * Proposer preferences are only broadcast once, the ones broadcast before the builder subscribed
-   * to them are fetched from the beacon node
-   */
-  private async fetchProposerPreferences(api: ApiClient): Promise<void> {
-    try {
-      const preferences = (await api.beacon.getProposerPreferences()).value();
-      for (const signedProposerPreferences of preferences) {
-        this.proposerPreferencesTracker.onProposerPreferences(signedProposerPreferences);
-      }
-      this.logger.info("Fetched proposer preferences from the beacon node", {count: preferences.length});
-    } catch (e) {
-      if (!isErrorAborted(e)) {
-        this.logger.warn("Unable to fetch proposer preferences from the beacon node", {}, e as Error);
-      }
     }
   }
 

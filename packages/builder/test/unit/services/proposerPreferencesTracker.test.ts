@@ -26,6 +26,8 @@ describe("ProposerPreferencesTracker", () => {
 
     expect(tracker.get(4, root(1))).toEqual(first);
     expect(tracker.get(4, root(2))).toEqual(second);
+    expect(tracker.count(4)).toBe(2);
+    expect(tracker.count(5)).toBe(0);
   });
 
   it("preserves the first validated preferences for a duplicate identity", () => {

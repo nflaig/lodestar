@@ -11,6 +11,7 @@ import {BlockObserver, ObservedBlock} from "../../src/services/blockObserver.js"
 import {BuilderSigner} from "../../src/services/builderSigner.js";
 import {BuilderStatusTracker} from "../../src/services/builderStatusTracker.js";
 import {PayloadStore} from "../../src/services/payloadStore.js";
+import {ProposerPreferencesRecovery} from "../../src/services/proposerPreferencesRecovery.js";
 import {ProposerPreferencesTracker} from "../../src/services/proposerPreferencesTracker.js";
 import {getApiClientStub, mockApiResponse} from "./utils/apiStub.js";
 import {biddingOptions, createBiddingModules, getPayloadSourceStub} from "./utils/bidding.js";
@@ -58,6 +59,16 @@ describe("Builder", () => {
       builderStatusTracker: new BuilderStatusTracker(api, logger, 1, null),
       blockObserver: new BlockObserver(config, logger, api),
       proposerPreferencesTracker,
+      proposerPreferencesRecovery: new ProposerPreferencesRecovery(
+        {config, logger, tracker: proposerPreferencesTracker, metrics: null, signal: controller.signal},
+        {
+          primary: {id: "primary", api},
+          additional: [],
+          genesisValidatorsRoot: toRootHex(Buffer.alloc(32)),
+          genesisTime: 0,
+          timeoutMs: 1000,
+        }
+      ),
       clock,
       index: 1,
       payloadStore,
@@ -150,9 +161,18 @@ describe("Builder", () => {
     new Builder(modules);
 
     await vi.waitFor(() =>
-      expect(logger.info).toHaveBeenCalledWith("Fetched proposer preferences from the beacon node", {count: 1})
+      expect(logger.info).toHaveBeenCalledWith("Recovered proposer preferences", {
+        source: "primary",
+        count: 1,
+        added: 1,
+        ignored: 0,
+      })
     );
     expect(modules.proposerPreferencesTracker.get(2, toRootHex(preferences.message.dependentRoot))).toBe(preferences);
+    expect(api.beacon.getProposerPreferences).toHaveBeenCalledExactlyOnceWith(undefined, {
+      signal: controller.signal,
+      timeoutMs: 1000,
+    });
   });
 
   it("starts without the proposer preferences of the beacon node if they can not be fetched", async () => {
@@ -162,12 +182,42 @@ describe("Builder", () => {
 
     await vi.waitFor(() =>
       expect(logger.warn).toHaveBeenCalledWith(
-        "Unable to fetch proposer preferences from the beacon node",
-        {},
+        "Unable to fetch proposer preferences",
+        {source: "primary"},
         expect.any(Error)
       )
     );
     expect(api.events.eventstream).toHaveBeenCalledOnce();
+  });
+
+  it("polls the proposer preferences again on each slot tick", async () => {
+    const builder = new Builder(modules);
+    await vi.waitFor(() =>
+      expect(logger.verbose).toHaveBeenCalledWith("No proposer preferences to recover", {
+        source: "primary",
+        count: 0,
+        added: 0,
+        ignored: 0,
+      })
+    );
+    // Let the startup refresh settle so the slot tick starts a new poll instead of joining it
+    await new Promise((resolve) => setTimeout(resolve));
+
+    const preferences = ssz.gloas.SignedProposerPreferences.defaultValue();
+    preferences.message.proposalSlot = 3;
+    api.beacon.getProposerPreferences.mockResolvedValue(
+      mockApiResponse({data: [preferences], meta: {version: ForkName.gloas}})
+    );
+    clock.currentSlot = 1;
+    await clock.tickSlotFns(1, controller.signal);
+    await vi.waitFor(() =>
+      expect(modules.proposerPreferencesTracker.get(3, toRootHex(preferences.message.dependentRoot))).toBe(preferences)
+    );
+    expect(api.beacon.getProposerPreferences).toHaveBeenCalledTimes(2);
+
+    await builder.close();
+    await clock.tickSlotFns(2, controller.signal);
+    expect(api.beacon.getProposerPreferences).toHaveBeenCalledTimes(2);
   });
 
   it("dispatches payload attributes to the bidder and observed blocks to the revealer", async () => {
