@@ -66,7 +66,7 @@ export function createBiddingModules({
   getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined};
   revealOptions?: Partial<RevealerOptions>;
   dryRun?: boolean;
-  updateOptions?: Pick<BidderOptions, "updateIntervalMs" | "updateCutoffBps">;
+  updateOptions?: Pick<BidderOptions, "updateIntervalMs" | "updateCutoffBps" | "maxRevisionsPerSlot">;
 }): {ledger: BidLedger; bidStore: BidStore; bidder: Bidder; revealer: Revealer} {
   const ledger = new BidLedger();
   const bidStore = new BidStore();

@@ -1,17 +1,17 @@
 import {createHash} from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import {SLOTS_PER_EPOCH} from "@lodestar/params";
 import {RootHex, gloas, ssz} from "@lodestar/types";
 import {fromHex, toRootHex} from "@lodestar/utils";
 import {BidLedger} from "./bidLedger.js";
 import {BidStore} from "./bidStore.js";
+import {BID_HISTORY_SLOTS, MAX_COMMITMENT_JOURNAL_FILES, PAYLOAD_RETENTION_SLOTS} from "./commitmentLimits.js";
 import {PayloadStore, StoredPayload} from "./payloadStore.js";
 
-const KEEP_SLOTS = 3 * SLOTS_PER_EPOCH;
+const KEEP_SLOTS = BID_HISTORY_SLOTS;
 const MAX_BYTES = 768 * 1024 * 1024;
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
-const MAX_FILES = 20_000;
+const MAX_FILES = MAX_COMMITMENT_JOURNAL_FILES;
 const recordName = /^(payload|bid|reveal)-(\d+)-(0x[0-9a-f]{64})\.json$/;
 
 type PayloadRecord = {
@@ -118,18 +118,21 @@ export class CommitmentJournal {
         record.blockHash !== toRootHex(payload.blockHash)
       )
         throw Error("COMMITMENT_PAYLOAD_MISMATCH");
-      payloads.add({
-        slot: record.slot,
-        parentBlockRoot: fromHex(record.parentBlockRoot),
-        blockHash: record.blockHash,
-        payload: {
-          sourceId: record.sourceId,
-          executionPayload: payload,
-          executionPayloadValue: BigInt(record.value),
-          executionRequests: ssz.gloas.ExecutionRequests.fromJson(record.requests),
-          blobsBundle: ssz.gloas.BlobsBundle.fromJson(record.blobs),
+      payloads.add(
+        {
+          slot: record.slot,
+          parentBlockRoot: fromHex(record.parentBlockRoot),
+          blockHash: record.blockHash,
+          payload: {
+            sourceId: record.sourceId,
+            executionPayload: payload,
+            executionPayloadValue: BigInt(record.value),
+            executionRequests: ssz.gloas.ExecutionRequests.fromJson(record.requests),
+            blobsBundle: ssz.gloas.BlobsBundle.fromJson(record.blobs),
+          },
         },
-      });
+        "recovery"
+      );
     }
     let recovered = 0;
     for (const name of this.sizes.keys()) {
@@ -150,7 +153,7 @@ export class CommitmentJournal {
       if (!ledger.hasSubmitted(bid.slot, identity.parentBlockHash, identity.parentBlockRoot))
         ledger.recordBid(identity);
       ledger.reserveRecoveredSlot(bid.slot, bid.value);
-      if (bid.slot + 2 >= currentSlot) {
+      if (bid.slot + PAYLOAD_RETENTION_SLOTS >= currentSlot) {
         const payload = payloads.get(identity.blockHash);
         if (
           !payload ||
@@ -175,7 +178,8 @@ export class CommitmentJournal {
   prune(currentSlot: number): void {
     for (const name of this.sizes.keys()) {
       const match = recordName.exec(name);
-      if (!match || Number(match[2]) + (match[1] === "payload" ? 2 : KEEP_SLOTS) >= currentSlot) continue;
+      if (!match || Number(match[2]) + (match[1] === "payload" ? PAYLOAD_RETENTION_SLOTS : KEEP_SLOTS) >= currentSlot)
+        continue;
       fs.unlinkSync(path.join(this.directory, name));
       this.bytes -= this.sizes.get(name) ?? 0;
       this.sizes.delete(name);

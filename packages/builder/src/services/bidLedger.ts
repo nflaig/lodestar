@@ -1,6 +1,6 @@
-import {SLOTS_PER_EPOCH} from "@lodestar/params";
 import type {Epoch, RootHex, Slot} from "@lodestar/types";
 import {LodestarError} from "@lodestar/utils";
+import {BID_HISTORY_SLOTS, MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 
 export type SubmittedBid = {
   slot: Slot;
@@ -69,8 +69,7 @@ export type BidLedgerErrorType =
 
 export class BidLedgerError extends LodestarError<BidLedgerErrorType> {}
 
-const RECORD_RETENTION_EPOCHS = 3;
-const KEEP_SLOTS = RECORD_RETENTION_EPOCHS * SLOTS_PER_EPOCH;
+const KEEP_SLOTS = BID_HISTORY_SLOTS;
 
 /** Retains signed revisions and tracks the separate first-gossip allowance for each parent tuple. */
 export class BidLedger {
@@ -84,6 +83,24 @@ export class BidLedger {
 
   hasSubmitted(slot: Slot, parentBlockHash: RootHex, parentBlockRoot: RootHex): boolean {
     return this.gossipBySlot.get(slot)?.has(tupleKey(parentBlockHash, parentBlockRoot)) ?? false;
+  }
+
+  getRevisionCount(slot: Slot): number {
+    return this.bidsBySlot.get(slot)?.size ?? 0;
+  }
+
+  /** Preflight new offers before retaining their payload or signing. */
+  assertCanRecordRevision(
+    {slot, parentBlockHash, parentBlockRoot}: Pick<SubmittedBid, "slot" | "parentBlockHash" | "parentBlockRoot">,
+    limit = MAX_BID_REVISIONS_PER_SLOT
+  ): void {
+    if (slot < this.pruneCutoffSlot) {
+      throw new BidLedgerError({code: BidLedgerErrorCode.BID_TOO_OLD, slot, pruneCutoffSlot: this.pruneCutoffSlot});
+    }
+    // Bound all parent variants together, including uncertain network publications.
+    if (this.getRevisionCount(slot) >= Math.min(limit, MAX_BID_REVISIONS_PER_SLOT)) {
+      throw new BidLedgerError({code: BidLedgerErrorCode.REVISION_LIMIT, slot, parentBlockHash, parentBlockRoot});
+    }
   }
 
   assertCanRecordBid({
@@ -130,23 +147,14 @@ export class BidLedger {
         pruneCutoffSlot: this.pruneCutoffSlot,
       });
     }
+    const key = `${tupleKey(bid.parentBlockHash, bid.parentBlockRoot)}:${bid.signedBidRoot}`;
     let bidsForSlot = this.bidsBySlot.get(bid.slot);
+    const previous = bidsForSlot?.get(key);
+    if (previous) return toRecord(previous);
+    this.assertCanRecordRevision(bid);
     if (bidsForSlot === undefined) {
       bidsForSlot = new Map();
       this.bidsBySlot.set(bid.slot, bidsForSlot);
-    }
-
-    const key = `${tupleKey(bid.parentBlockHash, bid.parentBlockRoot)}:${bid.signedBidRoot}`;
-    const previous = bidsForSlot.get(key);
-    if (previous) return toRecord(previous);
-    // Bound all parent variants together, including uncertain network publications.
-    if (bidsForSlot.size >= 64) {
-      throw new BidLedgerError({
-        code: BidLedgerErrorCode.REVISION_LIMIT,
-        slot: bid.slot,
-        parentBlockHash: bid.parentBlockHash,
-        parentBlockRoot: bid.parentBlockRoot,
-      });
     }
     const record = {...bid, wonBlockRoots: new Set<RootHex>(), paymentSettled: false};
     bidsForSlot.set(key, record);

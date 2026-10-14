@@ -5,14 +5,15 @@ import {IClock, computeEpochAtSlot} from "@lodestar/state-transition";
 import {BuilderIndex, BuilderStatus, Epoch, ExecutionAddress, RootHex, gloas} from "@lodestar/types";
 import {Logger, isErrorAborted, prettyGweiToEth, sleep, toHex, toRootHex} from "@lodestar/utils";
 import {BidResult, Metrics} from "../metrics.js";
-import {BidLedger} from "./bidLedger.js";
+import {BidLedger, BidLedgerError, BidLedgerErrorCode} from "./bidLedger.js";
 import {BidPolicy} from "./bidPolicy.js";
 import {BidPublisher} from "./bidPublisher.js";
 import {BidStore} from "./bidStore.js";
+import {MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuiltPayload} from "./payloadSource.js";
-import {PayloadStore} from "./payloadStore.js";
+import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
 import {ProposerPreferencesTracker} from "./proposerPreferencesTracker.js";
 
 const GWEI_TO_WEI = 1_000_000_000n;
@@ -25,6 +26,8 @@ export type BidderOptions = {
   updateIntervalMs?: number;
   /** Stop updates this far into the proposal slot, in basis points. */
   updateCutoffBps?: number;
+  /** Limit new offers across all parents without reducing recovery capacity for existing commitments. */
+  maxRevisionsPerSlot?: number;
   /** Point within the slot before the proposal slot at which the payload is retrieved and bid on, in basis points */
   deadlineBps: number;
   /** Do not bid while the builder balance is below this value */
@@ -60,7 +63,12 @@ export class Bidder {
   constructor(
     private readonly modules: BidderModules,
     private readonly opts: BidderOptions
-  ) {}
+  ) {
+    const limit = opts.maxRevisionsPerSlot ?? MAX_BID_REVISIONS_PER_SLOT;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_BID_REVISIONS_PER_SLOT) {
+      throw new RangeError(`maxRevisionsPerSlot must be between 1 and ${MAX_BID_REVISIONS_PER_SLOT}`);
+    }
+  }
 
   async onPayloadAttributes(event: PayloadAttributesEvent): Promise<void> {
     const {clock, config, ledger, logger, metrics, orchestrator, proposerPreferencesTracker} = this.modules;
@@ -214,6 +222,25 @@ export class Bidder {
         },
         signal
       );
+    } catch (error) {
+      if (
+        !best ||
+        !(
+          error instanceof PayloadStoreCapacityError ||
+          (error instanceof BidLedgerError && error.type.code === BidLedgerErrorCode.REVISION_LIMIT)
+        )
+      )
+        throw error;
+      logger.debug("Stopped API updates at commitment capacity", {
+        slot,
+        parentBlockHash,
+        parentBlockRoot,
+        reason: error.type.code,
+        slotBidRevisions: ledger.getRevisionCount(slot),
+      });
+      // Exhausting update capacity must not cancel the already retained bid's scheduled gossip.
+      await timer;
+      await publication;
     } finally {
       timerController.abort();
       await timer;
@@ -275,6 +302,7 @@ export class Bidder {
     signal.throwIfAborted();
     const {executionPayload} = payload;
     const blockHash = toRootHex(executionPayload.blockHash);
+    ledger.assertCanRecordRevision({slot, parentBlockHash, parentBlockRoot}, this.opts.maxRevisionsPerSlot);
     this.modules.payloadStore.add({slot, parentBlockRoot: data.parentBlockRoot, blockHash, payload});
 
     const bid = createExecutionPayloadBid({
@@ -301,6 +329,9 @@ export class Bidder {
       gasLimit: executionPayload.gasLimit,
       transactions: executionPayload.transactions.length,
       blobs: bid.blobKzgCommitments.length,
+      slotBidRevisions: ledger.getRevisionCount(slot),
+      retainedPayloads: this.modules.payloadStore.size,
+      retainedPayloadBytes: this.modules.payloadStore.bytes,
       secFromSlot: clock.secFromSlot(slot - 1),
     });
     return signedBid;

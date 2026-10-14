@@ -42,6 +42,7 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.getPayloadTimeout": number;
   "bidding.updateIntervalMs": number;
   "bidding.updateCutoffBps": number;
+  "bidding.maxRevisionsPerSlot": number;
   "bidding.minOperatingBalanceGwei": number;
   "reveal.cutoffBps"?: number;
 
@@ -212,6 +213,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     description: "Stop session updates at this point within the proposal slot, in basis points",
     type: "number",
     default: defaultOptions.bidding.updateCutoffBps,
+    group: "bidding",
+  },
+
+  "bidding.maxRevisionsPerSlot": {
+    description: "Maximum new signed revisions per slot across all parents; existing commitments remain recoverable",
+    type: "number",
+    default: defaultOptions.bidding.maxRevisionsPerSlot,
     group: "bidding",
   },
 

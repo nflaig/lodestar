@@ -20,6 +20,7 @@ describe("cmds / builder / args handler", () => {
       executionFeeRecipient: VALID_FEE_RECIPIENT,
       "bidding.updateIntervalMs": 0,
       "bidding.updateCutoffBps": 1000,
+      "bidding.maxRevisionsPerSlot": 256,
       beaconNodeUrl: "http://127.0.0.1:9596",
       "proposerPreferences.timeout": 1000,
       ...args,
@@ -54,6 +55,12 @@ describe("cmds / builder / args handler", () => {
     ],
   ])("rejects incomplete controlled payload options before loading keys", async (args, message) => {
     await expect(runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", ...args})).rejects.toThrow(message);
+  });
+
+  it.each([0, -1, 257, 1.5, NaN, Infinity])("rejects invalid revision limit %s before loading keys", async (limit) => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.maxRevisionsPerSlot": limit})
+    ).rejects.toThrow("--bidding.maxRevisionsPerSlot must be between 1 and 256");
   });
 
   it.each([

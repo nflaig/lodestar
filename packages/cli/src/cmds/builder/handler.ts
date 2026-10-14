@@ -13,6 +13,7 @@ import {
   EnginePayloadResult,
   EnginePayloadSource,
   MAX_ADDITIONAL_PROPOSER_PREFERENCES_SOURCES,
+  MAX_BID_REVISIONS_PER_SLOT,
   type PayloadSource,
   getMetrics,
 } from "@lodestar/builder";
@@ -62,6 +63,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   }
   const updateIntervalMs = args["bidding.updateIntervalMs"];
   const updateCutoffBps = args["bidding.updateCutoffBps"];
+  const maxRevisionsPerSlot = args["bidding.maxRevisionsPerSlot"];
   if (
     !Number.isSafeInteger(updateIntervalMs) ||
     (updateIntervalMs !== 0 && (updateIntervalMs < 25 || !constructorUrl))
@@ -70,6 +72,13 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   }
   if (!Number.isSafeInteger(updateCutoffBps) || updateCutoffBps < 0 || updateCutoffBps > 10000) {
     throw new YargsError("--bidding.updateCutoffBps must be between 0 and 10000");
+  }
+  if (
+    !Number.isSafeInteger(maxRevisionsPerSlot) ||
+    maxRevisionsPerSlot < 1 ||
+    maxRevisionsPerSlot > MAX_BID_REVISIONS_PER_SLOT
+  ) {
+    throw new YargsError(`--bidding.maxRevisionsPerSlot must be between 1 and ${MAX_BID_REVISIONS_PER_SLOT}`);
   }
   const proposerPreferencesUrls = parseProposerPreferencesUrls(
     args["proposerPreferences.urls"] ?? [],
@@ -158,6 +167,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       url: toPrintableUrl(constructorUrl),
       updateIntervalMs,
       updateCutoffBps,
+      maxRevisionsPerSlot,
       dryRun: args["payload.dryRun"],
     });
   } else if (transactionsFile && testingUrl) {
@@ -236,6 +246,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       getPayloadTimeout: args["bidding.getPayloadTimeout"],
       updateIntervalMs,
       updateCutoffBps,
+      maxRevisionsPerSlot,
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
     builderApi: builderApiOpts,

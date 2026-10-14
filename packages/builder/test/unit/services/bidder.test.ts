@@ -62,7 +62,7 @@ describe("Bidder", () => {
   function createBidder(
     getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined},
     dryRun = false,
-    updateOptions?: Pick<BidderOptions, "updateIntervalMs" | "updateCutoffBps">
+    updateOptions?: Pick<BidderOptions, "updateIntervalMs" | "updateCutoffBps" | "maxRevisionsPerSlot">
   ): {
     bidder: Bidder;
     ledger: BidLedger;
@@ -223,6 +223,88 @@ describe("Bidder", () => {
     expect(payloadSource.prepare).toHaveBeenCalledOnce();
     expect(payloadSource.release).toHaveBeenCalledOnce();
     expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it.each([64, 256])("rejects before retaining or signing at an admission limit of %i revisions", async (limit) => {
+    addProposerPreferences();
+    payloadSource.supportsUpdates = true;
+    const {bidder, ledger, bidStore} = createBidder(undefined, false, {
+      updateIntervalMs: 100,
+      updateCutoffBps: 1000,
+      maxRevisionsPerSlot: limit,
+    });
+    const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+    await vi.advanceTimersByTimeAsync(0);
+    const first = bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot));
+    if (!first) throw Error("Expected the first advertised bid");
+    const firstRecord = ledger.getBidsForSlot(slot)[0];
+    for (let i = 1; i < limit; i++) {
+      const root = Buffer.alloc(32);
+      root.writeUInt32BE(i, 28);
+      ledger.recordRevision({...firstRecord, signedBidRoot: toRootHex(root)});
+    }
+    const sign = vi.spyOn(BuilderSigner.prototype, "signExecutionPayloadBid");
+    const bytes = payloadStore.bytes;
+    const next = mockBuiltPayload({slot, parentHash: parentBlockHash, prevRandao, blockHash: Buffer.alloc(32, 12)});
+    payloadSource.getPayload.mockResolvedValue({
+      ...next,
+      fork: ForkName.gloas,
+      executionPayloadValue: 2_000_000_000_000_000_000n,
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(sign).not.toHaveBeenCalled();
+    expect(payloadStore.bytes).toBe(bytes);
+    expect(payloadStore.size).toBe(1);
+    expect(payloadStore.has(toRootHex(next.executionPayload.blockHash))).toBe(false);
+    expect(payloadStore.has(toRootHex(first.message.blockHash))).toBe(true);
+    expect(bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBe(first);
+    expect(ledger.getBidsForSlot(slot)).toHaveLength(limit);
+    controller.abort();
+    await bidding;
+    sign.mockRestore();
+  });
+
+  it.each(["revisions", "payloads"])(
+    "still gossips its best bid after reaching %s capacity before the deadline",
+    async (capacity) => {
+      addProposerPreferences();
+      payloadSource.supportsUpdates = true;
+      if (capacity === "payloads") payloadStore = new PayloadStore(256 * 1024 * 1024, 2);
+      const {bidder, bidStore} = createBidder(undefined, false, {
+        updateIntervalMs: 100,
+        updateCutoffBps: 1000,
+        maxRevisionsPerSlot: capacity === "revisions" ? 2 : 256,
+      });
+      let revision = 0;
+      payloadSource.getPayload.mockImplementation(async () => ({
+        ...mockBuiltPayload({
+          slot,
+          parentHash: parentBlockHash,
+          prevRandao,
+          blockHash: Buffer.alloc(32, ++revision),
+          valueGwei: revision * 1_000_000_000,
+        }),
+        fork: ForkName.gloas,
+      }));
+      const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+      await vi.advanceTimersByTimeAsync(500);
+      expect(payloadSource.getPayload).toHaveBeenCalledTimes(3);
+      expect(payloadStore.size).toBe(2);
+      expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+      const best = bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot));
+      await vi.advanceTimersByTimeAsync(msToDeadline - 500);
+      await bidding;
+      expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledExactlyOnceWith(
+        {signedExecutionPayloadBid: best},
+        {signal: expect.any(AbortSignal)}
+      );
+      expect(payloadSource.getPayload).toHaveBeenCalledTimes(3);
+      expect(logger.error).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([0, -1, 257, 1.5, NaN, Infinity])("rejects invalid programmatic revision limit %s", (limit) => {
+    expect(() => createBidder(undefined, false, {maxRevisionsPerSlot: limit})).toThrow(RangeError);
   });
 
   it("cancels a replaced parent without deleting its already advertised bid", async () => {
