@@ -1,3 +1,5 @@
+import {createHash} from "node:crypto";
+import {RLP} from "@ethereumjs/rlp";
 import {
   type EngineApiRpcReturnTypes,
   type JsonRpcHttpClient,
@@ -5,7 +7,7 @@ import {
   serializePayloadAttributes,
 } from "@lodestar/beacon-node";
 import type {BuildHandle, BuildRequest, BuiltPayload, PayloadSource} from "@lodestar/builder";
-import {ForkName} from "@lodestar/params";
+import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB, ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
 import {ErrorAborted, LodestarError, toHex} from "@lodestar/utils";
 
@@ -107,14 +109,41 @@ function validateSessionPayload(sourceId: string, request: BuildRequest, respons
     executionPayload.extraData.length > 32
   )
     return fail("Payload differs from the session parent or attributes");
+  if (executionPayloadValue < 0n) return fail("Negative payload value");
+  // Authentication belongs to the constructor. Check the complete ordered
+  // reveal data before this adapter can offer anything for signing. Repeated
+  // versioned hashes still require repeated entries in the payload bundle.
+  const hashes: Uint8Array[] = [];
+  try {
+    for (const transaction of executionPayload.transactions) {
+      if (transaction[0] !== 3) continue;
+      const fields = RLP.decode(transaction.subarray(1));
+      if (!Array.isArray(fields) || fields.length !== 14 || !Array.isArray(fields[10]) || !fields[10].length)
+        return fail("Invalid blob transaction");
+      for (const hash of fields[10]) {
+        if (!(hash instanceof Uint8Array) || hash.length !== 32 || hash[0] !== 1)
+          return fail("Invalid blob versioned hash");
+        hashes.push(hash);
+      }
+    }
+  } catch {
+    return fail("Invalid blob transaction encoding");
+  }
   if (
-    executionPayloadValue < 0n ||
-    executionPayload.blobGasUsed !== 0n ||
-    blobsBundle.blobs.length ||
-    blobsBundle.commitments.length ||
-    blobsBundle.proofs.length
-  ) {
-    return fail("Unsupported payload value or blobs");
+    hashes.length > 64 ||
+    executionPayload.blobGasUsed !== BigInt(hashes.length * 131072) ||
+    blobsBundle.blobs.length !== hashes.length ||
+    blobsBundle.commitments.length !== hashes.length ||
+    blobsBundle.proofs.length !== hashes.length * CELLS_PER_EXT_BLOB ||
+    blobsBundle.blobs.some((blob) => blob.length !== FIELD_ELEMENTS_PER_BLOB * 32) ||
+    blobsBundle.commitments.some((commitment) => commitment.length !== 48) ||
+    blobsBundle.proofs.some((proof) => proof.length !== 48)
+  )
+    return fail("Incomplete blob reveal data");
+  for (const [i, commitment] of blobsBundle.commitments.entries()) {
+    const hash = createHash("sha256").update(commitment).digest();
+    hash[0] = 1;
+    if (!hash.equals(hashes[i])) return fail("Blob commitment order differs from transactions");
   }
   return {sourceId, fork: request.fork, executionPayload, executionRequests, blobsBundle, executionPayloadValue};
 }

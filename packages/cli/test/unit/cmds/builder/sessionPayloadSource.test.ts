@@ -1,9 +1,11 @@
+import {createHash} from "node:crypto";
+import {RLP} from "@ethereumjs/rlp";
 import {describe, expect, it, vi} from "vitest";
 import {type EngineApiRpcReturnTypes, JsonRpcHttpClient, serializePayloadAttributes} from "@lodestar/beacon-node";
 import type {BuildRequest} from "@lodestar/builder";
 import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {ErrorAborted, toRootHex} from "@lodestar/utils";
+import {ErrorAborted, toHex, toRootHex} from "@lodestar/utils";
 import {SessionPayloadErrorCode, SessionPayloadSource} from "../../../../src/cmds/builder/sessionPayloadSource.js";
 
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
@@ -148,4 +150,54 @@ describe("SessionPayloadSource", () => {
     await expect(source.prepare(request, controller.signal)).rejects.toBeInstanceOf(ErrorAborted);
     expect(fetch.mock.calls[1][0]).toEqual({method: "zbuilder_endV1", params: ["late"]});
   });
+
+  function withBlobs(
+    request: BuildRequest,
+    count = 1
+  ): PayloadResponse & {blobsBundle: NonNullable<PayloadResponse["blobsBundle"]>} {
+    const output = payloadResponse(request, []);
+    const commitment = Buffer.alloc(48, 7);
+    const hash = createHash("sha256").update(commitment).digest();
+    hash[0] = 1;
+    const fields = Array.from({length: 14}, () => new Uint8Array());
+    const tx = [...fields.slice(0, 10), Array.from({length: count}, () => hash), ...fields.slice(11)];
+    output.executionPayload.transactions = [toHex(Buffer.concat([Buffer.from([3]), RLP.encode(tx)]))];
+    output.executionPayload.blobGasUsed = "0x" + (count * 131072).toString(16);
+    output.blobsBundle = {
+      blobs: Array.from({length: count}, () => "0x" + "00".repeat(131072)),
+      commitments: Array.from({length: count}, () => toHex(commitment)),
+      proofs: Array.from({length: count * 128}, () => "0x" + "11".repeat(48)),
+    };
+    return {...output, blobsBundle: output.blobsBundle};
+  }
+
+  it("retains ordered blob data, including repeated hashes, after release", async () => {
+    const {source, fetch, request} = setup();
+    fetch.mockResolvedValueOnce({sessionId: "blobs"}).mockResolvedValueOnce(withBlobs(request, 2));
+    const handle = await source.prepare(request, signal);
+    const payload = await source.getPayload(handle, signal);
+    fetch.mockResolvedValueOnce(true);
+    await source.release(handle, signal);
+    expect(payload.blobsBundle.blobs).toHaveLength(2);
+    expect(payload.blobsBundle.proofs).toHaveLength(256);
+    expect(payload.executionPayload.blobGasUsed).toBe(262144n);
+  });
+
+  it.each(["missingBlob", "oldProofs", "wrongCommitment", "wrongGas", "wrappedTransaction"])(
+    "rejects incomplete blob reveals: %s",
+    async (fault) => {
+      const {source, fetch, request} = setup();
+      const response = withBlobs(request);
+      if (fault === "missingBlob") response.blobsBundle.blobs = [];
+      if (fault === "oldProofs") response.blobsBundle.proofs = response.blobsBundle.proofs.slice(0, 1);
+      if (fault === "wrongCommitment") response.blobsBundle.commitments[0] = "0x" + "08".repeat(48);
+      if (fault === "wrongGas") response.executionPayload.blobGasUsed = "0x0";
+      if (fault === "wrappedTransaction") response.executionPayload.transactions[0] = "0x03c0";
+      fetch.mockResolvedValueOnce({sessionId: "blobs"}).mockResolvedValueOnce(response);
+      const handle = await source.prepare(request, signal);
+      await expect(source.getPayload(handle, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH},
+      });
+    }
+  );
 });

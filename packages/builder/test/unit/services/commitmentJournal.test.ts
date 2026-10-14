@@ -58,6 +58,28 @@ afterEach(() => {
 });
 
 describe("CommitmentJournal", () => {
+  it("recovers every blob and cell proof for an older selected revision", () => {
+    const {directory, journal} = setup();
+    const original = revision(1);
+    original.stored.payload.executionPayload.blobGasUsed = 131072n;
+    original.stored.payload.blobsBundle = {
+      blobs: [new Uint8Array(131072).fill(1)],
+      commitments: [new Uint8Array(48).fill(2)],
+      proofs: Array.from({length: 128}, (_, i) => new Uint8Array(48).fill(i)),
+    };
+    original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
+    journal.retain(original.signed, original.stored);
+    journal.retain(revision(2).signed, revision(2).stored);
+    const {payloads, bids, count} = recover(directory);
+    expect(count).toBe(2);
+    expect(bids.has(original.signed)).toBe(true);
+    const restored = payloads.get(original.stored.blockHash);
+    expect(restored?.payload.blobsBundle).toEqual(original.stored.payload.blobsBundle);
+    original.stored.payload.blobsBundle.blobs[0].fill(3);
+    expect(restored?.payload.blobsBundle.blobs[0][0]).toBe(1);
+    expect(restored?.payload.blobsBundle.proofs[127][0]).toBe(127);
+  });
+
   it("recovers full overlapping slots and keeps old revisions selectable above a lower admission limit", () => {
     const {directory, journal} = setup();
     const originals = Array.from({length: 1024}, (_, i) => {
