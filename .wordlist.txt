@@ -136,6 +136,7 @@ bootnodes
 bundlers
 chainConfig
 chainsafe
+checksums
 chiado
 chmod
 cli
@@ -152,6 +153,7 @@ cryptographic
 dApp
 dApps
 ddos
+deadlineBps
 decrypt
 decrypted
 derypted
@@ -172,11 +174,13 @@ ephemery
 ethers
 fastconfirm
 feeRecipient
+filesystem
 flamegraph
 flamegraphs
 floodsub
 forkchoice
 fsSL
+fsync
 getNetworkIdentity
 gloas
 gnosis

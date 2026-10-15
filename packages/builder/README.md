@@ -209,7 +209,7 @@ flight skips that stage. Uncertain sends are retained and never retried for that
 
 Each identity has a separate ledger and a durable journal under
 `<commitmentDir>-gossip/<pubkey>`. These directories must accompany the primary journal
-through backups and deployments. Startup refuses to omit a configured signer whose journal still contains a revealable
+through backups and deployments. Startup refuses to omit a configured signer whose journal still contains an outstanding
 commitment. Keep those keys available and drain bidding before removing an identity. Shared payloads stay in
 memory until the normal reveal retention expires, and each journal independently holds
 the payloads needed to recover that identity's commitments.
