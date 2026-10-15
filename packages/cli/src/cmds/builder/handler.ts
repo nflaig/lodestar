@@ -244,6 +244,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       shareBps: args["bidding.shareBps"],
       fixedCostGwei: args["bidding.fixedCostGwei"],
       subsidyGwei: args["bidding.subsidyGwei"],
+      subsidyUntilSlot: args["bidding.subsidyUntilSlot"],
       minValueGwei: args["bidding.minValueGwei"],
       maxValueGwei: args["bidding.maxValueGwei"],
       deadlineBps: args["bidding.deadlineBps"],

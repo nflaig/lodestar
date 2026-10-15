@@ -398,7 +398,7 @@ export class Bidder {
     const unsettledGwei = ledger.getUnsettledValueGwei(computeEpochAtSlot(slot));
     const coverableGwei = Math.max(balance - MIN_DEPOSIT_AMOUNT - unsettledGwei, 0);
     const payloadValueGwei = Number(payload.executionPayloadValue / GWEI_TO_WEI);
-    const value = this.modules.policy.computeValue({payloadValueGwei, coverableGwei});
+    const value = this.modules.policy.computeValue({slot, payloadValueGwei, coverableGwei});
     if (value === null) {
       logger.info("Bid policy declined to bid", {...logCtx, payloadValueGwei, coverableGwei, unsettledGwei});
       metrics?.bids.total.inc({result: BidResult.policyDeclined});
