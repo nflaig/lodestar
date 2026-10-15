@@ -249,6 +249,8 @@ export class Bidder {
     const stagedPublications = stages.map((stage, index) =>
       sleep(stageTime(stage.deadlineBps) - Date.now(), AbortSignal.any([signal, timerController.signal]))
         .then(async () => {
+          const stageStarted = performance.now();
+          const timerLatenessMs = Date.now() - stageTime(stage.deadlineBps);
           const expires = index + 1 < stages.length ? stageTime(stages[index + 1].deadlineBps) : until;
           if (
             signal.aborted ||
@@ -278,7 +280,9 @@ export class Bidder {
             if (!signed || signal.aborted || Date.now() >= expires || signed.message.value <= highestAttemptedValue)
               return;
             highestAttemptedValue = signed.message.value;
+            const preparedAt = performance.now();
             await stage.bidPublisher.gossip(signed, signal);
+            const publishedAt = performance.now();
             metrics?.bids.total.inc({result: BidResult.published});
             logger.info("Gossiped execution payload bid", {
               slot,
@@ -287,6 +291,9 @@ export class Bidder {
               blockHash: toRootHex(signed.message.blockHash),
               builderIndex: stage.builderIndex,
               value: prettyGweiToEth(signed.message.value),
+              timerLatenessMs,
+              prepareMs: preparedAt - stageStarted,
+              publishMs: publishedAt - preparedAt,
             });
           } finally {
             publicationPending = false;
