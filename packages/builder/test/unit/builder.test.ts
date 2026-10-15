@@ -11,6 +11,7 @@ import {AsyncCommitmentJournal} from "../../src/services/asyncCommitmentJournal.
 import {BlockObserver, ObservedBlock} from "../../src/services/blockObserver.js";
 import {BuilderSigner} from "../../src/services/builderSigner.js";
 import {BuilderStatusTracker} from "../../src/services/builderStatusTracker.js";
+import {GossipStage} from "../../src/services/gossipStages.js";
 import {PayloadStore} from "../../src/services/payloadStore.js";
 import {ProposerPreferencesRecovery} from "../../src/services/proposerPreferencesRecovery.js";
 import {ProposerPreferencesTracker} from "../../src/services/proposerPreferencesTracker.js";
@@ -91,6 +92,69 @@ describe("Builder", () => {
   afterEach(() => {
     controller.abort();
     vi.restoreAllMocks();
+  });
+
+  it("routes block events and lifecycle work to every configured identity", async () => {
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 2));
+    const extra = createBiddingModules({
+      api,
+      config: modules.opts.config,
+      logger,
+      clock,
+      builderSigner: new BuilderSigner(createBeaconConfig(modules.opts.config, Buffer.alloc(32)), {
+        secretKey,
+        publicKey: secretKey.toPublicKey(),
+      }),
+      proposerPreferencesTracker: modules.proposerPreferencesTracker,
+      payloadStore: modules.payloadStore,
+      payloadSource: modules.opts.payloadSource,
+      signal: controller.signal,
+      index: 2,
+    });
+    const status = new BuilderStatusTracker(api, logger, 2, null);
+    const stage: GossipStage = {
+      deadlineBps: 9750,
+      builderIndex: 2,
+      ledger: extra.ledger,
+      bidStore: extra.bidStore,
+      bidPublisher: extra.bidPublisher,
+      getBuilderStatus: () => status.getStatus(),
+    };
+    const journal = Object.create(AsyncCommitmentJournal.prototype) as AsyncCommitmentJournal;
+    const prune = vi.spyOn(journal, "prune").mockResolvedValue();
+    const close = vi.spyOn(journal, "close").mockResolvedValue();
+    const poll = vi.spyOn(status, "poll").mockResolvedValue();
+    modules.gossipIdentities = [{stage, builderStatusTracker: status, revealer: extra.revealer, journal}];
+    const primaryReveal = vi.spyOn(modules.revealer, "onBlock").mockRejectedValue(Error("failed primary"));
+    const extraReveal = vi.spyOn(extra.revealer, "onBlock").mockResolvedValue();
+    const block = ssz.gloas.SignedBeaconBlock.defaultValue();
+    api.beacon.getBlockV2.mockResolvedValue(
+      mockApiResponse({data: block, meta: {version: ForkName.gloas, executionOptimistic: false, finalized: false}})
+    );
+    const builder = new Builder(modules);
+    api.events.eventstream.mock.calls[0][0].onEvent({
+      type: EventType.block,
+      message: {slot: 0, block: toRootHex(Buffer.alloc(32, 8)), executionOptimistic: false},
+    });
+    await vi.waitFor(() => expect(extraReveal).toHaveBeenCalledOnce());
+    expect(primaryReveal).toHaveBeenCalledOnce();
+    await clock.tickSlotFns(1, controller.signal);
+    expect(prune).toHaveBeenCalledWith(1);
+    await clock.tickEpochFns(1, controller.signal);
+    expect(poll).toHaveBeenCalledWith(1);
+    await builder.close();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("rejects additional identities without durable storage before opening network connections", async () => {
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 2));
+    await expect(
+      Builder.init({
+        ...modules.opts,
+        gossipIdentities: [{keypair: {secretKey, publicKey: secretKey.toPublicKey()}, deadlineBps: 9750}],
+      })
+    ).rejects.toThrow("GOSSIP_STAGES_REQUIRE_COMMITMENT_DIRECTORY");
+    expect(api.events.eventstream).not.toHaveBeenCalled();
   });
 
   it("starts one shared stream after the clock and preserves slot pruning", async () => {

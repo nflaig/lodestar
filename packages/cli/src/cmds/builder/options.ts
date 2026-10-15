@@ -39,6 +39,7 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.minValueGwei": number;
   "bidding.maxValueGwei"?: number;
   "bidding.deadlineBps": number;
+  "bidding.gossipIdentitiesFile"?: string;
   "bidding.getPayloadTimeout": number;
   "bidding.updateIntervalMs": number;
   "bidding.updateCutoffBps": number;
@@ -254,6 +255,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
   "bidding.maxValueGwei": {
     description: "Never bid above this value in gwei",
     type: "number",
+    group: "bidding",
+  },
+
+  "bidding.gossipIdentitiesFile": {
+    description:
+      "JSON file listing additional registered builder keystores, password files and deadlineBps for staged P2P bids from the same payload session",
+    type: "string",
     group: "bidding",
   },
 
