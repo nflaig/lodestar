@@ -342,7 +342,11 @@ export class Builder {
           extraBidStore,
           extraLedger
         );
-        const extraJournal = await AsyncCommitmentJournal.start({directory, identity: journalIdentity});
+        const extraJournal = await AsyncCommitmentJournal.start({
+          directory,
+          identity: journalIdentity,
+          sharedPayloadDirectory: opts.commitmentDir,
+        });
         startupJournals.push(extraJournal);
         const stage: GossipStage = {
           deadlineBps: entry.deadlineBps,
