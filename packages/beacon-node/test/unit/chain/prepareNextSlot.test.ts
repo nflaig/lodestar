@@ -19,7 +19,7 @@ import {IChainOptions} from "../../../src/chain/options.js";
 import {PrepareNextSlotScheduler} from "../../../src/chain/prepareNextSlot.js";
 import {RegenCaller} from "../../../src/chain/regen/index.js";
 import {PayloadIdCache} from "../../../src/execution/engine/payloadIdCache.js";
-import {ClockEvent} from "../../../src/util/clock.js";
+import {Clock, ClockEvent} from "../../../src/util/clock.js";
 import {MockedLogger, getMockedLogger} from "../../mocks/loggerMock.js";
 import {MockedBeaconChain, getMockedBeaconChain} from "../../mocks/mockedBeaconChain.js";
 import {generateCachedBellatrixState, generateState, zeroProtoBlock} from "../../utils/state.js";
@@ -674,6 +674,49 @@ describe("PrepareNextSlot scheduler", () => {
         expect(regenStub.getBlockSlotState).not.toHaveBeenCalled();
       });
 
+      it("should preserve slot notification order while the clock catches up", async () => {
+        earlyController.abort();
+        earlyController = new AbortController();
+        Object.defineProperty(chainStub, "clock", {
+          value: new Clock({config, genesisTime: 0, signal: earlyController.signal}),
+        });
+        earlyScheduler = createEarlyScheduler();
+        const seen: number[] = [];
+        const start = chainStub.clock.currentSlot;
+        chainStub.clock.on(ClockEvent.slot, (slot) => seen.push(slot));
+        vi.setSystemTime((start + 3) * config.SLOT_DURATION_MS);
+
+        expect(chainStub.clock.currentSlot).toBe(start + 3);
+        expect(seen).toEqual([start + 1, start + 2, start + 3]);
+        expect(regenStub.getBlockSlotState).not.toHaveBeenCalled();
+      });
+
+      it("should admit a subscriber that connects during the grace period", async () => {
+        setPreviousHead();
+        chainStub.emitter.off(routes.events.EventType.payloadAttributes, payloadAttributesSpy);
+        chainStub.clock.emit(ClockEvent.slot, clockSlot);
+        await vi.advanceTimersByTimeAsync(grace / 2);
+        chainStub.emitter.on(routes.events.EventType.payloadAttributes, payloadAttributesSpy);
+        await vi.advanceTimersByTimeAsync(grace / 2);
+
+        expect(payloadAttributesSpy).toHaveBeenCalledTimes(1);
+      });
+
+      it("should use a different old head selected by recomputation", async () => {
+        setPreviousHead();
+        const newRoot = `0x${"fa".repeat(32)}`;
+        chainStub.recomputeForkChoiceHead.mockImplementation(() => {
+          const head = {...makeHead(PayloadStatus.EMPTY, newRoot), slot: clockSlot - 1};
+          forkChoiceStub.getHead.mockReturnValue(head);
+          return head;
+        });
+        chainStub.clock.emit(ClockEvent.slot, clockSlot);
+        await vi.advanceTimersByTimeAsync(grace);
+
+        expect(payloadAttributesSpy).toHaveBeenCalledTimes(1);
+        expect(payloadAttributesSpy.mock.calls[0][0].data.parentBlockRoot).toEqual(fromHex(newRoot));
+      });
+
       it("should cancel its clock subscription and pending fallback on shutdown", async () => {
         setPreviousHead();
         const listeners = chainStub.clock.listenerCount(ClockEvent.slot);
@@ -686,6 +729,30 @@ describe("PrepareNextSlot scheduler", () => {
         expect(payloadAttributesSpy).not.toHaveBeenCalled();
         expect(loggerStub.error).not.toHaveBeenCalled();
       });
+
+      it("should leave an overdue clock notification to the regular run", async () => {
+        setPreviousHead();
+        vi.setSystemTime(clockSlot * config.SLOT_DURATION_MS + grace + 1);
+        chainStub.clock.emit(ClockEvent.slot, clockSlot);
+        await flushEarlyWork();
+        expect(regenStub.getBlockSlotState).not.toHaveBeenCalled();
+      });
+
+      it.each([PayloadStatus.EMPTY, PayloadStatus.FULL])(
+        "should emit the same attributes as the regular run for a missed-slot %s head",
+        async (status) => {
+          setPreviousHead(status);
+          chainStub.getHeadState.mockReturnValue(makeState(clockSlot));
+          chainStub.clock.emit(ClockEvent.slot, clockSlot);
+          await vi.advanceTimersByTimeAsync(grace);
+          expect(payloadAttributesSpy).toHaveBeenCalledTimes(1);
+          const first = payloadAttributesSpy.mock.calls[0][0];
+          await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(6667) - grace);
+          expect(payloadAttributesSpy.mock.calls.length).toBeGreaterThan(1);
+          for (const [event] of payloadAttributesSpy.mock.calls.slice(1)) expect(event).toEqual(first);
+          expect(loggerStub.error).not.toHaveBeenCalled();
+        }
+      );
     });
 
     it("should not regenerate without payload attributes listeners", async () => {
