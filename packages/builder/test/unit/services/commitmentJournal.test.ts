@@ -58,6 +58,155 @@ afterEach(() => {
 });
 
 describe("CommitmentJournal", () => {
+  it("shares immutable payload files across identities and retains them after source pruning", () => {
+    const primary = setup();
+    const secondary = setup();
+    const original = revision(1);
+    original.stored.payload.blobsBundle = {
+      blobs: [new Uint8Array(131072).fill(1)],
+      commitments: [new Uint8Array(48).fill(2)],
+      proofs: Array.from({length: 128}, (_, i) => new Uint8Array(48).fill(i)),
+    };
+    original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
+    primary.journal.retain(original.signed, original.stored);
+    const signed = structuredClone(original.signed);
+    signed.message.builderIndex = 2;
+    const journal = new CommitmentJournal(secondary.directory, identity, undefined, primary.directory);
+    journal.retain(signed, original.stored);
+    const files = fs.readdirSync(secondary.directory).filter((name) => /^(blob|payload)-/.test(name));
+    expect(files).toHaveLength(2);
+    for (const name of files) {
+      const source = fs.statSync(path.join(primary.directory, name));
+      const dest = fs.statSync(path.join(secondary.directory, name));
+      expect(dest.ino, name).toBe(source.ino);
+      expect(dest.nlink, name).toBe(2);
+    }
+    primary.journal.prune(slot + 3);
+    const restored = recover(secondary.directory);
+    expect(restored.count).toBe(1);
+    expect(restored.bids.has(signed)).toBe(true);
+    expect(restored.bids.has(original.signed)).toBe(false);
+    const payload = restored.payloads.get(original.stored.blockHash)?.payload;
+    if (!payload) throw Error("Missing shared payload after source pruning");
+    expect(ssz.gloas.ExecutionPayload.equals(payload.executionPayload, original.stored.payload.executionPayload)).toBe(
+      true
+    );
+    expect(payload.blobsBundle).toEqual(original.stored.payload.blobsBundle);
+    expect(payload.executionPayloadValue).toBe(original.stored.payload.executionPayloadValue);
+    journal.prune(slot + 3);
+    expect(fs.readdirSync(secondary.directory).filter((name) => /^(blob|payload)-/.test(name))).toEqual([]);
+  });
+
+  it.each(["ENOENT", "EXDEV", "EPERM", "EACCES", "EMLINK", "EIO"])(
+    "writes its own durable copy when sharing is unavailable: %s",
+    (code) => {
+      const primary = setup();
+      const secondary = setup();
+      const original = revision(1);
+      primary.journal.retain(original.signed, original.stored);
+      vi.spyOn(fs, "linkSync").mockImplementation(() => {
+        throw Object.assign(Error(code), {code});
+      });
+      new CommitmentJournal(secondary.directory, identity, undefined, primary.directory).retain(
+        original.signed,
+        original.stored
+      );
+      expect(fs.linkSync).toHaveBeenCalled();
+      expect(recover(secondary.directory).bids.has(original.signed)).toBe(true);
+    }
+  );
+
+  it.each(["different bytes", "symlink"])("replaces a shared payload with %s with a recoverable copy", (kind) => {
+    const primary = setup();
+    const secondary = setup();
+    const original = revision(1);
+    primary.journal.retain(original.signed, original.stored);
+    const name = `payload-${slot}-${original.stored.blockHash}.json`;
+    const file = path.join(primary.directory, name);
+    if (kind === "different bytes") {
+      const bytes = fs.readFileSync(file);
+      bytes[bytes.length - 1] ^= 1;
+      fs.writeFileSync(file, bytes);
+    } else {
+      fs.renameSync(file, `${file}.original`);
+      fs.symlinkSync(`${file}.original`, file);
+    }
+    const journal = new CommitmentJournal(secondary.directory, identity, undefined, primary.directory);
+    journal.retain(original.signed, original.stored);
+    expect(recover(secondary.directory).bids.has(original.signed)).toBe(true);
+    expect(fs.lstatSync(path.join(secondary.directory, name)).isFile()).toBe(true);
+    const later = revision(2);
+    journal.retain(later.signed, later.stored);
+    expect(recover(secondary.directory).count).toBe(2);
+  });
+
+  it("never writes through an unverified temporary link left by a crash", () => {
+    const primary = setup();
+    const secondary = setup();
+    const original = revision(1);
+    primary.journal.retain(original.signed, original.stored);
+    const source = path.join(primary.directory, `payload-${slot}-${original.stored.blockHash}.json`);
+    const before = fs.readFileSync(source);
+    const later = revision(2);
+    const target = path.join(secondary.directory, `payload-${slot}-${later.stored.blockHash}.json`);
+    fs.symlinkSync(source, `${target}.tmp`);
+    new CommitmentJournal(secondary.directory, identity, undefined, primary.directory).retain(
+      later.signed,
+      later.stored
+    );
+    expect(fs.readFileSync(source)).toEqual(before);
+    expect(recover(secondary.directory).bids.has(later.signed)).toBe(true);
+  });
+
+  it("cleans abandoned temporary links after verifying the journal identity", () => {
+    const primary = setup();
+    const secondary = setup();
+    const original = revision(1);
+    primary.journal.retain(original.signed, original.stored);
+    const name = `payload-${slot}-${original.stored.blockHash}.json`;
+    const source = path.join(primary.directory, name);
+    const temporary = path.join(secondary.directory, `${name}.tmp`);
+    fs.linkSync(source, temporary);
+    expect(fs.statSync(source).nlink).toBe(2);
+    expect(() => new CommitmentJournal(secondary.directory, {...identity, pubkey: "other"})).toThrow(
+      "COMMITMENT_JOURNAL_IDENTITY_MISMATCH"
+    );
+    expect(fs.existsSync(temporary)).toBe(true);
+    expect(recover(secondary.directory).count).toBe(0);
+    expect(fs.existsSync(temporary)).toBe(false);
+    expect(fs.statSync(source).nlink).toBe(1);
+    expect(recover(primary.directory).bids.has(original.signed)).toBe(true);
+  });
+
+  it("rejects sharing from the same directory", () => {
+    const {directory} = setup();
+    expect(() => new CommitmentJournal(directory, identity, undefined, path.join(directory, "."))).toThrow(
+      "COMMITMENT_SHARED_DIRECTORY"
+    );
+  });
+
+  it("recovers a crash during the first identity write", () => {
+    const {directory} = setup();
+    fs.renameSync(path.join(directory, "identity.json"), path.join(directory, "identity.json.tmp"));
+    expect(recover(directory).count).toBe(0);
+    expect(fs.readdirSync(directory)).toEqual(["identity.json"]);
+  });
+
+  it("does not publish a bid when syncing the shared directory entry fails", () => {
+    const primary = setup();
+    const secondary = setup();
+    const original = revision(1);
+    primary.journal.retain(original.signed, original.stored);
+    const journal = new CommitmentJournal(secondary.directory, identity, undefined, primary.directory);
+    vi.spyOn(fs, "fsyncSync").mockImplementation(() => {
+      throw Error("sync failed");
+    });
+    expect(() => journal.retain(original.signed, original.stored)).toThrow("sync failed");
+    expect(fs.readdirSync(secondary.directory).some((n) => n.startsWith("bid-"))).toBe(false);
+    vi.restoreAllMocks();
+    expect(recover(secondary.directory).count).toBe(0);
+  });
+
   it("deduplicates sidecars across revisions, preserves repeated order and prunes by slot", () => {
     const {directory, journal} = setup();
     const first = revision(1);

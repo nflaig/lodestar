@@ -12,7 +12,7 @@ export type JournalOperation =
   | {kind: "prune"; slot: number};
 export type JournalRequest = {id: number; operation: JournalOperation};
 export type JournalReply = {id: number; error?: string};
-export type JournalWorkerData = {directory: string; identity: JournalIdentity};
+export type JournalWorkerData = {directory: string; identity: JournalIdentity; sharedPayloadDirectory?: string};
 export type JournalThread = {
   on(event: "message", listener: (reply: JournalReply) => void): unknown;
   on(event: "error", listener: (error: Error) => void): unknown;

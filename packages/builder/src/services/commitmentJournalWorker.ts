@@ -4,8 +4,8 @@ import {CommitmentJournal} from "./commitmentJournal.js";
 
 const port = parentPort;
 if (!port) throw Error("COMMITMENT_WORKER_PORT");
-const {directory, identity} = workerData as JournalWorkerData;
-const journal = new CommitmentJournal(directory, identity);
+const {directory, identity, sharedPayloadDirectory} = workerData as JournalWorkerData;
+const journal = new CommitmentJournal(directory, identity, undefined, sharedPayloadDirectory);
 port.on("message", ({id, operation}: JournalRequest) => {
   let error: string | undefined;
   try {

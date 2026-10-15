@@ -46,8 +46,11 @@ export class CommitmentJournal {
   constructor(
     private readonly directory: string,
     identity: JournalIdentity,
-    currentSlot?: number
+    currentSlot?: number,
+    private readonly sharedPayloadDirectory?: string
   ) {
+    if (sharedPayloadDirectory !== undefined && path.resolve(sharedPayloadDirectory) === path.resolve(directory))
+      throw Error("COMMITMENT_SHARED_DIRECTORY");
     const created = fs.mkdirSync(directory, {recursive: true, mode: 0o700});
     if (created) {
       // Persist newly created directory entries too: syncing a record's own
@@ -59,7 +62,10 @@ export class CommitmentJournal {
       }
     }
     const names = fs.readdirSync(directory);
-    if (names.length > MAX_FILES * 2) throw Error("COMMITMENT_JOURNAL_FILE_LIMIT");
+    const incomplete = names.filter(
+      (name) => name.endsWith(".tmp") && (name === "identity.json.tmp" || recordName.test(name.slice(0, -4)))
+    );
+    if (names.length - incomplete.length > MAX_FILES * 2) throw Error("COMMITMENT_JOURNAL_FILE_LIMIT");
     for (const name of names) {
       if (!recordName.test(name) && name !== "identity.json") continue;
       const info = fs.lstatSync(path.join(directory, name));
@@ -77,6 +83,17 @@ export class CommitmentJournal {
       if (this.sizes.size) throw Error("COMMITMENT_JOURNAL_IDENTITY_MISSING");
       this.write("identity.json", expected);
     }
+    // Only after identity validation: abandoned temporary links have no reveal obligation, but would
+    // otherwise pin unaccounted source data after pruning. Never follow them or remove unknown files.
+    for (const name of incomplete) {
+      try {
+        fs.unlinkSync(path.join(directory, name));
+      } catch (error) {
+        // Creating a missing identity may already have consumed identity.json.tmp.
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+    }
+    if (incomplete.length) syncDirectory(directory);
     // Expired records carry no reveal obligation. Remove them before checking
     // sidecar contents, just as recovery does for legacy payload records.
     if (currentSlot !== undefined) this.prune(currentSlot);
@@ -123,7 +140,7 @@ export class CommitmentJournal {
         const bytes = Buffer.concat([blob, commitments[i], ...cellProofs]);
         const hash = `0x${createHash("sha256").update(bytes).digest("hex")}`;
         const name = `blob-${slot}-${hash}.bin`;
-        if (!this.sizes.has(name)) this.writeBytes(name, bytes);
+        if (!this.sizes.has(name)) this.writeBytes(name, bytes, true);
         return hash;
       });
       const record: PayloadRecord = {
@@ -136,7 +153,7 @@ export class CommitmentJournal {
         requests: ssz.gloas.ExecutionRequests.toJson(payload.executionRequests),
         blobRefs,
       };
-      this.write(payloadName, record);
+      this.write(payloadName, record, true);
     }
     const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid));
     const name = `bid-${slot}-${root}.json`;
@@ -288,26 +305,59 @@ export class CommitmentJournal {
     return data;
   }
 
-  private write(name: string, data: unknown): void {
+  private write(name: string, data: unknown, sharePayload = false): void {
     const text = JSON.stringify({data, checksum: digest(JSON.stringify(data))});
-    this.writeBytes(name, Buffer.from(text));
+    this.writeBytes(name, Buffer.from(text), sharePayload);
   }
 
-  private writeBytes(name: string, data: Uint8Array): void {
+  private writeBytes(name: string, data: Uint8Array, sharePayload = false): void {
     if (this.failed) throw Error("COMMITMENT_JOURNAL_FAILED");
     const bytes = data.byteLength;
     if (bytes > MAX_FILE_BYTES || this.bytes + bytes > MAX_BYTES || this.sizes.size >= MAX_FILES)
       throw Error("COMMITMENT_JOURNAL_CAPACITY");
     const filename = path.join(this.directory, name);
+    const temporary = `${filename}.tmp`;
     try {
-      const fd = fs.openSync(`${filename}.tmp`, "w", 0o600);
       try {
-        fs.writeFileSync(fd, data);
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
+        fs.unlinkSync(temporary);
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
       }
-      fs.renameSync(`${filename}.tmp`, filename);
+      let linked = false;
+      if (sharePayload && this.sharedPayloadDirectory !== undefined) {
+        try {
+          fs.linkSync(path.join(this.sharedPayloadDirectory, name), temporary);
+          linked = true;
+        } catch (error) {
+          // Linking is optional; an existing target would violate the single-writer contract.
+          if (!(error instanceof Error && "code" in error && error.code !== "EEXIST")) throw error;
+        }
+        if (linked) {
+          let matches = false;
+          try {
+            const info = fs.lstatSync(temporary);
+            matches = info.isFile() && info.size === bytes && fs.readFileSync(temporary).equals(data);
+          } catch {
+            // An unreadable source is no reason to lose the independently retained in-memory snapshot.
+          }
+          if (!matches) {
+            fs.unlinkSync(temporary);
+            linked = false;
+          }
+        }
+      }
+      if (!linked) {
+        const fd = fs.openSync(temporary, "wx", 0o600);
+        try {
+          fs.writeFileSync(fd, data);
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
+      fs.renameSync(temporary, filename);
+      // Source files are immutable and already synced before a stage can borrow them. This identity's
+      // durable hard link owns its reveal lifetime independently of source pruning or restart order.
       syncDirectory(this.directory);
       this.sizes.set(name, bytes);
       this.bytes += bytes;
