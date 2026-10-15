@@ -19,6 +19,7 @@ import {IChainOptions} from "../../../src/chain/options.js";
 import {PrepareNextSlotScheduler} from "../../../src/chain/prepareNextSlot.js";
 import {RegenCaller} from "../../../src/chain/regen/index.js";
 import {PayloadIdCache} from "../../../src/execution/engine/payloadIdCache.js";
+import {ClockEvent} from "../../../src/util/clock.js";
 import {MockedLogger, getMockedLogger} from "../../mocks/loggerMock.js";
 import {MockedBeaconChain, getMockedBeaconChain} from "../../mocks/mockedBeaconChain.js";
 import {generateCachedBellatrixState, generateState, zeroProtoBlock} from "../../utils/state.js";
@@ -570,6 +571,121 @@ describe("PrepareNextSlot scheduler", () => {
       expect(chainStub.recomputeForkChoiceHead).not.toHaveBeenCalled();
       expect(regenStub.getBlockSlotState).not.toHaveBeenCalled();
       expect(payloadAttributesSpy).not.toHaveBeenCalled();
+    });
+
+    describe("missed-slot fallback", () => {
+      const grace = config.getSlotComponentDurationMs(1667);
+
+      function setPreviousHead(payloadStatus = PayloadStatus.FULL, slot = clockSlot - 1): ProtoBlock {
+        const head = {...makeHead(payloadStatus), slot};
+        forkChoiceStub.getHead.mockReturnValue(head);
+        chainStub.recomputeForkChoiceHead.mockImplementation(() => forkChoiceStub.getHead());
+        return head;
+      }
+
+      it("should start on the previous full head after the grace period without an import", async () => {
+        const head = setPreviousHead();
+        chainStub.clock.emit(ClockEvent.slot, clockSlot);
+        await vi.advanceTimersByTimeAsync(grace - 1);
+        expect(regenStub.getBlockSlotState).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(regenStub.getBlockSlotState).toHaveBeenCalledExactlyOnceWith(
+          head,
+          prepareSlot,
+          {dontTransferCache: true},
+          RegenCaller.prepareEarlyPayloadAttributes
+        );
+        expect(chainStub.getParentExecutionRequests).toHaveBeenCalledExactlyOnceWith(clockSlot - 1, headRoot);
+        expect(payloadAttributesSpy).toHaveBeenCalledExactlyOnceWith({
+          version: ForkName.gloas,
+          data: expect.objectContaining({
+            proposalSlot: prepareSlot,
+            parentBlockRoot: fromHex(headRoot),
+            parentBlockHash: fromHex(payloadHash),
+            payloadAttributes: expect.objectContaining({slotNumber: prepareSlot, withdrawals: []}),
+          }),
+        });
+        expect(executionEngineStub.notifyForkchoiceUpdate).not.toHaveBeenCalled();
+      });
+
+      it("should let an imported current-slot block supersede the fallback before it fires", async () => {
+        setPreviousHead();
+        chainStub.clock.emit(ClockEvent.slot, clockSlot);
+        forkChoiceStub.getHead.mockReturnValue(makeHead(PayloadStatus.EMPTY));
+        emitBlockImported();
+        await flushEarlyWork();
+        await vi.advanceTimersByTimeAsync(grace);
+
+        expect(regenStub.getBlockSlotState).toHaveBeenCalledTimes(1);
+        expect(payloadAttributesSpy).toHaveBeenCalledTimes(1);
+        expect(chainStub.recomputeForkChoiceHead).not.toHaveBeenCalled();
+      });
+
+      it("should replace an in-flight fallback when a current-slot block arrives", async () => {
+        setPreviousHead();
+        let resolveRegen: (state: IBeaconStateViewGloas) => void = () => {};
+        regenStub.getBlockSlotState.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveRegen = resolve;
+            })
+        );
+        chainStub.clock.emit(ClockEvent.slot, clockSlot);
+        await vi.advanceTimersByTimeAsync(grace);
+        const currentRoot = `0x${"ff".repeat(32)}`;
+        forkChoiceStub.getHead.mockReturnValue(makeHead(PayloadStatus.EMPTY, currentRoot));
+        emitBlockImported(clockSlot, currentRoot);
+        resolveRegen(prepareState);
+        await flushEarlyWork();
+
+        expect(regenStub.getBlockSlotState).toHaveBeenCalledTimes(2);
+        expect(payloadAttributesSpy).toHaveBeenCalledTimes(1);
+        expect(payloadAttributesSpy.mock.calls[0][0].data.parentBlockRoot).toEqual(fromHex(currentRoot));
+      });
+
+      it("should not use a pending previous payload", async () => {
+        setPreviousHead(PayloadStatus.PENDING);
+        chainStub.clock.emit(ClockEvent.slot, clockSlot);
+        await vi.advanceTimersByTimeAsync(grace);
+
+        expect(regenStub.getBlockSlotState).not.toHaveBeenCalled();
+        expect(payloadAttributesSpy).not.toHaveBeenCalled();
+      });
+
+      it("should leave an old head across an epoch boundary to the regular run", async () => {
+        const nextEpochSlot = SLOTS_PER_EPOCH + 1;
+        vi.setSystemTime(nextEpochSlot * config.SLOT_DURATION_MS);
+        setPreviousHead(PayloadStatus.FULL, SLOTS_PER_EPOCH - 1);
+        chainStub.clock.emit(ClockEvent.slot, nextEpochSlot);
+        await vi.advanceTimersByTimeAsync(grace);
+
+        expect(regenStub.getBlockSlotState).not.toHaveBeenCalled();
+        expect(payloadAttributesSpy).not.toHaveBeenCalled();
+      });
+
+      it("should not regenerate without a subscriber", async () => {
+        setPreviousHead();
+        chainStub.emitter.off(routes.events.EventType.payloadAttributes, payloadAttributesSpy);
+        chainStub.clock.emit(ClockEvent.slot, clockSlot);
+        await vi.advanceTimersByTimeAsync(grace);
+
+        expect(regenStub.getBlockSlotState).not.toHaveBeenCalled();
+      });
+
+      it("should cancel its clock subscription and pending fallback on shutdown", async () => {
+        setPreviousHead();
+        const listeners = chainStub.clock.listenerCount(ClockEvent.slot);
+        chainStub.clock.emit(ClockEvent.slot, clockSlot);
+        earlyController.abort();
+        await vi.advanceTimersByTimeAsync(grace);
+
+        expect(chainStub.clock.listenerCount(ClockEvent.slot)).toBe(listeners - 2);
+        expect(regenStub.getBlockSlotState).not.toHaveBeenCalled();
+        expect(payloadAttributesSpy).not.toHaveBeenCalled();
+        expect(loggerStub.error).not.toHaveBeenCalled();
+      });
     });
 
     it("should not regenerate without payload attributes listeners", async () => {

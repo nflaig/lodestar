@@ -60,6 +60,9 @@ const BUILDER_PREVERIFY_LIMIT_BPS = 2000;
  */
 const BUILDER_STATUS_CHECK_BEFORE_SLOT_BPS = 1667;
 
+// Give the current block time to arrive before preparing on the previous head (2s for 12s slots).
+const EARLY_PAYLOAD_ATTRIBUTES_FALLBACK_BPS = 1667;
+
 type EarlyPayloadAttributesTrigger = {
   clockSlot: Slot;
   blockRoot: RootHex;
@@ -84,6 +87,7 @@ export class PrepareNextSlotScheduler {
   private lastEmittedPayloadAttributes: EmittedPayloadAttributes | null = null;
   private earlyTrigger: EarlyPayloadAttributesTrigger | null = null;
   private earlyRunning = false;
+  private earlyFallbackTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly chain: IBeaconChain,
@@ -94,6 +98,7 @@ export class PrepareNextSlotScheduler {
   ) {
     this.chain.clock.on(ClockEvent.slot, this.prepareForNextSlot);
     if (this.chain.opts.emitPayloadAttributes === true && this.chain.opts.emitPayloadAttributesEarly === true) {
+      this.chain.clock.on(ClockEvent.slot, this.onEarlyFallbackSlot);
       this.chain.emitter.on(routes.events.EventType.block, this.onBlockImported);
       this.chain.emitter.on(routes.events.EventType.executionPayload, this.onExecutionPayloadImported);
     }
@@ -101,6 +106,11 @@ export class PrepareNextSlotScheduler {
       "abort",
       () => {
         this.chain.clock.off(ClockEvent.slot, this.prepareForNextSlot);
+        this.chain.clock.off(ClockEvent.slot, this.onEarlyFallbackSlot);
+        if (this.earlyFallbackTimeout !== null) {
+          clearTimeout(this.earlyFallbackTimeout);
+          this.earlyFallbackTimeout = null;
+        }
         this.chain.emitter.off(routes.events.EventType.block, this.onBlockImported);
         this.chain.emitter.off(routes.events.EventType.executionPayload, this.onExecutionPayloadImported);
       },
@@ -478,8 +488,39 @@ export class PrepareNextSlotScheduler {
     this.requestEarlyPayloadAttributes({clockSlot: slot, blockRoot, recomputeHead: true});
   };
 
+  private onEarlyFallbackSlot = (clockSlot: Slot): void => {
+    if (this.earlyFallbackTimeout !== null) {
+      clearTimeout(this.earlyFallbackTimeout);
+      this.earlyFallbackTimeout = null;
+    }
+    if (
+      !isForkPostGloas(this.config.getForkName(clockSlot + 1)) ||
+      computeEpochAtSlot(clockSlot + 1) !== computeEpochAtSlot(clockSlot) ||
+      !this.canEmitEarlyPayloadAttributes(clockSlot)
+    ) {
+      return;
+    }
+
+    const grace = this.config.getSlotComponentDurationMs(EARLY_PAYLOAD_ATTRIBUTES_FALLBACK_BPS);
+    this.earlyFallbackTimeout = setTimeout(
+      () => {
+        this.earlyFallbackTimeout = null;
+        if (!this.canEmitEarlyPayloadAttributes(clockSlot)) {
+          return;
+        }
+        const head = this.chain.forkChoice.getHead();
+        // Do not compete with imports or move checkpoint regeneration ahead of the regular run.
+        if (head.slot >= clockSlot || computeEpochAtSlot(head.slot) !== computeEpochAtSlot(clockSlot)) {
+          return;
+        }
+        this.requestEarlyPayloadAttributes({clockSlot, blockRoot: head.blockRoot, recomputeHead: true});
+      },
+      Math.max(0, grace - this.chain.clock.msFromSlot(clockSlot))
+    );
+  };
+
   /**
-   * Import events for the current slot coalesce into at most one running and one pending early
+   * Import events and the missed-slot fallback coalesce into at most one running and one pending early
    * emission. The pending trigger keeps the latest block root and any requested head recompute.
    */
   private requestEarlyPayloadAttributes(trigger: EarlyPayloadAttributesTrigger): void {
