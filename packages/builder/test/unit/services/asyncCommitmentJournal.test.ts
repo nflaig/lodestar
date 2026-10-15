@@ -1,5 +1,5 @@
 import {EventEmitter} from "node:events";
-import {describe, expect, it} from "vitest";
+import {describe, expect, it, vi} from "vitest";
 import {ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
 import {AsyncCommitmentJournal, type JournalRequest} from "../../../src/services/asyncCommitmentJournal.js";
@@ -62,10 +62,40 @@ describe("AsyncCommitmentJournal", () => {
     const pending = [journal.retain(bid, stored), journal.retain(bid, stored)];
     const outcomes = Promise.allSettled(pending);
     thread.emit("error", Error("worker failed"));
-    expect((await outcomes).map((outcome) => outcome.status)).toEqual(["rejected", "rejected"]);
+    expect(await outcomes).toMatchObject([
+      {status: "rejected", reason: {uncertain: true}},
+      {status: "rejected", reason: {uncertain: false}},
+    ]);
     await expect(journal.retain(bid, stored)).rejects.toThrow("worker failed");
     await journal.close();
     expect(thread.sent).toHaveLength(1);
+  });
+
+  it("lets a slow write finish and then persists an already queued reveal", async () => {
+    vi.useFakeTimers();
+    try {
+      const {thread, journal, bid, stored} = setup();
+      const terminate = vi.spyOn(thread, "terminate");
+      const offer = journal.retain(bid, stored);
+      const outcome = expect(offer).rejects.toMatchObject({uncertain: true, message: "COMMITMENT_WORKER_TIMEOUT"});
+      const reveal = journal.retainReveal({
+        slot: 1,
+        blockHash: stored.blockHash,
+        blockRoot: stored.blockHash,
+        envelopeRoot: stored.blockHash,
+      });
+      await vi.advanceTimersByTimeAsync(10_001);
+      await outcome;
+      expect(thread.sent).toHaveLength(1);
+      expect(terminate).not.toHaveBeenCalled();
+      thread.finish();
+      expect(thread.sent.at(-1)?.operation.kind).toBe("reveal");
+      thread.finish();
+      await reveal;
+      await journal.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("coalesces queued pruning without overtaking the active durable write", async () => {

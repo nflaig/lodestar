@@ -133,6 +133,18 @@ describe("CommitmentJournal", () => {
     );
   });
 
+  it("prunes corrupt expired sidecars before startup validation", () => {
+    const {directory} = setup();
+    fs.writeFileSync(path.join(directory, `blob-${slot - 3}-${toRootHex(Buffer.alloc(32))}.bin`), Buffer.alloc(1));
+    expect(() => new CommitmentJournal(directory, {...identity, pubkey: "other-builder"}, slot)).toThrow(
+      "COMMITMENT_JOURNAL_IDENTITY_MISMATCH"
+    );
+    expect(fs.readdirSync(directory)).toHaveLength(2);
+    const journal = new CommitmentJournal(directory, identity, slot);
+    expect(journal.recover(slot, new PayloadStore(), new BidStore(), new BidLedger())).toBe(0);
+    expect(fs.readdirSync(directory)).toEqual(["identity.json"]);
+  });
+
   it.each(["blob-", "payload-"])("does not recover an offer if its %s write failed", (prefix) => {
     const {directory, journal} = setup();
     const original = revision(1);

@@ -148,7 +148,7 @@ export class Bidder {
         await this.bidOnPayload(payload, data, feeRecipient, signal, false);
       }
     } catch (e) {
-      if (!isErrorAborted(e)) {
+      if (!isErrorAborted(e) && !(signal.aborted && e === signal.reason)) {
         metrics?.bids.total.inc({result: BidResult.error});
         logger.error("Failed to bid", logCtx, e as Error);
       }
@@ -321,7 +321,7 @@ export class Bidder {
     const signedBid = apiRevision
       ? await this.modules.bidPublisher.prepare(bid)
       : await this.modules.bidPublisher.publish(bid, signal);
-    signal.throwIfAborted();
+    if (apiRevision) signal.throwIfAborted();
     this.modules.bidStore.add(signedBid);
 
     metrics?.bids.total.inc({result: apiRevision ? BidResult.prepared : BidResult.published});

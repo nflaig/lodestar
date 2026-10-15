@@ -10,6 +10,7 @@ import {defer, toRootHex} from "@lodestar/utils";
 import {type BidIdentity, BidLedger, BidLedgerErrorCode} from "../../../src/services/bidLedger.js";
 import {BidPublisher, BidPublisherError, BidPublisherErrorCode} from "../../../src/services/bidPublisher.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
+import {CommitmentJournalError} from "../../../src/services/commitmentJournalError.js";
 import {getApiClientStub, mockApiErrorResponse, mockApiResponse} from "../utils/apiStub.js";
 
 const builderIndex = 7;
@@ -95,6 +96,24 @@ describe("BidPublisher", () => {
     });
     expect(retainCommitment).toHaveBeenCalledOnce();
     expect(ledger.getRevisionCount(bid.slot)).toBe(255);
+  });
+
+  it("releases revision admission when a write was rejected before dispatch", async () => {
+    const retainCommitment = vi
+      .fn()
+      .mockRejectedValueOnce(new CommitmentJournalError("COMMITMENT_WORKER_CAPACITY", false))
+      .mockResolvedValue(undefined);
+    const {publisher, ledger} = createPublisher({hasPayload: () => true, retainCommitment});
+    const bid = createBid();
+    for (let i = 0; i < 255; i++) {
+      const root = Buffer.alloc(32);
+      root.writeUInt32BE(i, 28);
+      ledger.recordRevision({...bidIdentity(bid), signedBidRoot: toRootHex(root), valueGwei: i});
+    }
+    await expect(publisher.prepare(bid)).rejects.toThrow("COMMITMENT_WORKER_CAPACITY");
+    await publisher.prepare(bid);
+    expect(retainCommitment).toHaveBeenCalledTimes(2);
+    expect(ledger.getRevisionCount(bid.slot)).toBe(256);
   });
   it("signs, records, and submits a bid with a retained payload", async () => {
     const bid = createBid();

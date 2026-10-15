@@ -45,7 +45,8 @@ export class CommitmentJournal {
 
   constructor(
     private readonly directory: string,
-    identity: JournalIdentity
+    identity: JournalIdentity,
+    currentSlot?: number
   ) {
     const created = fs.mkdirSync(directory, {recursive: true, mode: 0o700});
     if (created) {
@@ -67,13 +68,7 @@ export class CommitmentJournal {
         throw Error("COMMITMENT_JOURNAL_INVALID_FILE");
       this.sizes.set(name, info.size);
       this.bytes += info.size;
-      if (match?.[1] === "blob") {
-        const bytes = fs.readFileSync(path.join(directory, name));
-        if (bytes.length !== SIDECAR_BYTES || `0x${createHash("sha256").update(bytes).digest("hex")}` !== match[3])
-          throw Error("COMMITMENT_BLOB_CHECKSUM");
-      }
     }
-    if (this.bytes > MAX_BYTES || this.sizes.size > MAX_FILES) throw Error("COMMITMENT_JOURNAL_CAPACITY");
     const expected = {version: 1, ...identity};
     if (this.sizes.has("identity.json")) {
       if (JSON.stringify(this.read("identity.json")) !== JSON.stringify(expected))
@@ -81,6 +76,19 @@ export class CommitmentJournal {
     } else {
       if (this.sizes.size) throw Error("COMMITMENT_JOURNAL_IDENTITY_MISSING");
       this.write("identity.json", expected);
+    }
+    // Expired records carry no reveal obligation. Remove them before checking
+    // sidecar contents, just as recovery does for legacy payload records.
+    if (currentSlot !== undefined) this.prune(currentSlot);
+    if (this.bytes > MAX_BYTES || this.sizes.size > MAX_FILES) throw Error("COMMITMENT_JOURNAL_CAPACITY");
+    for (const [name, size] of this.sizes) {
+      const match = recordName.exec(name);
+      if (match?.[1] === "blob") {
+        if (size !== SIDECAR_BYTES) throw Error("COMMITMENT_BLOB_CHECKSUM");
+        const bytes = fs.readFileSync(path.join(directory, name));
+        if (bytes.length !== SIDECAR_BYTES || `0x${createHash("sha256").update(bytes).digest("hex")}` !== match[3])
+          throw Error("COMMITMENT_BLOB_CHECKSUM");
+      }
     }
   }
 

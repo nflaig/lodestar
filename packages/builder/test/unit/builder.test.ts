@@ -7,6 +7,7 @@ import {ForkName, SLOTS_PER_EPOCH} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
 import {ErrorAborted, defer, toRootHex} from "@lodestar/utils";
 import {Builder, BuilderModules} from "../../src/builder.js";
+import {AsyncCommitmentJournal} from "../../src/services/asyncCommitmentJournal.js";
 import {BlockObserver, ObservedBlock} from "../../src/services/blockObserver.js";
 import {BuilderSigner} from "../../src/services/builderSigner.js";
 import {BuilderStatusTracker} from "../../src/services/builderStatusTracker.js";
@@ -126,6 +127,21 @@ describe("Builder", () => {
     await builder.close();
     expect(controller.signal.aborted).toBe(true);
     expect(api.events.eventstream).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes preferences even while journal pruning is delayed or fails", async () => {
+    modules.journal = Object.create(AsyncCommitmentJournal.prototype) as AsyncCommitmentJournal;
+    const disk = defer<void>();
+    vi.spyOn(modules.journal, "prune").mockReturnValue(disk.promise);
+    vi.spyOn(modules.journal, "close").mockResolvedValue();
+    const refresh = vi.spyOn(modules.proposerPreferencesRecovery, "refresh").mockResolvedValue();
+    const builder = new Builder(modules);
+    const tick = clock.tickSlotFns(1, controller.signal);
+    expect(refresh).toHaveBeenCalledWith(1);
+    disk.reject(Error("slow disk failed"));
+    await tick;
+    expect(logger.error).toHaveBeenCalledWith("Failed to prune builder commitments", {slot: 1}, expect.any(Error));
+    await builder.close();
   });
 
   it.each([ForkName.gloas, ForkName.heze] as const)("dispatches %s block and preference events", async (version) => {

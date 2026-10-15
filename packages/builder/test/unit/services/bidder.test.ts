@@ -191,6 +191,22 @@ describe("Bidder", () => {
     expect(logger.error).not.toHaveBeenCalled();
   });
 
+  it("retains a successfully submitted bid if cancellation arrives during its acknowledgement", async () => {
+    addProposerPreferences();
+    const {bidder, bidStore} = createBidder();
+    api.beacon.publishExecutionPayloadBid.mockImplementation(async () => {
+      controller.abort();
+      return mockApiResponse({});
+    });
+    const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+    await vi.advanceTimersByTimeAsync(msToDeadline);
+    await bidding;
+    expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+    const {signedExecutionPayloadBid} = api.beacon.publishExecutionPayloadBid.mock.calls[0][0];
+    expect(bidStore.has(signedExecutionPayloadBid)).toBe(true);
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
   it("improves API bids after gossip while retaining both payload commitments", async () => {
     addProposerPreferences();
     payloadSource.supportsUpdates = true;

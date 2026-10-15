@@ -219,7 +219,7 @@ export class Builder {
         genesisValidatorsRoot: toRootHex(genesis.genesisValidatorsRoot),
         pubkey: builderSigner.getPubkeyHex(),
       };
-      const recovery = new CommitmentJournal(opts.commitmentDir, identity);
+      const recovery = new CommitmentJournal(opts.commitmentDir, identity, clock.getCurrentSlot());
       const recovered = recovery.recover(clock.getCurrentSlot(), payloadStore, bidStore, ledger);
       journal = await AsyncCommitmentJournal.start({directory: opts.commitmentDir, identity});
       logger.info("Recovered builder commitments", {recovered});
@@ -336,8 +336,12 @@ export class Builder {
     this.proposerPreferencesTracker.prune(slot);
     this.ledger.settlePaymentsBefore(slot - PAYMENT_SETTLEMENT_SLOTS);
     this.ledger.prune(slot);
-    await this.journal?.prune(slot);
     void this.proposerPreferencesRecovery.refresh(slot);
+    try {
+      await this.journal?.prune(slot);
+    } catch (error) {
+      this.logger.error("Failed to prune builder commitments", {slot}, error as Error);
+    }
   }
 
   /** SSE does not replay a selection received while the process was offline. */

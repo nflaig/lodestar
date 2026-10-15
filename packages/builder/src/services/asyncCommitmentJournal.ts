@@ -3,6 +3,7 @@ import type {gloas} from "@lodestar/types";
 import {ssz} from "@lodestar/types";
 import {defer} from "@lodestar/utils";
 import type {JournalIdentity, RevealRecord} from "./commitmentJournal.js";
+import {CommitmentJournalError} from "./commitmentJournalError.js";
 import type {StoredPayload} from "./payloadStore.js";
 
 export type JournalOperation =
@@ -24,8 +25,9 @@ const MAX_PENDING_BYTES = 64 * 1024 * 1024;
 const MAX_PENDING_OFFERS = 8;
 const MAX_PENDING_OPERATIONS = 16;
 const OPERATION_TIMEOUT = 10_000;
+const STARTUP_TIMEOUT = 30_000;
 
-type Pending = JournalRequest & {bytes: number; result: ReturnType<typeof defer<void>>};
+type Pending = JournalRequest & {bytes: number; result: ReturnType<typeof defer<void>>; timedOut?: boolean};
 
 /** One worker owns journal mutation. Only one request is cloned into it at a
  * time; queued payloads borrow the publisher's immutable retained snapshots.
@@ -44,7 +46,7 @@ export class AsyncCommitmentJournal {
   private timer: ReturnType<typeof setTimeout>;
 
   constructor(private readonly worker: JournalThread) {
-    this.timer = setTimeout(() => this.fail(Error("COMMITMENT_WORKER_TIMEOUT")), OPERATION_TIMEOUT);
+    this.timer = setTimeout(() => this.fail(Error("COMMITMENT_WORKER_STARTUP_TIMEOUT")), STARTUP_TIMEOUT);
     worker.on("message", (reply: JournalReply) => this.onReply(reply));
     worker.on("error", (error: Error) => this.fail(error));
     worker.on("exit", () => {
@@ -92,20 +94,21 @@ export class AsyncCommitmentJournal {
   async close(): Promise<void> {
     if (!this.closing) {
       this.closing = true;
-      if (!this.active && !this.queue.length) await this.stop();
+      if (this.active?.timedOut) this.fail(Error("COMMITMENT_WORKER_CLOSE_TIMEOUT"));
+      else if (!this.active && !this.queue.length) await this.stop();
     }
     await this.closed.promise;
   }
 
   private enqueue(operation: JournalOperation, bytes: number): Promise<void> {
-    if (this.failure) return Promise.reject(this.failure);
-    if (this.closing) return Promise.reject(Error("COMMITMENT_WORKER_CLOSED"));
+    if (this.failure) return Promise.reject(new CommitmentJournalError(this.failure.message, false));
+    if (this.closing) return Promise.reject(new CommitmentJournalError("COMMITMENT_WORKER_CLOSED", false));
     if (
       this.queue.length + Number(this.active !== undefined) >= MAX_PENDING_OPERATIONS ||
       (operation.kind === "retain" &&
         (this.pendingOffers >= MAX_PENDING_OFFERS || this.pendingBytes + bytes > MAX_PENDING_BYTES))
     )
-      return Promise.reject(Error("COMMITMENT_WORKER_CAPACITY"));
+      return Promise.reject(new CommitmentJournalError("COMMITMENT_WORKER_CAPACITY", false));
     const pending = {id: this.nextId++, operation, bytes, result: defer<void>()};
     this.pendingBytes += bytes;
     if (operation.kind === "retain") this.pendingOffers++;
@@ -123,7 +126,15 @@ export class AsyncCommitmentJournal {
       return;
     }
     const {id, operation} = this.active;
-    this.timer = setTimeout(() => this.fail(Error("COMMITMENT_WORKER_TIMEOUT")), OPERATION_TIMEOUT);
+    this.timer = setTimeout(() => {
+      if (this.closing) this.fail(Error("COMMITMENT_WORKER_CLOSE_TIMEOUT"));
+      else if (this.active) {
+        // The caller stops waiting, but a slow disk can still complete. Keep
+        // ownership until the late reply so pending reveals can then proceed.
+        this.active.timedOut = true;
+        this.active.result.reject(new CommitmentJournalError("COMMITMENT_WORKER_TIMEOUT", true));
+      }
+    }, OPERATION_TIMEOUT);
     try {
       // Clone, never transfer: old snapshots must remain available for reveal.
       this.worker.postMessage({id, operation} satisfies JournalRequest);
@@ -152,7 +163,7 @@ export class AsyncCommitmentJournal {
     this.active = undefined;
     this.pendingBytes -= pending.bytes;
     if (pending.operation.kind === "retain") this.pendingOffers--;
-    if (reply.error) pending.result.reject(Error(reply.error));
+    if (reply.error) pending.result.reject(new CommitmentJournalError(reply.error, true));
     else pending.result.resolve();
     this.pump();
   }
@@ -162,9 +173,9 @@ export class AsyncCommitmentJournal {
     this.failure = error;
     clearTimeout(this.timer);
     this.ready.reject(error);
-    this.active?.result.reject(error);
+    this.active?.result.reject(new CommitmentJournalError(error.message, true));
     this.active = undefined;
-    for (const pending of this.queue.splice(0)) pending.result.reject(error);
+    for (const pending of this.queue.splice(0)) pending.result.reject(new CommitmentJournalError(error.message, false));
     this.pendingBytes = this.pendingOffers = 0;
     void this.stop();
   }

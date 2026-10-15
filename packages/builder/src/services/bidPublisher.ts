@@ -7,6 +7,7 @@ import {LodestarError, toRootHex} from "@lodestar/utils";
 import type {BidIdentity, BidLedger} from "./bidLedger.js";
 import {BidLedgerError, BidLedgerErrorCode} from "./bidLedger.js";
 import type {BuilderSigner} from "./builderSigner.js";
+import {CommitmentJournalError} from "./commitmentJournalError.js";
 import {BID_HISTORY_SLOTS, MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 
 export type BidPublisherModules = {
@@ -136,6 +137,9 @@ export class BidPublisher {
       ledger.recordRevision({...identity, valueGwei: bid.value, signedBidRoot});
       recorded = true;
       return signedExecutionPayloadBid;
+    } catch (error) {
+      if (error instanceof CommitmentJournalError && !error.uncertain) persistenceAttempted = false;
+      throw error;
     } finally {
       // A failed acknowledgement can still leave a durable signature on disk.
       // Keep that admission consumed so restart cannot recover over 256 bids.
