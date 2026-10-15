@@ -5,7 +5,7 @@ import {type EngineApiRpcReturnTypes, JsonRpcHttpClient, serializePayloadAttribu
 import type {BuildRequest} from "@lodestar/builder";
 import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {ErrorAborted, toHex, toRootHex} from "@lodestar/utils";
+import {ErrorAborted, FetchError, toHex, toRootHex} from "@lodestar/utils";
 import {SessionPayloadErrorCode, SessionPayloadSource} from "../../../../src/cmds/builder/sessionPayloadSource.js";
 
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
@@ -74,6 +74,67 @@ describe("SessionPayloadSource", () => {
     });
     return {source, fetch, signals, request: buildRequest()};
   }
+
+  function transportError(code: string): FetchError {
+    return new FetchError(
+      "http://constructor",
+      new TypeError("fetch failed", {cause: Object.assign(new Error("closed"), {code})})
+    );
+  }
+
+  it.each(["UND_ERR_SOCKET", "ECONNRESET"])("retries one %s read with the original signal", async (code) => {
+    const {source, fetch, signals, request} = setup();
+    const output = payloadResponse(request);
+    fetch
+      .mockResolvedValueOnce({sessionId: "retry"})
+      .mockRejectedValueOnce(transportError(code))
+      .mockResolvedValueOnce(output);
+    const handle = await source.prepare(request, signal);
+    expect((await source.getPayload(handle, signal)).executionPayloadValue).toBe(BigInt(output.blockValue));
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch.mock.calls[2]).toEqual(fetch.mock.calls[1]);
+    expect(signals.every((value) => value === signal)).toBe(true);
+  });
+
+  it("does not retry a second connection failure", async () => {
+    const {source, fetch, request} = setup();
+    const error = transportError("UND_ERR_SOCKET");
+    fetch.mockResolvedValueOnce({sessionId: "retry"}).mockRejectedValue(error);
+    const handle = await source.prepare(request, signal);
+    await expect(source.getPayload(handle, signal)).rejects.toBe(error);
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not restart a read after slot cancellation", async () => {
+    const {source, fetch, request} = setup();
+    const controller = new AbortController();
+    fetch.mockResolvedValueOnce({sessionId: "retry"}).mockImplementationOnce(async () => {
+      controller.abort();
+      throw transportError("UND_ERR_SOCKET");
+    });
+    const handle = await source.prepare(request, controller.signal);
+    await expect(source.getPayload(handle, controller.signal)).rejects.toBeInstanceOf(ErrorAborted);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([new Error("invalid JSON"), transportError("ECONNREFUSED"), transportError("ERR_TIMEOUT")])(
+    "does not retry other failures: %s",
+    async (error) => {
+      const {source, fetch, request} = setup();
+      fetch.mockResolvedValueOnce({sessionId: "retry"}).mockRejectedValueOnce(error);
+      const handle = await source.prepare(request, signal);
+      await expect(source.getPayload(handle, signal)).rejects.toBe(error);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it("does not retry session creation on a closing socket", async () => {
+    const {source, fetch, request} = setup();
+    const error = transportError("UND_ERR_SOCKET");
+    fetch.mockRejectedValueOnce(error);
+    await expect(source.prepare(request, signal)).rejects.toBe(error);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
 
   it("retrieves multiple snapshots from one handle and releases without invalidating them", async () => {
     const {source, fetch, signals, request} = setup();

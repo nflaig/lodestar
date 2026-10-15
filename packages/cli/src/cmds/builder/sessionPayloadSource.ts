@@ -9,7 +9,7 @@ import {
 import type {BuildHandle, BuildRequest, BuiltPayload, PayloadSource} from "@lodestar/builder";
 import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB, ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {ErrorAborted, LodestarError, toHex} from "@lodestar/utils";
+import {ErrorAborted, LodestarError, isFetchError, toHex} from "@lodestar/utils";
 
 type Rpc = Pick<JsonRpcHttpClient, "fetch">;
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
@@ -64,10 +64,20 @@ export class SessionPayloadSource implements PayloadSource {
     if (handle.sourceId !== this.id || !entry || entry.request.fork !== handle.fork) {
       throw new SessionPayloadError({code: SessionPayloadErrorCode.UNKNOWN_HANDLE, reason: handle.payloadId});
     }
-    const response = await this.rpc(signal).fetch<PayloadResponse | null>({
+    const call = {
       method: "zbuilder_getPayloadV1",
       params: entry.latest ? [handle.payloadId, toHex(entry.latest.executionPayload.blockHash)] : [handle.payloadId],
-    });
+    };
+    let response: PayloadResponse | null;
+    try {
+      response = await this.rpc(signal).fetch<PayloadResponse | null>(call);
+    } catch (error) {
+      if (signal.aborted) throw new ErrorAborted();
+      if (!isFetchError(error) || (error.code !== "UND_ERR_SOCKET" && error.code !== "ECONNRESET")) throw error;
+      // Only this idempotent read may retry a pooled socket closing. Preserve
+      // the slot's cancellation deadline and never replay begin/append calls.
+      response = await this.rpc(signal).fetch<PayloadResponse | null>(call);
+    }
     if (signal.aborted) throw new ErrorAborted();
     if (response === null) {
       if (entry.latest) return entry.latest;
