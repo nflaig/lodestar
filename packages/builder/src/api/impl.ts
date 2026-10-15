@@ -12,10 +12,13 @@ import {
   verifySignatureSet,
 } from "@lodestar/state-transition";
 import {BLSPubkey, BuilderIndex, gloas, ssz} from "@lodestar/types";
-import {Logger, byteArrayEquals, prettyGweiToEth, toPubkeyHex, toRootHex} from "@lodestar/utils";
+import {Logger, byteArrayEquals, isErrorAborted, prettyGweiToEth, sleep, toPubkeyHex, toRootHex} from "@lodestar/utils";
 import {BidRequestResult, Metrics} from "../metrics.js";
 import {BidStore} from "../services/bidStore.js";
 import {ProposerDutiesTracker} from "../services/proposerDutiesTracker.js";
+
+const BID_RESPONSE_MARGIN_MS = 50;
+const MAX_WAITING_BID_REQUESTS = 64;
 
 /** Routes of the builder API that apply from Gloas onwards */
 export type BuilderApi = Pick<
@@ -37,11 +40,13 @@ export type BuilderApiModules = {
   proposerDutiesTracker: ProposerDutiesTracker;
   builderIndex: BuilderIndex;
   metrics: Metrics | null;
+  signal?: AbortSignal;
 };
 
-/** Serves the published bids to proposers that request them directly and accepts their signed blocks */
+/** Serves retained bids to proposers that request them directly and accepts their signed blocks */
 export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOptions): BuilderApi {
   const {api, bidStore, builderIndex, clock, config, logger, metrics, proposerDutiesTracker} = modules;
+  let waitingBidRequests = 0;
 
   async function assertValidRequestAuth(
     auth: gloas.SignedBuilderRequestAuth,
@@ -71,7 +76,32 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
       // The builder is ready to serve requests once it is started
     },
 
-    async getExecutionPayloadBid({slot, parentHash, parentRoot, proposerPubkey, requestAuth}) {
+    async getExecutionPayloadBid({
+      slot,
+      parentHash,
+      parentRoot,
+      proposerPubkey,
+      requestAuth,
+      dateMilliseconds,
+      timeoutMs,
+    }) {
+      if (modules.signal?.aborted) throw new ApiError(503, "Builder is stopping");
+      const started = performance.now();
+      const transitMs = Date.now() - dateMilliseconds;
+      const currentSlot = clock.getCurrentSlot();
+      // The request timeout includes inbound transit. Reserve the same amount for the reply,
+      // plus serialization/scheduling headroom. A future timestamp disables waiting because of clock skew.
+      // Use the slot end to bound long waits: a revision can finish retention after construction stops.
+      const waitBudget =
+        transitMs >= 0 && slot >= currentSlot && slot <= currentSlot + 1
+          ? Math.max(
+              0,
+              Math.min(
+                timeoutMs - 2 * transitMs - BID_RESPONSE_MARGIN_MS,
+                clock.msToSlot(slot) + config.SLOT_DURATION_MS
+              )
+            )
+          : 0;
       if (requestAuth.message.slot !== slot) {
         throw new ApiError(
           400,
@@ -80,9 +110,33 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
       }
       await assertValidRequestAuth(requestAuth, proposerPubkey);
 
+      if (modules.signal?.aborted) throw new ApiError(503, "Builder is stopping");
+      const waitMs = Math.max(0, waitBudget - (performance.now() - started));
+      const waitStarted = performance.now();
+      const waitCapacityExceeded = waitMs > 0 && waitingBidRequests >= MAX_WAITING_BID_REQUESTS;
+      if (waitMs > 0 && !waitCapacityExceeded) {
+        waitingBidRequests++;
+        try {
+          await sleep(waitMs, modules.signal);
+        } catch (error) {
+          if (isErrorAborted(error)) throw new ApiError(503, "Builder is stopping");
+          throw error;
+        } finally {
+          waitingBidRequests--;
+        }
+      }
+
       const parentBlockHash = toRootHex(parentHash);
       const parentBlockRoot = toRootHex(parentRoot);
-      const logCtx = {slot, parentBlockHash, parentBlockRoot, proposer: toPubkeyHex(proposerPubkey)};
+      const logCtx = {
+        slot,
+        parentBlockHash,
+        parentBlockRoot,
+        proposer: toPubkeyHex(proposerPubkey),
+        requestTransitMs: transitMs,
+        bidWaitMs: Math.round(performance.now() - waitStarted),
+        waitCapacityExceeded,
+      };
       const version = config.getForkName(slot);
 
       const signedBid = bidStore.get(slot, parentBlockHash, parentBlockRoot);
