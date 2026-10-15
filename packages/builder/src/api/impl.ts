@@ -125,6 +125,7 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
           waitingBidRequests--;
         }
       }
+      if (modules.signal?.aborted) throw new ApiError(503, "Builder is stopping");
 
       const parentBlockHash = toRootHex(parentHash);
       const parentBlockRoot = toRootHex(parentRoot);

@@ -5,6 +5,7 @@ import {getConfig} from "@lodestar/config/test-utils";
 import {DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, ForkName} from "@lodestar/params";
 import {ZERO_HASH, computeDomain, computeSigningRoot} from "@lodestar/state-transition";
 import {gloas, ssz} from "@lodestar/types";
+import * as utils from "@lodestar/utils";
 import {BuilderApi, getBuilderApi} from "../../../src/api/impl.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {ProposerDutiesTracker} from "../../../src/services/proposerDutiesTracker.js";
@@ -144,6 +145,7 @@ describe("builder api", () => {
       });
 
       afterEach(() => {
+        vi.restoreAllMocks();
         vi.useRealTimers();
       });
 
@@ -343,6 +345,17 @@ describe("builder api", () => {
           statusCode: 503,
         });
         expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("checks shutdown again when a completed wait resumes", async () => {
+        vi.spyOn(utils, "sleep").mockImplementationOnce(async () => {
+          controller.abort();
+        });
+        await expect(
+          builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now()}))
+        ).rejects.toMatchObject({
+          statusCode: 503,
+        });
       });
 
       it("waits for an in-flight revision whose retention finishes after construction stops", async () => {
