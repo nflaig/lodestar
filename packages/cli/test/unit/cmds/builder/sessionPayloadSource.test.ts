@@ -1,4 +1,6 @@
 import {createHash} from "node:crypto";
+import {once} from "node:events";
+import {createServer} from "node:http";
 import {RLP} from "@ethereumjs/rlp";
 import {describe, expect, it, vi} from "vitest";
 import {type EngineApiRpcReturnTypes, JsonRpcHttpClient, serializePayloadAttributes} from "@lodestar/beacon-node";
@@ -81,6 +83,48 @@ describe("SessionPayloadSource", () => {
       new TypeError("fetch failed", {cause: Object.assign(new Error("closed"), {code})})
     );
   }
+
+  it("recovers a payload through the real HTTP client after the peer closes the socket", async () => {
+    const request = buildRequest();
+    const output = payloadResponse(request);
+    const methods: string[] = [];
+    let closeRead = true;
+    const server = createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      const call = JSON.parse(Buffer.concat(chunks).toString()) as {id: number; method: string};
+      methods.push(call.method);
+      if (call.method === "zbuilder_getPayloadV1" && closeRead) {
+        closeRead = false;
+        req.socket.destroy();
+        return;
+      }
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: call.id,
+          result: call.method === "zbuilder_beginV1" ? {sessionId: "socket"} : output,
+        })
+      );
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Missing listener address");
+      const source = new SessionPayloadSource(
+        "socket",
+        (signal) => new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal, timeout: 1000})
+      );
+      const handle = await source.prepare(request, signal);
+      expect((await source.getPayload(handle, signal)).executionPayloadValue).toBe(BigInt(output.blockValue));
+      expect(methods).toEqual(["zbuilder_beginV1", "zbuilder_getPayloadV1", "zbuilder_getPayloadV1"]);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
 
   it.each(["UND_ERR_SOCKET", "ECONNRESET"])("retries one %s read with the original signal", async (code) => {
     const {source, fetch, signals, request} = setup();
