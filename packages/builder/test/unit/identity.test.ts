@@ -4,7 +4,7 @@ import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName, PAYLOAD_BUILDER_VERSION, SLOTS_PER_EPOCH} from "@lodestar/params";
 import {computeStartSlotAtEpoch} from "@lodestar/state-transition";
 import {ErrorAborted, FetchError, TimeoutError, toHex} from "@lodestar/utils";
-import {getBuilderStatus, resolveBuilderIdentity} from "../../src/identity.js";
+import {getBuilderStatus, resolveBuilderIdentity, resolveGossipBuilderIdentity} from "../../src/identity.js";
 import {getApiClientStub, mockApiErrorResponse, mockApiResponse} from "./utils/apiStub.js";
 import {ClockMock} from "./utils/clock.js";
 import {getMockedLogger} from "./utils/logger.js";
@@ -33,6 +33,41 @@ describe("Identity", () => {
   afterEach(() => {
     vi.resetAllMocks();
     vi.useRealTimers();
+  });
+
+  it("resolves a registered inactive gossip identity without waiting for activation", async () => {
+    api.beacon.getStateBuilders.mockResolvedValue(
+      mockGetStateBuildersResponse(index, {status: "pending", pubkey, balance, version})
+    );
+    await expect(resolveGossipBuilderIdentity(api, pubkeyString, abortController.signal)).resolves.toMatchObject({
+      index,
+      status: "pending",
+    });
+    expect(api.beacon.getStateBuilders).toHaveBeenCalledExactlyOnceWith(
+      {stateId: "head", builderIds: [pubkeyString]},
+      {signal: abortController.signal, timeoutMs: 2000}
+    );
+  });
+
+  it("fails unknown gossip identity lookup without entering a deposit polling loop", async () => {
+    api.beacon.getStateBuilders.mockResolvedValue(
+      mockApiResponse({data: [], meta: {executionOptimistic: false, finalized: false}})
+    );
+    await expect(resolveGossipBuilderIdentity(api, pubkeyString, abortController.signal)).rejects.toThrow(
+      "GOSSIP_BUILDER_NOT_REGISTERED"
+    );
+    expect(api.beacon.getStateBuilders).toHaveBeenCalledOnce();
+  });
+
+  it("retries one transient gossip registry failure within the bounded startup budget", async () => {
+    vi.useFakeTimers();
+    api.beacon.getStateBuilders
+      .mockResolvedValueOnce(await mockApiErrorResponse(503))
+      .mockResolvedValueOnce(mockGetStateBuildersResponse(index, {status, pubkey, balance, version}));
+    const result = resolveGossipBuilderIdentity(api, pubkeyString, abortController.signal);
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(result).resolves.toMatchObject({index});
+    expect(api.beacon.getStateBuilders).toHaveBeenCalledTimes(2);
   });
 
   it("successfully gets the builder status", async () => {

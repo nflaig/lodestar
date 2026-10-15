@@ -11,6 +11,7 @@ import {BidPublisher} from "./bidPublisher.js";
 import {BidStore} from "./bidStore.js";
 import {MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
+import {GossipStage, getMinGossipBidValue, validateGossipStages} from "./gossipStages.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuiltPayload} from "./payloadSource.js";
 import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
@@ -51,6 +52,7 @@ export type BidderModules = {
   executionFeeRecipient: ExecutionAddress;
   metrics: Metrics | null;
   signal: AbortSignal;
+  gossipStages?: GossipStage[];
 };
 
 /**
@@ -64,6 +66,17 @@ export class Bidder {
     private readonly modules: BidderModules,
     private readonly opts: BidderOptions
   ) {
+    const stages = modules.gossipStages ?? [];
+    if (
+      stages.length &&
+      (!(opts.updateIntervalMs && opts.updateIntervalMs > 0) || !modules.orchestrator.supportsUpdates)
+    )
+      throw Error("GOSSIP_STAGES_REQUIRE_PAYLOAD_UPDATES");
+    validateGossipStages(
+      {builderIndex: modules.builderIndex, deadlineBps: opts.deadlineBps},
+      stages,
+      opts.updateCutoffBps ?? 1000
+    );
     const limit = opts.maxRevisionsPerSlot ?? MAX_BID_REVISIONS_PER_SLOT;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_BID_REVISIONS_PER_SLOT) {
       throw new RangeError(`maxRevisionsPerSlot must be between 1 and ${MAX_BID_REVISIONS_PER_SLOT}`);
@@ -172,11 +185,25 @@ export class Bidder {
       Date.now() + clock.msToSlot(slot) + config.getSlotComponentDurationMs(this.opts.updateCutoffBps ?? 1000);
     let best: gloas.SignedExecutionPayloadBid | null = null;
     let publication: Promise<void> | undefined;
+    let publicationPending = false;
+    let highestAttemptedValue = Math.max(
+      -1,
+      ...[ledger, ...(this.modules.gossipStages ?? []).map((stage) => stage.ledger)]
+        .flatMap((item) => item.getBidsForSlot(slot))
+        .filter((bid) => bid.parentBlockHash === parentBlockHash && bid.parentBlockRoot === parentBlockRoot)
+        .map((bid) => bid.valueGwei)
+    );
+    const stages = this.modules.gossipStages ?? [];
+    const slotStart = Date.now() + clock.msToSlot(slot);
+    const stageTime = (deadlineBps: number): number =>
+      slotStart - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(deadlineBps);
+    const primaryUntil = stages.length ? stageTime(stages[0].deadlineBps) : until;
     const gossipBest = (): void => {
       if (
         !best ||
         publication ||
         Date.now() < job.getPayloadAt ||
+        Date.now() >= primaryUntil ||
         signal.aborted ||
         this.opts.dryRun ||
         ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)
@@ -184,6 +211,8 @@ export class Bidder {
         return;
       // Reserve synchronously in gossip(), before the transport can become uncertain.
       const signed = best;
+      highestAttemptedValue = Math.max(highestAttemptedValue, signed.message.value);
+      publicationPending = true;
       publication = this.modules.bidPublisher
         .gossip(signed, signal)
         .then(() => {
@@ -194,6 +223,7 @@ export class Bidder {
             parentBlockRoot,
             blockHash: toRootHex(signed.message.blockHash),
             value: prettyGweiToEth(signed.message.value),
+            builderIndex: signed.message.builderIndex,
           });
         })
         .catch((error: unknown) => {
@@ -203,6 +233,9 @@ export class Bidder {
               {slot, parentBlockHash, parentBlockRoot},
               error as Error
             );
+        })
+        .finally(() => {
+          publicationPending = false;
         });
     };
     const timerController = new AbortController();
@@ -211,6 +244,63 @@ export class Bidder {
       .catch((error: unknown) => {
         if (!isErrorAborted(error)) throw error;
       });
+    // A stage gets one attempt at its deadline. Missed windows never catch up in a burst.
+    const stagesStartedAt = Date.now();
+    const stagedPublications = stages.map((stage, index) =>
+      sleep(stageTime(stage.deadlineBps) - Date.now(), AbortSignal.any([signal, timerController.signal]))
+        .then(async () => {
+          const expires = index + 1 < stages.length ? stageTime(stages[index + 1].deadlineBps) : until;
+          if (
+            signal.aborted ||
+            this.opts.dryRun ||
+            publicationPending ||
+            stagesStartedAt >= stageTime(stage.deadlineBps) ||
+            Date.now() >= expires ||
+            !best
+          )
+            return;
+          if (stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)) return;
+          const stored = this.modules.payloadStore.get(toRootHex(best.message.blockHash));
+          if (!stored) return;
+          publicationPending = true;
+          try {
+            const minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
+            const signed = await this.bidOnPayload(
+              {...stored.payload, fork: ForkName.gloas},
+              data,
+              feeRecipient,
+              signal,
+              true,
+              stage,
+              minimum - 1
+            );
+            // Persistence may finish after a parent switch, shutdown, or this stage's window.
+            if (!signed || signal.aborted || Date.now() >= expires || signed.message.value <= highestAttemptedValue)
+              return;
+            highestAttemptedValue = signed.message.value;
+            await stage.bidPublisher.gossip(signed, signal);
+            metrics?.bids.total.inc({result: BidResult.published});
+            logger.info("Gossiped execution payload bid", {
+              slot,
+              parentBlockHash,
+              parentBlockRoot,
+              blockHash: toRootHex(signed.message.blockHash),
+              builderIndex: stage.builderIndex,
+              value: prettyGweiToEth(signed.message.value),
+            });
+          } finally {
+            publicationPending = false;
+          }
+        })
+        .catch((error: unknown) => {
+          if (!isErrorAborted(error) && !signal.aborted)
+            logger.error(
+              "Failed to gossip execution payload bid",
+              {slot, parentBlockHash, parentBlockRoot, builderIndex: stage.builderIndex},
+              error as Error
+            );
+        })
+    );
     try {
       await orchestrator.runUpdates(
         job,
@@ -244,10 +334,12 @@ export class Bidder {
       });
       // Exhausting update capacity must not cancel the already retained bid's scheduled gossip.
       await timer;
+      await Promise.all(stagedPublications);
       await publication;
     } finally {
       timerController.abort();
       await timer;
+      await Promise.all(stagedPublications);
       await publication;
     }
   }
@@ -257,9 +349,14 @@ export class Bidder {
     data: gloas.SSEPayloadAttributes,
     feeRecipient: ExecutionAddress,
     signal: AbortSignal,
-    apiRevision: boolean
+    apiRevision: boolean,
+    identity: Pick<BidderModules, "ledger" | "bidPublisher" | "bidStore" | "getBuilderStatus" | "builderIndex"> = this
+      .modules,
+    minimumValue = -1
   ): Promise<gloas.SignedExecutionPayloadBid | null> {
-    const {clock, ledger, logger, metrics} = this.modules;
+    const {clock, logger, metrics} = this.modules;
+    const {ledger, bidPublisher, bidStore, builderIndex} = identity;
+    const additional = identity !== this.modules;
     const slot = data.proposalSlot;
     const parentBlockRoot = toRootHex(data.parentBlockRoot);
     const parentBlockHash = toRootHex(data.parentBlockHash);
@@ -275,7 +372,7 @@ export class Bidder {
       return null;
     }
 
-    const {status, balance} = this.modules.getBuilderStatus();
+    const {status, balance} = identity.getBuilderStatus();
     if (status !== "active" || balance === undefined) {
       logger.warn("Builder is not active, not bidding", {...logCtx, status});
       metrics?.bids.total.inc({result: BidResult.inactive});
@@ -301,7 +398,8 @@ export class Bidder {
       return null;
     }
 
-    const previous = this.modules.bidStore.get(slot, parentBlockHash, parentBlockRoot);
+    if (value <= minimumValue) return null;
+    const previous = bidStore.get(slot, parentBlockHash, parentBlockRoot);
     if (apiRevision && previous && value <= previous.message.value) return null;
     signal.throwIfAborted();
     const {executionPayload} = payload;
@@ -313,32 +411,38 @@ export class Bidder {
       slot,
       parentBlockRoot: data.parentBlockRoot,
       prevRandao: data.payloadAttributes.prevRandao,
-      builderIndex: this.modules.builderIndex,
+      builderIndex,
       feeRecipient,
       value,
       payload: {...payload, fork: ForkName.gloas},
     });
-    const signedBid = apiRevision
-      ? await this.modules.bidPublisher.prepare(bid)
-      : await this.modules.bidPublisher.publish(bid, signal);
+    const signedBid = apiRevision ? await bidPublisher.prepare(bid) : await bidPublisher.publish(bid, signal);
     if (apiRevision) signal.throwIfAborted();
-    this.modules.bidStore.add(signedBid);
+    bidStore.add(signedBid);
 
     metrics?.bids.total.inc({result: apiRevision ? BidResult.prepared : BidResult.published});
-    logger.info(apiRevision ? "Prepared API execution payload bid" : "Published execution payload bid", {
-      ...logCtx,
-      blockHash,
-      value: prettyGweiToEth(value),
-      payloadValue: prettyGweiToEth(payloadValueGwei),
-      feeRecipient: toHex(feeRecipient),
-      gasLimit: executionPayload.gasLimit,
-      transactions: executionPayload.transactions.length,
-      blobs: bid.blobKzgCommitments.length,
-      slotBidRevisions: ledger.getRevisionCount(slot),
-      retainedPayloads: this.modules.payloadStore.size,
-      retainedPayloadBytes: this.modules.payloadStore.bytes,
-      secFromSlot: clock.secFromSlot(slot - 1),
-    });
+    logger.info(
+      additional
+        ? "Prepared staged execution payload bid"
+        : apiRevision
+          ? "Prepared API execution payload bid"
+          : "Published execution payload bid",
+      {
+        ...logCtx,
+        blockHash,
+        builderIndex,
+        value: prettyGweiToEth(value),
+        payloadValue: prettyGweiToEth(payloadValueGwei),
+        feeRecipient: toHex(feeRecipient),
+        gasLimit: executionPayload.gasLimit,
+        transactions: executionPayload.transactions.length,
+        blobs: bid.blobKzgCommitments.length,
+        slotBidRevisions: ledger.getRevisionCount(slot),
+        retainedPayloads: this.modules.payloadStore.size,
+        retainedPayloadBytes: this.modules.payloadStore.bytes,
+        secFromSlot: clock.secFromSlot(slot - 1),
+      }
+    );
     return signedBid;
   }
 

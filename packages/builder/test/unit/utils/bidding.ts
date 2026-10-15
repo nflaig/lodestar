@@ -2,7 +2,7 @@ import {vi} from "vitest";
 import {ApiClient} from "@lodestar/api";
 import {ChainForkConfig} from "@lodestar/config";
 import {IClock} from "@lodestar/state-transition";
-import {BuilderIndex, BuilderStatus} from "@lodestar/types";
+import {BuilderIndex, BuilderStatus, gloas} from "@lodestar/types";
 import {Logger} from "@lodestar/utils";
 import {Bidder, type BidderOptions} from "../../../src/services/bidder.js";
 import {BidLedger} from "../../../src/services/bidLedger.js";
@@ -12,6 +12,7 @@ import {BidSelector} from "../../../src/services/bidSelector.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import {EnvelopePublisher} from "../../../src/services/envelopePublisher.js";
+import {GossipStage} from "../../../src/services/gossipStages.js";
 import {PayloadOrchestrator} from "../../../src/services/payloadOrchestrator.js";
 import {PayloadSource} from "../../../src/services/payloadSource.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
@@ -52,6 +53,8 @@ export function createBiddingModules({
   revealOptions,
   dryRun,
   updateOptions,
+  gossipStages,
+  retainCommitment,
 }: {
   api: ApiClient;
   config: ChainForkConfig;
@@ -66,12 +69,24 @@ export function createBiddingModules({
   getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined};
   revealOptions?: Partial<RevealerOptions>;
   dryRun?: boolean;
+  gossipStages?: GossipStage[];
+  retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => Promise<void>;
   updateOptions?: Pick<BidderOptions, "updateIntervalMs" | "updateCutoffBps" | "maxRevisionsPerSlot">;
-}): {ledger: BidLedger; bidStore: BidStore; bidder: Bidder; revealer: Revealer} {
+}): {ledger: BidLedger; bidStore: BidStore; bidder: Bidder; revealer: Revealer; bidPublisher: BidPublisher} {
   const ledger = new BidLedger();
   const bidStore = new BidStore();
+  const bidPublisher = new BidPublisher({
+    api,
+    config,
+    signer: builderSigner,
+    ledger,
+    builderIndex: index,
+    hasPayload: ({blockHash}) => payloadStore.has(blockHash),
+    retainCommitment,
+  });
   const bidder = new Bidder(
     {
+      gossipStages,
       config,
       logger,
       clock,
@@ -84,14 +99,7 @@ export function createBiddingModules({
       payloadStore,
       ledger,
       policy: new ProportionalBidPolicy(biddingOptions),
-      bidPublisher: new BidPublisher({
-        api,
-        config,
-        signer: builderSigner,
-        ledger,
-        builderIndex: index,
-        hasPayload: ({blockHash}) => payloadStore.has(blockHash),
-      }),
+      bidPublisher,
       bidStore,
       proposerPreferencesTracker,
       getBuilderStatus,
@@ -117,5 +125,5 @@ export function createBiddingModules({
     },
     {cutoffBps: config.PAYLOAD_ATTESTATION_DUE_BPS, ...revealOptions}
   );
-  return {ledger, bidStore, bidder, revealer};
+  return {ledger, bidStore, bidder, revealer, bidPublisher};
 }

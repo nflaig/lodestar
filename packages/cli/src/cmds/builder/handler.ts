@@ -32,6 +32,7 @@ import {
 } from "../../util/index.js";
 import {getVersionData} from "../../util/version.js";
 import {BuilderRestApiServer, getBuilderApiBeforeInit} from "./apiServer.js";
+import {loadGossipIdentities} from "./gossipIdentities.js";
 import {loadBuilderKeypair} from "./loadKeypair.js";
 import {IBuilderCliArgs, builderMetricsDefaultOptions} from "./options.js";
 import {SessionPayloadSource} from "./sessionPayloadSource.js";
@@ -109,6 +110,8 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   }
 
   const keypair = await loadBuilderKeypair(logger, args.keystore, args.keystorePassword, args.builderPubkey);
+
+  const gossipIdentities = await loadGossipIdentities(logger, args["bidding.gossipIdentitiesFile"]);
 
   const onGracefulShutdownCbs: (() => Promise<void> | void)[] = [];
   onGracefulShutdown(async () => {
@@ -227,6 +230,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
 
   builder = await Builder.init({
     keypair,
+    gossipIdentities,
     logger,
     config,
     abortController,

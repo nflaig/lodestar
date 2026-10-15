@@ -146,7 +146,7 @@ balance until reconciliation or expiry. Startup also processes the current beaco
 head. An uncertain write stops new journal writes. Use one process per journal
 with local filesystem atomic-rename/fsync semantics, retain the data directory
 across upgrades, and drain existing offers before switching publisher identities.
-Multiple builder identities and replicated recovery are not implemented.
+Replicated recovery across processes is not implemented.
 
 After synchronous startup recovery, one worker owns journal writes and pruning.
 Its queue admits at most eight offers, 64 MiB of offer data and sixteen operations.
@@ -162,6 +162,57 @@ blob records remain readable. Older binaries cannot recover live reference-based
 payload records: before rolling back, pause new construction and drain beyond the
 two-slot payload retention window. Preserve the journal and identity files; never
 replace the journal with a backup that omits bids already exposed to proposers.
+
+## Staged P2P bids
+
+Gloas peers accept at most one gossip bid per builder index, slot and parent tuple.
+To advertise later improvements over P2P, configure additional **registered** builder
+identities with `--bidding.gossipIdentitiesFile /path/to/gossip-identities.json`:
+
+```json
+[
+  {
+    "keystore": "keystore-builder-1.json",
+    "keystorePassword": "../secrets/builder-1-password.txt",
+    "deadlineBps": 9750
+  },
+  {
+    "keystore": "keystore-builder-2.json",
+    "keystorePassword": "../secrets/builder-2-password.txt",
+    "deadlineBps": 10000
+  }
+]
+```
+
+Paths are relative to the configuration file. `builderPubkey` is an optional expected
+public key for each entry. Keep the existing primary keystore flags. For example,
+with `--bidding.deadlineBps 9250` on a 12-second network, the primary bids 900 ms
+before the proposal slot, followed by stages at 300 ms before and at the slot boundary.
+Propagation and commitment persistence add latency, so measure arrival times before
+choosing a schedule. A stage at or after the boundary may miss an early proposer.
+
+There is one construction session. Each extra stage uses the latest durable primary
+snapshot, computes a bid under its own balance and unsettled liabilities, and signs
+with its own identity. The configured pricing policy applies to every identity.
+A later stage must exceed the largest previously attempted value by Lodestar's gossip
+increment: 3%, with a 100,000 gwei floor and 10,000,000 gwei cap. Competitors may already
+have a higher bid. API requests continue to return revisions signed by the primary.
+If the primary's balance caps its API revisions, this also limits the staged snapshot
+feed, even if an additional identity has more balance.
+
+At most four additional identities are accepted. Their deadlines must strictly increase
+after the primary deadline and remain before `10000 + bidding.updateCutoffBps`.
+Session updates and a durable commitment directory are required. Unknown identities fail
+startup with a bounded registry request (one retry for transient failures); known inactive or underfunded identities skip
+bidding. A missed stage, an insufficient increase, or a preceding publication still in
+flight skips that stage. Uncertain sends are retained and never retried for that tuple.
+
+Each identity has a separate ledger and a durable journal under
+`<commitmentDir>-gossip/<pubkey>`. These directories must accompany the primary journal
+through backups and deployments. Startup refuses to omit a configured signer whose journal still contains a revealable
+commitment. Keep those keys available and drain bidding before removing an identity. Shared payloads stay in
+memory until the normal reveal retention expires, and each journal independently holds
+the payloads needed to recover that identity's commitments.
 
 ## License
 
