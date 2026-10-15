@@ -58,6 +58,99 @@ afterEach(() => {
 });
 
 describe("CommitmentJournal", () => {
+  it("deduplicates sidecars across revisions, preserves repeated order and prunes by slot", () => {
+    const {directory, journal} = setup();
+    const first = revision(1);
+    const bundle = {
+      blobs: [new Uint8Array(131072).fill(1), new Uint8Array(131072).fill(1)],
+      commitments: [new Uint8Array(48).fill(2), new Uint8Array(48).fill(2)],
+      proofs: Array.from({length: 256}, (_, i) => new Uint8Array(48).fill(i % 128)),
+    };
+    first.stored.payload.blobsBundle = bundle;
+    first.signed.message.blobKzgCommitments = bundle.commitments;
+    journal.retain(first.signed, first.stored);
+    const second = revision(2);
+    second.stored.payload.blobsBundle = bundle;
+    second.signed.message.blobKzgCommitments = bundle.commitments;
+    journal.retain(second.signed, second.stored);
+    expect(fs.readdirSync(directory).filter((name) => name.startsWith("blob-"))).toHaveLength(1);
+    const restored = recover(directory);
+    for (const original of [first, second]) {
+      expect(restored.payloads.get(original.stored.blockHash)?.payload.blobsBundle, original.stored.blockHash).toEqual(
+        bundle
+      );
+    }
+    const later = revision(3, slot + 1);
+    later.stored.payload.blobsBundle = bundle;
+    later.signed.message.blobKzgCommitments = bundle.commitments;
+    journal.retain(later.signed, later.stored);
+    journal.prune(slot + 3);
+    expect(fs.readdirSync(directory).filter((name) => name.startsWith("blob-"))).toHaveLength(1);
+    expect(recover(directory, slot + 3).payloads.get(later.stored.blockHash)?.payload.blobsBundle).toEqual(bundle);
+  });
+
+  it.each(["missing", "corrupt"])("rejects a %s sidecar during recovery", (kind) => {
+    const {directory, journal} = setup();
+    const original = revision(1);
+    original.stored.payload.blobsBundle = {
+      blobs: [new Uint8Array(131072)],
+      commitments: [new Uint8Array(48)],
+      proofs: Array.from({length: 128}, () => new Uint8Array(48)),
+    };
+    original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
+    journal.retain(original.signed, original.stored);
+    const name = fs.readdirSync(directory).find((name) => name.startsWith("blob-"));
+    if (!name) throw Error("Missing sidecar fixture");
+    const filename = path.join(directory, name);
+    if (kind === "missing") fs.unlinkSync(filename);
+    else {
+      const bytes = fs.readFileSync(filename);
+      bytes[0] ^= 1;
+      fs.writeFileSync(filename, bytes);
+    }
+    expect(() => recover(directory)).toThrow(
+      kind === "missing" ? "COMMITMENT_BLOB_MISSING" : "COMMITMENT_BLOB_CHECKSUM"
+    );
+  });
+
+  it("recovers legacy payload records containing embedded blob data", () => {
+    const {directory, journal} = setup();
+    const original = revision(1);
+    original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
+    journal.retain(original.signed, original.stored);
+    const name = fs.readdirSync(directory).find((name) => name.startsWith("payload-"));
+    if (!name) throw Error("Missing payload fixture");
+    const filename = path.join(directory, name);
+    const {data} = JSON.parse(fs.readFileSync(filename, "utf8"));
+    delete data.blobRefs;
+    data.blobs = ssz.gloas.BlobsBundle.toJson(original.stored.payload.blobsBundle);
+    fs.writeFileSync(
+      filename,
+      JSON.stringify({data, checksum: createHash("sha256").update(JSON.stringify(data)).digest("hex")})
+    );
+    expect(recover(directory).payloads.get(original.stored.blockHash)?.payload.blobsBundle).toEqual(
+      original.stored.payload.blobsBundle
+    );
+  });
+
+  it.each(["blob-", "payload-"])("does not recover an offer if its %s write failed", (prefix) => {
+    const {directory, journal} = setup();
+    const original = revision(1);
+    original.stored.payload.blobsBundle = {
+      blobs: [new Uint8Array(131072)],
+      commitments: [new Uint8Array(48)],
+      proofs: Array.from({length: 128}, () => new Uint8Array(48)),
+    };
+    const rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (path.basename(String(to)).startsWith(prefix)) throw Error("disk failed");
+      rename(from, to);
+    });
+    original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
+    expect(() => journal.retain(original.signed, original.stored)).toThrow("disk failed");
+    vi.restoreAllMocks();
+    expect(recover(directory).count).toBe(0);
+  });
   it("recovers every blob and cell proof for an older selected revision", () => {
     const {directory, journal} = setup();
     const original = revision(1);
@@ -67,6 +160,7 @@ describe("CommitmentJournal", () => {
       commitments: [new Uint8Array(48).fill(2)],
       proofs: Array.from({length: 128}, (_, i) => new Uint8Array(48).fill(i)),
     };
+    original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
     original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
     journal.retain(original.signed, original.stored);
     journal.retain(revision(2).signed, revision(2).stored);
@@ -85,6 +179,7 @@ describe("CommitmentJournal", () => {
     const originals = Array.from({length: 1024}, (_, i) => {
       const original = revision((i % 256) + 1, slot - 2 + Math.floor(i / 256));
       original.signed.message.parentBlockRoot.fill(i % 2);
+      original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
       journal.retain(original.signed, original.stored);
       return original;
     });
@@ -108,7 +203,7 @@ describe("CommitmentJournal", () => {
     const blockRoot = toRootHex(Buffer.alloc(32, 7));
     const envelopeRoot = toRootHex(Buffer.alloc(32, 8));
     expect(ledger.recordWin(old, blockRoot)).not.toBeNull();
-    ledger.persistReveal = (record) => journal.retainReveal(record);
+    journal.retainReveal({slot: old.slot, blockRoot, blockHash: old.blockHash, envelopeRoot});
     ledger.recordReveal(old.slot, blockRoot, old.blockHash, envelopeRoot);
     const restarted = recover(directory);
     expect(restarted.ledger.canReveal(blockRoot, old.blockHash, envelopeRoot)).toBe(true);
@@ -249,3 +344,5 @@ describe("CommitmentJournal", () => {
     expect(fs.readdirSync(directory)).toEqual(["identity.json"]);
   });
 });
+
+import {createHash} from "node:crypto";

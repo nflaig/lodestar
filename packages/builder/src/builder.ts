@@ -10,6 +10,7 @@ import {waitForGenesis} from "./genesis.js";
 import {resolveBuilderIdentity} from "./identity.js";
 import {Metrics} from "./metrics.js";
 import {logNodeVersion, waitForNodeReady} from "./readiness.js";
+import {AsyncCommitmentJournal} from "./services/asyncCommitmentJournal.js";
 import {Bidder, BidderOptions} from "./services/bidder.js";
 import {BidLedger} from "./services/bidLedger.js";
 import {ProportionalBidPolicy, ProportionalBidPolicyOpts} from "./services/bidPolicy.js";
@@ -47,7 +48,7 @@ export type BuilderModules = {
   bidder: Bidder;
   revealer: Revealer;
   builderApi: BuilderApi | null;
-  journal?: CommitmentJournal;
+  journal?: AsyncCommitmentJournal;
 };
 
 export type BuilderOptions = {
@@ -103,7 +104,7 @@ export class Builder {
   private readonly ledger: BidLedger;
   private readonly bidder: Bidder;
   private readonly revealer: Revealer;
-  private readonly journal?: CommitmentJournal;
+  private readonly journal?: AsyncCommitmentJournal;
 
   constructor({
     opts,
@@ -212,15 +213,15 @@ export class Builder {
     const payloadStore = new PayloadStore();
     const bidStore = new BidStore();
     const ledger = new BidLedger();
-    const journal = opts.commitmentDir
-      ? new CommitmentJournal(opts.commitmentDir, {
-          genesisValidatorsRoot: toRootHex(genesis.genesisValidatorsRoot),
-          pubkey: builderSigner.getPubkeyHex(),
-        })
-      : undefined;
-    if (journal) {
-      const recovered = journal.recover(clock.getCurrentSlot(), payloadStore, bidStore, ledger);
-      ledger.persistReveal = (record) => journal.retainReveal(record);
+    let journal: AsyncCommitmentJournal | undefined;
+    if (opts.commitmentDir) {
+      const identity = {
+        genesisValidatorsRoot: toRootHex(genesis.genesisValidatorsRoot),
+        pubkey: builderSigner.getPubkeyHex(),
+      };
+      const recovery = new CommitmentJournal(opts.commitmentDir, identity);
+      const recovered = recovery.recover(clock.getCurrentSlot(), payloadStore, bidStore, ledger);
+      journal = await AsyncCommitmentJournal.start({directory: opts.commitmentDir, identity});
       logger.info("Recovered builder commitments", {recovered});
     }
     const signal = opts.abortController.signal;
@@ -247,12 +248,12 @@ export class Builder {
           builderIndex: index,
           hasPayload: ({blockHash}) => payloadStore.has(blockHash),
           retainCommitment: journal
-            ? (bid) => {
+            ? async (bid) => {
                 if (config.getForkName(bid.message.slot) !== ForkName.gloas) throw Error("COMMITMENT_UNSUPPORTED_FORK");
                 const stored = payloadStore.get(toRootHex(bid.message.blockHash));
                 if (!stored) throw Error("COMMITMENT_PAYLOAD_MISSING");
                 const started = performance.now();
-                journal.retain(bid, stored);
+                await journal.retain(bid, stored);
                 logger.debug("Persisted builder commitment", {
                   slot: bid.message.slot,
                   elapsedMs: performance.now() - started,
@@ -279,7 +280,13 @@ export class Builder {
         ledger,
         bidSelector: new BidSelector({config, ledger, builderIndex: index}),
         payloadStore,
-        envelopePublisher: new EnvelopePublisher({api, signer: builderSigner, ledger, builderIndex: index}),
+        envelopePublisher: new EnvelopePublisher({
+          api,
+          signer: builderSigner,
+          ledger,
+          builderIndex: index,
+          retainReveal: journal ? (record) => journal.retainReveal(record) : undefined,
+        }),
         builderIndex: index,
         metrics: opts.metrics,
         signal,
@@ -329,7 +336,7 @@ export class Builder {
     this.proposerPreferencesTracker.prune(slot);
     this.ledger.settlePaymentsBefore(slot - PAYMENT_SETTLEMENT_SLOTS);
     this.ledger.prune(slot);
-    this.journal?.prune(slot);
+    await this.journal?.prune(slot);
     void this.proposerPreferencesRecovery.refresh(slot);
   }
 
@@ -419,5 +426,6 @@ export class Builder {
 
   async close(): Promise<void> {
     this.controller.abort();
+    await this.journal?.close();
   }
 }

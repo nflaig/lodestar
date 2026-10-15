@@ -85,7 +85,7 @@ using a new workload on a shared devnet; these checks do not independently verif
 ## Incremental payload constructor
 
 An external constructor can keep one session alive and return improving Gloas
-payloads without blob transactions. Add these flags to the existing builder command:
+payloads, including complete blob bundles. Add these flags to the existing builder command:
 
 ```sh
 --payload.constructorUrl http://127.0.0.1:8547 \
@@ -124,9 +124,11 @@ slot still follows, so one slot may deliver the same tuple twice and the empty t
 the full one. The builder keys builds by tuple, and a changed tuple cancels the earlier build.
 Epoch boundaries keep the regular timing only.
 
-The commitment journal permits 64 signed revisions per slot across all parents.
-Payload storage is capped at 192 payloads and 256 MiB of serialized content plus entry
-allowances, which is not a resident memory limit. Exhaustion rejects new work rather than evicting
+The commitment journal permits 256 signed revisions per slot across all parents.
+Payload storage is capped at 1,280 payloads and 256 MiB of retained content plus entry
+allowances, with a 64 MiB admission budget per slot. Identical immutable blob sidecars
+share storage within a slot; metadata and proof accounting remain conservative.
+This accounting is not a resident memory limit. Exhaustion rejects new work rather than evicting
 advertised payloads. Metrics distinguish prepared API revisions (`prepared`) from
 successful gossip publication (`published`). Keep the constructor RPC private.
 
@@ -134,7 +136,7 @@ Live CLI builders persist Gloas commitments to `<dataDir>/builder-commitments`.
 Payloads and signed bids are synced before exposure; reveal conflict records are
 synced before signing. Recovery restores eligible revisions and checks identity,
 checksums and required payloads before serving. The disk journal is limited to
-768 MiB, 20,000 files and 128 MiB per file. Payloads expire after two slots;
+768 MiB, 51,457 files and 128 MiB per file. Payloads expire after two slots;
 bid and reveal metadata expire after three epochs. Dry runs do not write it.
 
 Recovery conservatively consumes each recorded parent tuple's gossip allowance
@@ -145,6 +147,21 @@ head. An uncertain write stops new journal writes. Use one process per journal
 with local filesystem atomic-rename/fsync semantics, retain the data directory
 across upgrades, and drain existing offers before switching publisher identities.
 Multiple builder identities and replicated recovery are not implemented.
+
+After synchronous startup recovery, one worker owns journal writes and pruning.
+Its queue admits at most eight offers, 64 MiB of offer data and sixteen operations.
+Reveal records have reserved capacity and priority over queued offers. An offer
+becomes eligible only after its durable acknowledgement; queued writes and writes
+with uncertain outcomes consume revision admission. Existing ready bids can still
+be served while a newer revision is being persisted.
+
+Blob bytes, commitments and cell proofs are stored together in content-addressed
+binary files shared by revisions of the same slot. Payload records retain ordered
+references; recovery checks their hashes and bid commitment order. Legacy inline
+blob records remain readable. Older binaries cannot recover live reference-based
+payload records: before rolling back, pause new construction and drain beyond the
+two-slot payload retention window. Preserve the journal and identity files; never
+replace the journal with a backup that omits bids already exposed to proposers.
 
 ## License
 

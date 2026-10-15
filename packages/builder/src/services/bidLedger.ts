@@ -74,8 +74,6 @@ const KEEP_SLOTS = BID_HISTORY_SLOTS;
 /** Retains signed revisions and tracks the separate first-gossip allowance for each parent tuple. */
 export class BidLedger {
   private readonly recoveredLiabilityBySlot = new Map<Slot, number>();
-  /** Optional durable conflict record; invoked before signing an envelope. */
-  persistReveal?: (record: {slot: Slot; blockRoot: RootHex; blockHash: RootHex; envelopeRoot: RootHex}) => void;
   private readonly gossipBySlot = new Map<Slot, Set<string>>();
   private readonly bidsBySlot = new Map<Slot, Map<string, MutableBidLedgerRecord>>();
   private readonly revealedPayloadByBlockRoot = new Map<RootHex, RevealedPayload>();
@@ -217,7 +215,6 @@ export class BidLedger {
       return;
     }
 
-    this.persistReveal?.({slot, blockRoot, blockHash, envelopeRoot});
     this.revealedPayloadByBlockRoot.set(blockRoot, {slot, blockHash, envelopeRoot, published: false});
   }
 

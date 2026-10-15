@@ -5,7 +5,9 @@ import type {BuilderIndex, RootHex, Slot, gloas, heze} from "@lodestar/types";
 import {sszTypesFor} from "@lodestar/types";
 import {LodestarError, toRootHex} from "@lodestar/utils";
 import type {BidIdentity, BidLedger} from "./bidLedger.js";
+import {BidLedgerError, BidLedgerErrorCode} from "./bidLedger.js";
 import type {BuilderSigner} from "./builderSigner.js";
+import {BID_HISTORY_SLOTS, MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 
 export type BidPublisherModules = {
   api: ApiClient;
@@ -15,7 +17,7 @@ export type BidPublisherModules = {
   builderIndex: BuilderIndex;
   hasPayload: (identity: BidIdentity) => boolean;
   /** Must finish durable retention before the signature can be exposed. */
-  retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => void;
+  retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => void | Promise<void>;
 };
 
 export enum BidPublisherErrorCode {
@@ -47,6 +49,8 @@ export class BidPublisherError extends LodestarError<BidPublisherErrorType> {}
 
 /** Signs and submits a bid only if its payload is retained locally. */
 export class BidPublisher {
+  private readonly pendingRevisions = new Map<Slot, number>();
+  private readonly pendingGossip = new Set<string>();
   constructor(private readonly modules: BidPublisherModules) {}
 
   publish(bid: heze.ExecutionPayloadBid, signal: AbortSignal): Promise<heze.SignedExecutionPayloadBid>;
@@ -58,13 +62,26 @@ export class BidPublisher {
       parentBlockHash: toRootHex(bid.parentBlockHash),
       parentBlockRoot: toRootHex(bid.parentBlockRoot),
     });
-    const signed = this.prepare(bid);
-    await this.gossip(signed, signal);
-    return signed;
+    const key = `${bid.slot}:${toRootHex(bid.parentBlockHash)}:${toRootHex(bid.parentBlockRoot)}`;
+    if (this.pendingGossip.has(key))
+      throw new BidLedgerError({
+        code: BidLedgerErrorCode.DUPLICATE_BID,
+        slot: bid.slot,
+        parentBlockHash: toRootHex(bid.parentBlockHash),
+        parentBlockRoot: toRootHex(bid.parentBlockRoot),
+      });
+    this.pendingGossip.add(key);
+    try {
+      const signed = await this.prepare(bid);
+      await this.gossip(signed, signal);
+      return signed;
+    } finally {
+      this.pendingGossip.delete(key);
+    }
   }
 
   /** Sign a retained payload and journal the commitment before the API can expose it. */
-  prepare(bid: gloas.ExecutionPayloadBid): gloas.SignedExecutionPayloadBid {
+  async prepare(bid: gloas.ExecutionPayloadBid): Promise<gloas.SignedExecutionPayloadBid> {
     const {config, builderIndex, hasPayload, ledger, signer} = this.modules;
     const fork = config.getForkName(bid.slot);
     if (!isForkPostGloas(fork)) {
@@ -94,13 +111,40 @@ export class BidPublisher {
       );
     }
 
-    const signedExecutionPayloadBid = signer.signExecutionPayloadBid(bid);
-    const signedBidRoot = toRootHex(
-      sszTypesFor(fork, "SignedExecutionPayloadBid").hashTreeRoot(signedExecutionPayloadBid)
-    );
-    ledger.recordRevision({...identity, valueGwei: bid.value, signedBidRoot});
-    this.modules.retainCommitment?.(signedExecutionPayloadBid);
-    return signedExecutionPayloadBid;
+    ledger.assertCanRecordRevision(identity);
+    for (const slot of this.pendingRevisions.keys()) {
+      if (slot + BID_HISTORY_SLOTS < bid.slot) this.pendingRevisions.delete(slot);
+    }
+    const pending = this.pendingRevisions.get(bid.slot) ?? 0;
+    if (ledger.getRevisionCount(bid.slot) + pending >= MAX_BID_REVISIONS_PER_SLOT)
+      throw new BidLedgerError({code: BidLedgerErrorCode.REVISION_LIMIT, ...identity});
+    this.pendingRevisions.set(bid.slot, pending + 1);
+    let persistenceAttempted = false;
+    let recorded = false;
+    try {
+      const signedExecutionPayloadBid = signer.signExecutionPayloadBid(bid);
+      const signedBidRoot = toRootHex(
+        sszTypesFor(fork, "SignedExecutionPayloadBid").hashTreeRoot(signedExecutionPayloadBid)
+      );
+      if (this.modules.retainCommitment) {
+        persistenceAttempted = true;
+        await this.modules.retainCommitment(signedExecutionPayloadBid);
+      }
+      if (!hasPayload(identity))
+        throw new BidPublisherError({code: BidPublisherErrorCode.PAYLOAD_NOT_RETAINED, ...identity});
+      // A revision becomes eligible only after the worker confirms durability.
+      ledger.recordRevision({...identity, valueGwei: bid.value, signedBidRoot});
+      recorded = true;
+      return signedExecutionPayloadBid;
+    } finally {
+      // A failed acknowledgement can still leave a durable signature on disk.
+      // Keep that admission consumed so restart cannot recover over 256 bids.
+      if (!persistenceAttempted || recorded) {
+        const remaining = (this.pendingRevisions.get(bid.slot) ?? 1) - 1;
+        if (remaining) this.pendingRevisions.set(bid.slot, remaining);
+        else this.pendingRevisions.delete(bid.slot);
+      }
+    }
   }
 
   async gossip(signedExecutionPayloadBid: gloas.SignedExecutionPayloadBid, signal: AbortSignal): Promise<void> {

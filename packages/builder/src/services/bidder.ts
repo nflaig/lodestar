@@ -227,6 +227,7 @@ export class Bidder {
         !best ||
         !(
           error instanceof PayloadStoreCapacityError ||
+          (error instanceof Error && error.message === "COMMITMENT_WORKER_CAPACITY") ||
           (error instanceof BidLedgerError && error.type.code === BidLedgerErrorCode.REVISION_LIMIT)
         )
       )
@@ -235,7 +236,10 @@ export class Bidder {
         slot,
         parentBlockHash,
         parentBlockRoot,
-        reason: error.type.code,
+        reason:
+          error instanceof PayloadStoreCapacityError || error instanceof BidLedgerError
+            ? error.type.code
+            : error.message,
         slotBidRevisions: ledger.getRevisionCount(slot),
       });
       // Exhausting update capacity must not cancel the already retained bid's scheduled gossip.
@@ -315,8 +319,9 @@ export class Bidder {
       payload: {...payload, fork: ForkName.gloas},
     });
     const signedBid = apiRevision
-      ? this.modules.bidPublisher.prepare(bid)
+      ? await this.modules.bidPublisher.prepare(bid)
       : await this.modules.bidPublisher.publish(bid, signal);
+    signal.throwIfAborted();
     this.modules.bidStore.add(signedBid);
 
     metrics?.bids.total.inc({result: apiRevision ? BidResult.prepared : BidResult.published});

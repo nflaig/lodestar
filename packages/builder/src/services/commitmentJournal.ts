@@ -1,6 +1,7 @@
 import {createHash} from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB} from "@lodestar/params";
 import {RootHex, gloas, ssz} from "@lodestar/types";
 import {fromHex, toRootHex} from "@lodestar/utils";
 import {BidLedger} from "./bidLedger.js";
@@ -12,7 +13,10 @@ const KEEP_SLOTS = BID_HISTORY_SLOTS;
 const MAX_BYTES = 768 * 1024 * 1024;
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
 const MAX_FILES = MAX_COMMITMENT_JOURNAL_FILES;
-const recordName = /^(payload|bid|reveal)-(\d+)-(0x[0-9a-f]{64})\.json$/;
+const recordName = /^(payload|bid|reveal|blob)-(\d+)-(0x[0-9a-f]{64})\.(json|bin)$/;
+const BLOB_BYTES = FIELD_ELEMENTS_PER_BLOB * 32;
+const COMMITMENT_BYTES = 48;
+const SIDECAR_BYTES = BLOB_BYTES + COMMITMENT_BYTES * (1 + CELLS_PER_EXT_BLOB);
 
 type PayloadRecord = {
   slot: number;
@@ -22,10 +26,12 @@ type PayloadRecord = {
   value: string;
   payload: unknown;
   requests: unknown;
-  blobs: unknown;
+  blobs?: unknown;
+  blobRefs?: RootHex[];
 };
 
-type RevealRecord = {slot: number; blockRoot: RootHex; blockHash: RootHex; envelopeRoot: RootHex};
+export type RevealRecord = {slot: number; blockRoot: RootHex; blockHash: RootHex; envelopeRoot: RootHex};
+export type JournalIdentity = {genesisValidatorsRoot: RootHex; pubkey: string};
 
 /** Single-process Gloas journal. Commit files and their directory are synced
  * before an offer becomes externally visible. An uncertain write poisons new
@@ -39,7 +45,7 @@ export class CommitmentJournal {
 
   constructor(
     private readonly directory: string,
-    identity: {genesisValidatorsRoot: RootHex; pubkey: string}
+    identity: JournalIdentity
   ) {
     const created = fs.mkdirSync(directory, {recursive: true, mode: 0o700});
     if (created) {
@@ -56,9 +62,16 @@ export class CommitmentJournal {
     for (const name of names) {
       if (!recordName.test(name) && name !== "identity.json") continue;
       const info = fs.lstatSync(path.join(directory, name));
-      if (!info.isFile() || info.size > MAX_FILE_BYTES) throw Error("COMMITMENT_JOURNAL_INVALID_FILE");
+      const match = recordName.exec(name);
+      if (!info.isFile() || info.size > MAX_FILE_BYTES || (match && (match[1] === "blob") !== (match[4] === "bin")))
+        throw Error("COMMITMENT_JOURNAL_INVALID_FILE");
       this.sizes.set(name, info.size);
       this.bytes += info.size;
+      if (match?.[1] === "blob") {
+        const bytes = fs.readFileSync(path.join(directory, name));
+        if (bytes.length !== SIDECAR_BYTES || `0x${createHash("sha256").update(bytes).digest("hex")}` !== match[3])
+          throw Error("COMMITMENT_BLOB_CHECKSUM");
+      }
     }
     if (this.bytes > MAX_BYTES || this.sizes.size > MAX_FILES) throw Error("COMMITMENT_JOURNAL_CAPACITY");
     const expected = {version: 1, ...identity};
@@ -79,8 +92,32 @@ export class CommitmentJournal {
       toRootHex(parentBlockRoot) !== toRootHex(signedBid.message.parentBlockRoot)
     )
       throw Error("COMMITMENT_PAYLOAD_MISMATCH");
+    if (
+      !ssz.gloas.ExecutionPayloadBid.fields.blobKzgCommitments.equals(
+        signedBid.message.blobKzgCommitments,
+        payload.blobsBundle.commitments
+      )
+    )
+      throw Error("COMMITMENT_BLOB_MISMATCH");
     const payloadName = `payload-${slot}-${blockHash}.json`;
     if (!this.sizes.has(payloadName)) {
+      const {blobs, commitments, proofs} = payload.blobsBundle;
+      if (blobs.length !== commitments.length || proofs.length !== blobs.length * CELLS_PER_EXT_BLOB)
+        throw Error("COMMITMENT_BLOB_SHAPE");
+      const blobRefs = blobs.map((blob, i) => {
+        const cellProofs = proofs.slice(i * CELLS_PER_EXT_BLOB, (i + 1) * CELLS_PER_EXT_BLOB);
+        if (
+          blob.length !== BLOB_BYTES ||
+          commitments[i].length !== COMMITMENT_BYTES ||
+          cellProofs.some((proof) => proof.length !== COMMITMENT_BYTES)
+        )
+          throw Error("COMMITMENT_BLOB_SHAPE");
+        const bytes = Buffer.concat([blob, commitments[i], ...cellProofs]);
+        const hash = `0x${createHash("sha256").update(bytes).digest("hex")}`;
+        const name = `blob-${slot}-${hash}.bin`;
+        if (!this.sizes.has(name)) this.writeBytes(name, bytes);
+        return hash;
+      });
       const record: PayloadRecord = {
         slot,
         blockHash,
@@ -89,7 +126,7 @@ export class CommitmentJournal {
         value: payload.executionPayloadValue.toString(),
         payload: ssz.gloas.ExecutionPayload.toJson(payload.executionPayload),
         requests: ssz.gloas.ExecutionRequests.toJson(payload.executionRequests),
-        blobs: ssz.gloas.BlobsBundle.toJson(payload.blobsBundle),
+        blobRefs,
       };
       this.write(payloadName, record);
     }
@@ -107,6 +144,7 @@ export class CommitmentJournal {
 
   recover(currentSlot: number, payloads: PayloadStore, bids: BidStore, ledger: BidLedger): number {
     this.prune(currentSlot);
+    const sidecars = new Map<string, {blob: Uint8Array; commitment: Uint8Array; proofs: Uint8Array[]}>();
     // Load all required payloads first, before any signed response can be served.
     for (const name of this.sizes.keys()) {
       if (!name.startsWith("payload-")) continue;
@@ -118,6 +156,40 @@ export class CommitmentJournal {
         record.blockHash !== toRootHex(payload.blockHash)
       )
         throw Error("COMMITMENT_PAYLOAD_MISMATCH");
+      let blobsBundle: StoredPayload["payload"]["blobsBundle"];
+      if (record.blobRefs !== undefined) {
+        if (
+          !Array.isArray(record.blobRefs) ||
+          record.blobRefs.length * SIDECAR_BYTES > MAX_FILE_BYTES ||
+          record.blobs !== undefined
+        )
+          throw Error("COMMITMENT_BLOB_SHAPE");
+        blobsBundle = {blobs: [], commitments: [], proofs: []};
+        for (const hash of record.blobRefs) {
+          if (typeof hash !== "string" || !/^0x[0-9a-f]{64}$/.test(hash)) throw Error("COMMITMENT_BLOB_REFERENCE");
+          const name = `blob-${record.slot}-${hash}.bin`;
+          let sidecar = sidecars.get(name);
+          if (!sidecar) {
+            if (!this.sizes.has(name)) throw Error("COMMITMENT_BLOB_MISSING");
+            const bytes = new Uint8Array(fs.readFileSync(path.join(this.directory, name)));
+            if (bytes.length !== SIDECAR_BYTES || `0x${createHash("sha256").update(bytes).digest("hex")}` !== hash)
+              throw Error("COMMITMENT_BLOB_CHECKSUM");
+            sidecar = {
+              blob: bytes.subarray(0, BLOB_BYTES),
+              commitment: bytes.subarray(BLOB_BYTES, BLOB_BYTES + COMMITMENT_BYTES),
+              proofs: Array.from({length: CELLS_PER_EXT_BLOB}, (_, i) =>
+                bytes.subarray(BLOB_BYTES + (i + 1) * COMMITMENT_BYTES, BLOB_BYTES + (i + 2) * COMMITMENT_BYTES)
+              ),
+            };
+            sidecars.set(name, sidecar);
+          }
+          blobsBundle.blobs.push(sidecar.blob);
+          blobsBundle.commitments.push(sidecar.commitment);
+          blobsBundle.proofs.push(...sidecar.proofs);
+        }
+      } else {
+        blobsBundle = ssz.gloas.BlobsBundle.fromJson(record.blobs);
+      }
       payloads.add(
         {
           slot: record.slot,
@@ -128,7 +200,7 @@ export class CommitmentJournal {
             executionPayload: payload,
             executionPayloadValue: BigInt(record.value),
             executionRequests: ssz.gloas.ExecutionRequests.fromJson(record.requests),
-            blobsBundle: ssz.gloas.BlobsBundle.fromJson(record.blobs),
+            blobsBundle,
           },
         },
         "recovery"
@@ -162,6 +234,13 @@ export class CommitmentJournal {
           toRootHex(payload.payload.executionPayload.parentHash) !== identity.parentBlockHash
         )
           throw Error("COMMITMENT_PAYLOAD_MISSING");
+        if (
+          !ssz.gloas.ExecutionPayloadBid.fields.blobKzgCommitments.equals(
+            bid.blobKzgCommitments,
+            payload.payload.blobsBundle.commitments
+          )
+        )
+          throw Error("COMMITMENT_BLOB_MISMATCH");
         bids.add(signed);
       }
       recovered++;
@@ -178,7 +257,11 @@ export class CommitmentJournal {
   prune(currentSlot: number): void {
     for (const name of this.sizes.keys()) {
       const match = recordName.exec(name);
-      if (!match || Number(match[2]) + (match[1] === "payload" ? PAYLOAD_RETENTION_SLOTS : KEEP_SLOTS) >= currentSlot)
+      if (
+        !match ||
+        Number(match[2]) + (match[1] === "payload" || match[1] === "blob" ? PAYLOAD_RETENTION_SLOTS : KEEP_SLOTS) >=
+          currentSlot
+      )
         continue;
       fs.unlinkSync(path.join(this.directory, name));
       this.bytes -= this.sizes.get(name) ?? 0;
@@ -198,16 +281,20 @@ export class CommitmentJournal {
   }
 
   private write(name: string, data: unknown): void {
-    if (this.failed) throw Error("COMMITMENT_JOURNAL_FAILED");
     const text = JSON.stringify({data, checksum: digest(JSON.stringify(data))});
-    const bytes = Buffer.byteLength(text);
+    this.writeBytes(name, Buffer.from(text));
+  }
+
+  private writeBytes(name: string, data: Uint8Array): void {
+    if (this.failed) throw Error("COMMITMENT_JOURNAL_FAILED");
+    const bytes = data.byteLength;
     if (bytes > MAX_FILE_BYTES || this.bytes + bytes > MAX_BYTES || this.sizes.size >= MAX_FILES)
       throw Error("COMMITMENT_JOURNAL_CAPACITY");
     const filename = path.join(this.directory, name);
     try {
       const fd = fs.openSync(`${filename}.tmp`, "w", 0o600);
       try {
-        fs.writeFileSync(fd, text);
+        fs.writeFileSync(fd, data);
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
