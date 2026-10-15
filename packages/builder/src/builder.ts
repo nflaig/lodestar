@@ -276,6 +276,7 @@ export class Builder {
               proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
               builderIndex: index,
               metrics: opts.metrics,
+              signal,
             },
             opts.builderApi
           )
