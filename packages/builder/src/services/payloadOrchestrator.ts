@@ -95,7 +95,9 @@ export class PayloadOrchestrator {
       throw error;
     });
 
-    await sleep(getPayloadAt - Date.now(), this.signal);
+    if (!handle.isComplete) {
+      await sleep(getPayloadAt - Date.now(), this.signal);
+    }
 
     return withTimeout(
       (signal = this.signal) => this.source.getPayload(handle, signal),

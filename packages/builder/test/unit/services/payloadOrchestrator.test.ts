@@ -115,6 +115,20 @@ describe("PayloadOrchestrator", () => {
     expect(source.getPayloadCalls).toHaveLength(1);
   });
 
+  it("retrieves a complete payload as soon as preparation finishes", async () => {
+    const source = new StubPayloadSource();
+    const preparation = defer<BuildHandle>();
+    source.prepareImpl = () => preparation.promise;
+    const result = createOrchestrator(source).run(buildJob());
+    await vi.advanceTimersByTimeAsync(40);
+    expect(source.getPayloadCalls).toHaveLength(0);
+    preparation.resolve({sourceId: source.id, fork: ForkName.gloas, payloadId: "0x01", isComplete: true});
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(result).resolves.toEqual(builtPayload());
+    expect(source.getPayloadCalls).toHaveLength(1);
+    expect(Date.now()).toBe(NOW + 40);
+  });
+
   it("builds different branches independently", async () => {
     const source = new StubPayloadSource();
     const fullRequest = buildRequest();

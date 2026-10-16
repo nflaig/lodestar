@@ -69,7 +69,7 @@ export class TestingPayloadSource implements PayloadSource {
     const parentHash = request.forkchoiceState.headBlockHash;
     const key = JSON.stringify([request.fork, parentHash, attributes]);
     for (const [payloadId, built] of this.prepared) {
-      if (built.key === key) return {sourceId: this.id, fork: request.fork, payloadId};
+      if (built.key === key) return {sourceId: this.id, fork: request.fork, payloadId, isComplete: true};
     }
     if (this.lastFailure?.key === key) throw this.lastFailure.error;
     if (this.pending) {
@@ -133,7 +133,7 @@ export class TestingPayloadSource implements PayloadSource {
       const payloadId = randomUUID();
       this.prepared.set(payloadId, {key, payload});
       while (this.prepared.size > 2) this.prepared.delete(this.prepared.keys().next().value as string);
-      return {sourceId: this.id, fork: request.fork, payloadId};
+      return {sourceId: this.id, fork: request.fork, payloadId, isComplete: true};
     } catch (error) {
       if (buildStarted) this.lastFailure = {key, error};
       throw error;

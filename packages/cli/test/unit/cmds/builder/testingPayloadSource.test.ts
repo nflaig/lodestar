@@ -102,6 +102,7 @@ describe("TestingPayloadSource", () => {
     fetch.mockResolvedValueOnce({hash: request.forkchoiceState.headBlockHash}).mockResolvedValueOnce(response);
 
     const handle = await source.prepare(request, signal);
+    expect(handle.isComplete).toBe(true);
     const built = await source.getPayload(handle, signal);
 
     expect(fetch).toHaveBeenNthCalledWith(2, {

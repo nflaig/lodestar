@@ -29,6 +29,8 @@ export type BuildHandle = {
   sourceId: string;
   fork: ForkPostGloas;
   payloadId: PayloadId;
+  /** The source already holds a complete, immutable payload. */
+  isComplete?: true;
 };
 
 export type BuiltPayload = {

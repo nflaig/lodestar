@@ -191,8 +191,33 @@ describe("Bidder", () => {
   it("does not build without proposer preferences", async () => {
     const {bidder} = createBidder();
 
-    await bidder.onPayloadAttributes(payloadAttributesEvent());
+    const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+    await vi.advanceTimersByTimeAsync(msToDeadline);
+    await bidding;
 
+    expect(payloadSource.prepare).not.toHaveBeenCalled();
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+  });
+
+  it("uses preferences received after attributes without moving the bid deadline", async () => {
+    const {bidder} = createBidder();
+    const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+    await vi.advanceTimersByTimeAsync(500);
+    expect(payloadSource.prepare).not.toHaveBeenCalled();
+    addProposerPreferences();
+    await vi.advanceTimersByTimeAsync(msToDeadline - 500);
+    await bidding;
+    expect(payloadSource.prepare).toHaveBeenCalledOnce();
+    expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+    expect(Date.now()).toBe(msToDeadline);
+  });
+
+  it("abandons preference waiting when the builder stops", async () => {
+    const {bidder} = createBidder();
+    const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+    await vi.advanceTimersByTimeAsync(100);
+    controller.abort();
+    await bidding;
     expect(payloadSource.prepare).not.toHaveBeenCalled();
     expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
   });
