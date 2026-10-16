@@ -34,6 +34,7 @@ import {PayloadOrchestrator} from "./services/payloadOrchestrator.js";
 import {PayloadSource} from "./services/payloadSource.js";
 import {PayloadStore} from "./services/payloadStore.js";
 import {ProposerDutiesTracker} from "./services/proposerDutiesTracker.js";
+import {ProposerPreferencesCache} from "./services/proposerPreferencesCache.js";
 import {ProposerPreferencesRecovery, ProposerPreferencesSource} from "./services/proposerPreferencesRecovery.js";
 import {ProposerPreferencesTracker} from "./services/proposerPreferencesTracker.js";
 import {Revealer, RevealerOptions} from "./services/revealer.js";
@@ -57,6 +58,7 @@ export type BuilderModules = {
   revealer: Revealer;
   builderApi: BuilderApi | null;
   journal?: AsyncCommitmentJournal;
+  preferencesCache?: ProposerPreferencesCache;
   gossipIdentities?: GossipIdentity[];
 };
 
@@ -123,6 +125,7 @@ export class Builder {
   private readonly bidder: Bidder;
   private readonly revealer: Revealer;
   private readonly journal?: AsyncCommitmentJournal;
+  private readonly preferencesCache?: ProposerPreferencesCache;
   private readonly gossipIdentities: GossipIdentity[];
 
   constructor({
@@ -141,6 +144,7 @@ export class Builder {
     revealer,
     builderApi,
     journal,
+    preferencesCache,
     gossipIdentities = [],
   }: BuilderModules) {
     this.builderSigner = builderSigner;
@@ -159,6 +163,7 @@ export class Builder {
     this.revealer = revealer;
     this.builderApi = builderApi;
     this.journal = journal;
+    this.preferencesCache = preferencesCache;
     this.gossipIdentities = gossipIdentities;
 
     this.executionFeeRecipient = opts.executionFeeRecipient;
@@ -264,6 +269,7 @@ export class Builder {
     const bidStore = new BidStore();
     const ledger = new BidLedger();
     let journal: AsyncCommitmentJournal | undefined;
+    let preferencesCache: ProposerPreferencesCache | undefined;
     if (opts.commitmentDir) {
       const identity = {
         genesisValidatorsRoot: toRootHex(genesis.genesisValidatorsRoot),
@@ -271,6 +277,13 @@ export class Builder {
       };
       const recovery = new CommitmentJournal(opts.commitmentDir, identity, clock.getCurrentSlot());
       const recovered = recovery.recover(clock.getCurrentSlot(), payloadStore, bidStore, ledger);
+      preferencesCache = new ProposerPreferencesCache(
+        path.join(opts.commitmentDir, "proposer-preferences.json"),
+        identity,
+        logger
+      );
+      const recoveredPreferences = await preferencesCache.load(proposerPreferencesTracker, clock.getCurrentSlot());
+      logger.info("Restored cached proposer preferences", {recovered: recoveredPreferences});
       journal = await AsyncCommitmentJournal.start({directory: opts.commitmentDir, identity});
       logger.info("Recovered builder commitments", {recovered});
     }
@@ -456,6 +469,7 @@ export class Builder {
       );
 
       return new Builder({
+        preferencesCache,
         gossipIdentities,
         opts,
         builderSigner,
@@ -509,6 +523,7 @@ export class Builder {
     } catch (error) {
       this.logger.error("Failed to prune builder commitments", {slot}, error as Error);
     }
+    void this.preferencesCache?.save(this.proposerPreferencesTracker, this.clock.getCurrentSlot());
   }
 
   /** SSE does not replay a selection received while the process was offline. */
@@ -597,6 +612,10 @@ export class Builder {
 
   async close(): Promise<void> {
     this.controller.abort();
-    await Promise.all([this.journal?.close(), ...this.gossipIdentities.map((identity) => identity.journal?.close())]);
+    await Promise.all([
+      this.preferencesCache?.close(this.proposerPreferencesTracker, this.clock.getCurrentSlot()),
+      this.journal?.close(),
+      ...this.gossipIdentities.map((identity) => identity.journal?.close()),
+    ]);
   }
 }
