@@ -58,6 +58,118 @@ afterEach(() => {
 });
 
 describe("CommitmentJournal", () => {
+  it("acknowledges durable retention when optional reference metadata cannot be read", () => {
+    const {journal, directory} = setup();
+    const original = revision(1);
+    const stat = vi.spyOn(fs, "lstatSync").mockImplementation(() => {
+      throw Error("injected metadata failure");
+    });
+    expect(journal.retain(original.signed, original.stored)).toBeUndefined();
+    stat.mockRestore();
+    expect(journal.retain(original.signed, original.stored)).toBeUndefined();
+    expect(recover(directory).count).toBe(1);
+  });
+
+  it.each(["EXDEV", "ENOENT", "EPERM", "EMLINK"])(
+    "keeps ordinary retention available after reference link error %s",
+    (code) => {
+      const primary = setup();
+      const secondary = setup();
+      const original = revision(1);
+      const reference = primary.journal.retain(original.signed, original.stored);
+      if (!reference) throw Error("Missing reference");
+      const journal = new CommitmentJournal(secondary.directory, identity, undefined, primary.directory);
+      const link = vi.spyOn(fs, "linkSync").mockImplementation(() => {
+        throw Object.assign(Error(code), {code});
+      });
+      expect(() => journal.retainReference(original.signed, reference)).toThrow("COMMITMENT_REFERENCE_UNAVAILABLE");
+      journal.retain(original.signed, original.stored);
+      link.mockRestore();
+      expect(recover(secondary.directory).count).toBe(1);
+    }
+  );
+
+  it("retains an acknowledged payload by reference without reading or serializing its bytes", () => {
+    const primary = setup();
+    const secondary = setup();
+    const original = revision(1);
+    original.stored.payload.blobsBundle = {
+      blobs: [new Uint8Array(131072).fill(1)],
+      commitments: [new Uint8Array(48).fill(2)],
+      proofs: Array.from({length: 128}, (_, i) => new Uint8Array(48).fill(i)),
+    };
+    original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
+    const reference = primary.journal.retain(original.signed, original.stored);
+    if (!reference) throw Error("Missing durable reference");
+    const journal = new CommitmentJournal(secondary.directory, identity, undefined, primary.directory);
+    const signed = structuredClone(original.signed);
+    signed.message.builderIndex = 2;
+    const read = vi.spyOn(fs, "readFileSync");
+    const serialize = vi.spyOn(ssz.gloas.ExecutionPayload, "toJson");
+    journal.retainReference(signed, structuredClone(reference));
+    expect(read).not.toHaveBeenCalled();
+    expect(serialize).not.toHaveBeenCalled();
+    read.mockRestore();
+    serialize.mockRestore();
+    for (const file of reference.files) {
+      expect(fs.statSync(path.join(secondary.directory, file.name)).ino).toBe(Number(file.ino));
+    }
+    primary.journal.prune(slot + 3);
+    const recovered = recover(secondary.directory);
+    expect(recovered.count).toBe(1);
+    const payload = recovered.payloads.get(original.stored.blockHash)?.payload;
+    if (!payload) throw Error("Missing recovered payload");
+    expect(ssz.gloas.ExecutionPayload.equals(payload.executionPayload, original.stored.payload.executionPayload)).toBe(
+      true
+    );
+    expect(
+      ssz.gloas.ExecutionRequests.equals(payload.executionRequests, original.stored.payload.executionRequests)
+    ).toBe(true);
+    expect(ssz.gloas.BlobsBundle.equals(payload.blobsBundle, original.stored.payload.blobsBundle)).toBe(true);
+    expect(payload.executionPayloadValue).toBe(original.stored.payload.executionPayloadValue);
+  });
+
+  it.each(["replaced", "modified", "symlink", "pruned"])("refuses a %s source without publishing a bid", (kind) => {
+    const primary = setup();
+    const secondary = setup();
+    const original = revision(1);
+    const reference = primary.journal.retain(original.signed, original.stored);
+    if (!reference) throw Error("Missing durable reference");
+    const file = path.join(primary.directory, reference.files[0].name);
+    if (kind === "pruned") primary.journal.prune(slot + 3);
+    else if (kind === "modified") fs.appendFileSync(file, " ");
+    else {
+      fs.renameSync(file, `${file}.old`);
+      if (kind === "symlink") fs.symlinkSync(`${file}.old`, file);
+      else fs.copyFileSync(`${file}.old`, file);
+    }
+    const journal = new CommitmentJournal(secondary.directory, identity, undefined, primary.directory);
+    expect(() => journal.retainReference(original.signed, reference)).toThrow();
+    expect(fs.readdirSync(secondary.directory)).toEqual(["identity.json"]);
+    expect(recover(secondary.directory).count).toBe(0);
+  });
+
+  it("does not leave a payload referencing missing sidecars after a failed reference import", () => {
+    const primary = setup();
+    const secondary = setup();
+    const original = revision(1);
+    original.stored.payload.blobsBundle = {
+      blobs: [new Uint8Array(131072).fill(1), new Uint8Array(131072).fill(2)],
+      commitments: [new Uint8Array(48).fill(2), new Uint8Array(48).fill(3)],
+      proofs: Array.from({length: 256}, (_, i) => new Uint8Array(48).fill(i)),
+    };
+    original.signed.message.blobKzgCommitments = original.stored.payload.blobsBundle.commitments;
+    const reference = primary.journal.retain(original.signed, original.stored);
+    if (!reference) throw Error("Missing durable reference");
+    fs.unlinkSync(path.join(primary.directory, reference.files[2].name));
+    const journal = new CommitmentJournal(secondary.directory, identity, undefined, primary.directory);
+    expect(() => journal.retainReference(original.signed, reference)).toThrow();
+    expect(
+      fs.readdirSync(secondary.directory).filter((name) => name.startsWith("payload-") || name.startsWith("bid-"))
+    ).toEqual([]);
+    expect(recover(secondary.directory).count).toBe(0);
+  });
+
   it("shares immutable payload files across identities and retains them after source pruning", () => {
     const primary = setup();
     const secondary = setup();

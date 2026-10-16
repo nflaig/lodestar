@@ -2,16 +2,17 @@ import {Worker} from "node:worker_threads";
 import type {gloas} from "@lodestar/types";
 import {ssz} from "@lodestar/types";
 import {defer} from "@lodestar/utils";
-import type {JournalIdentity, RevealRecord} from "./commitmentJournal.js";
+import type {DurablePayload, JournalIdentity, RevealRecord} from "./commitmentJournal.js";
 import {CommitmentJournalError} from "./commitmentJournalError.js";
 import type {StoredPayload} from "./payloadStore.js";
 
 export type JournalOperation =
   | {kind: "retain"; bid: gloas.SignedExecutionPayloadBid; stored: StoredPayload}
+  | {kind: "retainReference"; bid: gloas.SignedExecutionPayloadBid; reference: DurablePayload}
   | {kind: "reveal"; record: RevealRecord}
   | {kind: "prune"; slot: number};
 export type JournalRequest = {id: number; operation: JournalOperation};
-export type JournalReply = {id: number; error?: string};
+export type JournalReply = {id: number; error?: string; reference?: DurablePayload};
 export type JournalWorkerData = {directory: string; identity: JournalIdentity; sharedPayloadDirectory?: string};
 export type JournalThread = {
   on(event: "message", listener: (reply: JournalReply) => void): unknown;
@@ -42,6 +43,7 @@ export class AsyncCommitmentJournal {
   private failure?: Error;
   private closing = false;
   private initialized = false;
+  private readonly references = new WeakMap<StoredPayload, DurablePayload>();
   private readonly closed = defer<void>();
   private timer: ReturnType<typeof setTimeout>;
 
@@ -81,6 +83,31 @@ export class AsyncCommitmentJournal {
     return this.enqueue({kind: "reveal", record}, 1024);
   }
 
+  getReference(stored: StoredPayload): DurablePayload | undefined {
+    return this.references.get(stored);
+  }
+
+  retainReference(bid: gloas.SignedExecutionPayloadBid, reference: DurablePayload): Promise<void> {
+    return this.enqueue({kind: "retainReference", bid, reference}, 4096 + reference.files.length * 512);
+  }
+
+  async retainShared(
+    bid: gloas.SignedExecutionPayloadBid,
+    stored: StoredPayload,
+    reference: DurablePayload | undefined
+  ): Promise<void> {
+    if (reference) {
+      try {
+        await this.retainReference(bid, reference);
+        return;
+      } catch (error) {
+        if (!(error instanceof CommitmentJournalError) || error.message !== "COMMITMENT_REFERENCE_UNAVAILABLE")
+          throw error;
+      }
+    }
+    await this.retain(bid, stored);
+  }
+
   prune(slot: number): Promise<void> {
     for (const pending of this.queue) {
       if (pending.operation.kind === "prune") {
@@ -105,13 +132,13 @@ export class AsyncCommitmentJournal {
     if (this.closing) return Promise.reject(new CommitmentJournalError("COMMITMENT_WORKER_CLOSED", false));
     if (
       this.queue.length + Number(this.active !== undefined) >= MAX_PENDING_OPERATIONS ||
-      (operation.kind === "retain" &&
+      ((operation.kind === "retain" || operation.kind === "retainReference") &&
         (this.pendingOffers >= MAX_PENDING_OFFERS || this.pendingBytes + bytes > MAX_PENDING_BYTES))
     )
       return Promise.reject(new CommitmentJournalError("COMMITMENT_WORKER_CAPACITY", false));
     const pending = {id: this.nextId++, operation, bytes, result: defer<void>()};
     this.pendingBytes += bytes;
-    if (operation.kind === "retain") this.pendingOffers++;
+    if (operation.kind === "retain" || operation.kind === "retainReference") this.pendingOffers++;
     if (operation.kind === "reveal") this.queue.unshift(pending);
     else this.queue.push(pending);
     this.pump();
@@ -162,9 +189,13 @@ export class AsyncCommitmentJournal {
     }
     this.active = undefined;
     this.pendingBytes -= pending.bytes;
-    if (pending.operation.kind === "retain") this.pendingOffers--;
+    if (pending.operation.kind === "retain" || pending.operation.kind === "retainReference") this.pendingOffers--;
     if (reply.error) pending.result.reject(new CommitmentJournalError(reply.error, true));
-    else pending.result.resolve();
+    else {
+      if (pending.operation.kind === "retain" && reply.reference)
+        this.references.set(pending.operation.stored, reply.reference);
+      pending.result.resolve();
+    }
     this.pump();
   }
 

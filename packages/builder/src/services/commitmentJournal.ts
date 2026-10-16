@@ -32,6 +32,16 @@ type PayloadRecord = {
 
 export type RevealRecord = {slot: number; blockRoot: RootHex; blockHash: RootHex; envelopeRoot: RootHex};
 export type JournalIdentity = {genesisValidatorsRoot: RootHex; pubkey: string};
+type DurableFile = {name: string; bytes: number; dev: bigint; ino: bigint; mtimeNs: bigint};
+/** Issued only after durable retention. Files are immutable; recipients hard-link
+ * them into their own journal before publishing, independently of source pruning. */
+export type DurablePayload = {
+  slot: number;
+  blockHash: RootHex;
+  parentBlockRoot: RootHex;
+  commitments: Uint8Array[];
+  files: DurableFile[];
+};
 
 /** Single-process Gloas journal. Commit files and their directory are synced
  * before an offer becomes externally visible. An uncertain write poisons new
@@ -42,6 +52,7 @@ export class CommitmentJournal {
   private readonly sizes = new Map<string, number>();
   private bytes = 0;
   private failed = false;
+  private readonly references = new Map<string, DurablePayload | undefined>();
 
   constructor(
     private readonly directory: string,
@@ -109,7 +120,7 @@ export class CommitmentJournal {
     }
   }
 
-  retain(signedBid: gloas.SignedExecutionPayloadBid, stored: StoredPayload): void {
+  retain(signedBid: gloas.SignedExecutionPayloadBid, stored: StoredPayload): DurablePayload | undefined {
     const {slot, blockHash, parentBlockRoot, payload} = stored;
     if (
       slot !== signedBid.message.slot ||
@@ -125,6 +136,7 @@ export class CommitmentJournal {
     )
       throw Error("COMMITMENT_BLOB_MISMATCH");
     const payloadName = `payload-${slot}-${blockHash}.json`;
+    let payloadRecord: PayloadRecord | undefined;
     if (!this.sizes.has(payloadName)) {
       const {blobs, commitments, proofs} = payload.blobsBundle;
       if (blobs.length !== commitments.length || proofs.length !== blobs.length * CELLS_PER_EXT_BLOB)
@@ -154,6 +166,108 @@ export class CommitmentJournal {
         blobRefs,
       };
       this.write(payloadName, record, true);
+      payloadRecord = record;
+    }
+    const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid));
+    const name = `bid-${slot}-${root}.json`;
+    if (!this.sizes.has(name)) this.write(name, ssz.gloas.SignedExecutionPayloadBid.toJson(signedBid));
+    if (this.references.has(payloadName)) return this.references.get(payloadName);
+    let reference: DurablePayload | undefined;
+    try {
+      const record = payloadRecord ?? (this.read(payloadName) as PayloadRecord);
+      // Legacy inline sidecars need the ordinary serialization path.
+      if (record.blobRefs === undefined) {
+        this.references.set(payloadName, undefined);
+        return undefined;
+      }
+      const names = [payloadName, ...record.blobRefs.map((hash) => `blob-${slot}-${hash}.bin`)];
+      reference = {
+        slot,
+        blockHash,
+        parentBlockRoot: toRootHex(parentBlockRoot),
+        commitments: payload.blobsBundle.commitments.map((commitment) => commitment.slice()),
+        files: names.map((name) => {
+          const info = fs.lstatSync(path.join(this.directory, name), {bigint: true});
+          if (!info.isFile()) throw Error("COMMITMENT_JOURNAL_INVALID_FILE");
+          return {name, bytes: Number(info.size), dev: info.dev, ino: info.ino, mtimeNs: info.mtimeNs};
+        }),
+      };
+    } catch {
+      // The offer is already durable. An optional optimization cannot revoke
+      // its acknowledgement or block reveals on a reference-metadata error.
+    }
+    this.references.set(payloadName, reference);
+    return reference;
+  }
+
+  retainReference(signedBid: gloas.SignedExecutionPayloadBid, reference: DurablePayload): void {
+    if (this.failed) throw Error("COMMITMENT_JOURNAL_FAILED");
+    if (!this.sharedPayloadDirectory) throw Error("COMMITMENT_REFERENCE_UNAVAILABLE");
+    const {slot, blockHash, parentBlockRoot, commitments, files} = reference;
+    if (
+      slot !== signedBid.message.slot ||
+      blockHash !== toRootHex(signedBid.message.blockHash) ||
+      parentBlockRoot !== toRootHex(signedBid.message.parentBlockRoot)
+    )
+      throw Error("COMMITMENT_PAYLOAD_MISMATCH");
+    if (
+      !ssz.gloas.ExecutionPayloadBid.fields.blobKzgCommitments.equals(commitments, signedBid.message.blobKzgCommitments)
+    )
+      throw Error("COMMITMENT_BLOB_MISMATCH");
+    if (files.length !== commitments.length + 1 || files[0]?.name !== `payload-${slot}-${blockHash}.json`)
+      throw Error("COMMITMENT_PAYLOAD_REFERENCE");
+    for (const [index, file] of files.entries()) {
+      const match = recordName.exec(file.name);
+      if (
+        !match ||
+        Number(match[2]) !== slot ||
+        (index > 0 && (match[1] !== "blob" || match[4] !== "bin" || file.bytes !== SIDECAR_BYTES))
+      )
+        throw Error("COMMITMENT_PAYLOAD_REFERENCE");
+    }
+    // A failed offer may leave orphan sidecars, never a payload referencing
+    // absent sidecars: recovery also needs this dependency order.
+    for (const file of this.sizes.has(files[0].name) ? [] : [...files.slice(1), files[0]]) {
+      if (this.sizes.has(file.name)) continue;
+      if (file.bytes > MAX_FILE_BYTES || this.bytes + file.bytes > MAX_BYTES || this.sizes.size >= MAX_FILES)
+        throw Error("COMMITMENT_JOURNAL_CAPACITY");
+      const filename = path.join(this.directory, file.name);
+      const temporary = `${filename}.tmp`;
+      // Missing/pruned source files fail this offer before publishing. Completed
+      // links own their data and can safely be reused by a subsequent offer.
+      try {
+        fs.unlinkSync(temporary);
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      try {
+        fs.linkSync(path.join(this.sharedPayloadDirectory, file.name), temporary);
+      } catch (error) {
+        throw Error("COMMITMENT_REFERENCE_UNAVAILABLE", {cause: error});
+      }
+      try {
+        const info = fs.lstatSync(temporary, {bigint: true});
+        if (
+          !info.isFile() ||
+          info.dev !== file.dev ||
+          info.ino !== file.ino ||
+          info.size !== BigInt(file.bytes) ||
+          info.mtimeNs !== file.mtimeNs
+        )
+          throw Error("COMMITMENT_PAYLOAD_REFERENCE");
+      } catch (error) {
+        fs.unlinkSync(temporary);
+        throw error;
+      }
+      try {
+        fs.renameSync(temporary, filename);
+        syncDirectory(this.directory);
+        this.sizes.set(file.name, file.bytes);
+        this.bytes += file.bytes;
+      } catch (error) {
+        this.failed = true;
+        throw error;
+      }
     }
     const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid));
     const name = `bid-${slot}-${root}.json`;
@@ -291,6 +405,7 @@ export class CommitmentJournal {
       fs.unlinkSync(path.join(this.directory, name));
       this.bytes -= this.sizes.get(name) ?? 0;
       this.sizes.delete(name);
+      this.references.delete(name);
     }
     // Unsynced deletion can only restore expired records after a crash. Recovery
     // prunes by slot before serving; it never makes expired offers eligible again.
