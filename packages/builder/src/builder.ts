@@ -378,8 +378,10 @@ export class Builder {
               const stored = payloadStore.get(toRootHex(bid.message.blockHash));
               if (!stored) throw Error("COMMITMENT_PAYLOAD_MISSING");
               const started = performance.now();
-              await extraJournal.retain(bid, stored);
+              const reference = journal?.getReference(stored);
+              const retentionMode = await extraJournal.retainShared(bid, stored, reference);
               logger.debug("Persisted staged builder commitment", {
+                retentionMode,
                 slot: bid.message.slot,
                 builderIndex: identity.index,
                 elapsedMs: performance.now() - started,
