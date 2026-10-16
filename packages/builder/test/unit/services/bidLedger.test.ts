@@ -164,11 +164,17 @@ describe("BidLedger", () => {
 
   it("bounds retained revisions across every parent of a slot", () => {
     const ledger = new BidLedger();
-    for (let i = 0; i < 64; i++) ledger.recordRevision(submittedBid({signedBidRoot: root(i)}));
-    expect(() => ledger.recordRevision(submittedBid({signedBidRoot: root(65)}))).toThrow(
+    const revisions = Array.from({length: 256}, (_, i) =>
+      submittedBid({signedBidRoot: root(i), parentBlockRoot: root(i % 2)})
+    );
+    for (const bid of revisions) ledger.recordRevision(bid);
+    expect(() => ledger.recordRevision(submittedBid({signedBidRoot: root(256)}))).toThrow(
       expect.objectContaining({type: expect.objectContaining({code: BidLedgerErrorCode.REVISION_LIMIT})})
     );
-    expect(ledger.getBidsForSlot(submittedBid().slot)).toHaveLength(64);
+    expect(ledger.getBidsForSlot(submittedBid().slot)).toHaveLength(256);
+    expect(ledger.recordRevision(revisions[0])).toMatchObject(revisions[0]);
+    expect(ledger.recordBid(revisions[0])).toMatchObject(revisions[0]);
+    expect(ledger.recordWin(revisions[0], root(300))).not.toBeNull();
   });
 
   it("only settles an exact winning bid identity", () => {
@@ -303,8 +309,10 @@ function submittedBid(overrides: Partial<SubmittedBid> = {}): SubmittedBid {
   };
 }
 
-function root(byte: number): RootHex {
-  return toRootHex(Uint8Array.from({length: 32}, () => byte));
+function root(value: number): RootHex {
+  const bytes = Buffer.alloc(32);
+  bytes.writeUInt32BE(value, 28);
+  return toRootHex(bytes);
 }
 
 function getBidLedgerError(fn: () => unknown): BidLedgerError {

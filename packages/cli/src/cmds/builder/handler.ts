@@ -8,9 +8,17 @@ import {
   getHttpMetricsServer,
   initializeExecutionEngine,
 } from "@lodestar/beacon-node";
-import {Builder, EnginePayloadResult, EnginePayloadSource, type PayloadSource, getMetrics} from "@lodestar/builder";
+import {
+  Builder,
+  EnginePayloadResult,
+  EnginePayloadSource,
+  MAX_ADDITIONAL_PROPOSER_PREFERENCES_SOURCES,
+  MAX_BID_REVISIONS_PER_SLOT,
+  type PayloadSource,
+  getMetrics,
+} from "@lodestar/builder";
 import {getNodeLogger} from "@lodestar/logger/node";
-import {fromHex, toPrintableUrl} from "@lodestar/utils";
+import {fromHex, isValidHttpUrl, toPrintableUrl} from "@lodestar/utils";
 import {getBeaconConfigFromArgs} from "../../config/beaconParams.js";
 import {GlobalArgs} from "../../options/index.js";
 import {getGlobalPaths} from "../../paths/global.js";
@@ -55,6 +63,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   }
   const updateIntervalMs = args["bidding.updateIntervalMs"];
   const updateCutoffBps = args["bidding.updateCutoffBps"];
+  const maxRevisionsPerSlot = args["bidding.maxRevisionsPerSlot"];
   if (
     !Number.isSafeInteger(updateIntervalMs) ||
     (updateIntervalMs !== 0 && (updateIntervalMs < 25 || !constructorUrl))
@@ -63,6 +72,21 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   }
   if (!Number.isSafeInteger(updateCutoffBps) || updateCutoffBps < 0 || updateCutoffBps > 10000) {
     throw new YargsError("--bidding.updateCutoffBps must be between 0 and 10000");
+  }
+  if (
+    !Number.isSafeInteger(maxRevisionsPerSlot) ||
+    maxRevisionsPerSlot < 1 ||
+    maxRevisionsPerSlot > MAX_BID_REVISIONS_PER_SLOT
+  ) {
+    throw new YargsError(`--bidding.maxRevisionsPerSlot must be between 1 and ${MAX_BID_REVISIONS_PER_SLOT}`);
+  }
+  const proposerPreferencesUrls = parseProposerPreferencesUrls(
+    args["proposerPreferences.urls"] ?? [],
+    args.beaconNodeUrl
+  );
+  const proposerPreferencesTimeout = args["proposerPreferences.timeout"];
+  if (!Number.isSafeInteger(proposerPreferencesTimeout) || proposerPreferencesTimeout < 100) {
+    throw new YargsError("--proposerPreferences.timeout must be at least 100 ms");
   }
 
   const globalPaths = getGlobalPaths(args, network);
@@ -115,6 +139,20 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
 
   logger.info("Beacon node", {beaconNode: toPrintableUrl(args.beaconNodeUrl), timeoutMs: args.requestTimeout});
 
+  const proposerPreferencesSources = proposerPreferencesUrls.map((url) => ({
+    id: toPrintableUrl(url),
+    api: getClient(
+      {urls: [url], globalInit: {signal: abortController.signal, timeoutMs: proposerPreferencesTimeout}},
+      {config, logger, metrics: metrics?.restApiClient}
+    ),
+  }));
+  if (proposerPreferencesSources.length > 0) {
+    logger.info("Proposer preferences sources", {
+      beaconNodes: proposerPreferencesSources.map(({id}) => id).join(","),
+      timeoutMs: proposerPreferencesTimeout,
+    });
+  }
+
   let payloadSource: PayloadSource;
   if (constructorUrl) {
     payloadSource = new SessionPayloadSource(
@@ -129,6 +167,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       url: toPrintableUrl(constructorUrl),
       updateIntervalMs,
       updateCutoffBps,
+      maxRevisionsPerSlot,
       dryRun: args["payload.dryRun"],
     });
   } else if (transactionsFile && testingUrl) {
@@ -207,9 +246,11 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       getPayloadTimeout: args["bidding.getPayloadTimeout"],
       updateIntervalMs,
       updateCutoffBps,
+      maxRevisionsPerSlot,
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
     builderApi: builderApiOpts,
+    proposerPreferences: {sources: proposerPreferencesSources, timeoutMs: proposerPreferencesTimeout},
     reveal: {
       cutoffBps: args["reveal.cutoffBps"],
       adversarialWithholdExecutionPayload: args["adversarial.withhold.executionPayload"],
@@ -219,6 +260,27 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   });
 
   onGracefulShutdownCbs.push(() => builder?.close());
+}
+
+/** Urls are not echoed in errors as they may carry credentials */
+export function parseProposerPreferencesUrls(urls: string[], beaconNodeUrl: string): string[] {
+  if (urls.length > MAX_ADDITIONAL_PROPOSER_PREFERENCES_SOURCES) {
+    throw new YargsError(
+      `--proposerPreferences.urls accepts at most ${MAX_ADDITIONAL_PROPOSER_PREFERENCES_SOURCES} urls`
+    );
+  }
+  const seen = new Set(isValidHttpUrl(beaconNodeUrl) ? [new URL(beaconNodeUrl).href] : []);
+  for (const [i, url] of urls.entries()) {
+    if (!isValidHttpUrl(url)) {
+      throw new YargsError(`--proposerPreferences.urls[${i}] is not a valid http(s) url`);
+    }
+    const href = new URL(url).href;
+    if (seen.has(href)) {
+      throw new YargsError(`--proposerPreferences.urls[${i}] duplicates --beaconNodeUrl or an earlier url`);
+    }
+    seen.add(href);
+  }
+  return urls;
 }
 
 function getBuilderApiAuthData(args: IBuilderCliArgs): Uint8Array {

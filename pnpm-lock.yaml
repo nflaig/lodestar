@@ -442,6 +442,9 @@ importers:
       '@chainsafe/threads':
         specifier: ^1.11.3
         version: 1.11.3
+      '@ethereumjs/rlp':
+        specifier: ^4.0.1
+        version: 4.0.1
       '@libp2p/crypto':
         specifier: ^5.1.23
         version: 5.1.23
@@ -521,9 +524,6 @@ importers:
       '@chainsafe/as-sha256':
         specifier: ^1.2.5
         version: 1.2.5
-      '@ethereumjs/rlp':
-        specifier: ^4.0.1
-        version: 4.0.1
       '@lodestar/test-utils':
         specifier: workspace:^
         version: link:../test-utils

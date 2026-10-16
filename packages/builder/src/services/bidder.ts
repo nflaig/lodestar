@@ -5,14 +5,15 @@ import {IClock, computeEpochAtSlot} from "@lodestar/state-transition";
 import {BuilderIndex, BuilderStatus, Epoch, ExecutionAddress, RootHex, gloas} from "@lodestar/types";
 import {Logger, isErrorAborted, prettyGweiToEth, sleep, toHex, toRootHex} from "@lodestar/utils";
 import {BidResult, Metrics} from "../metrics.js";
-import {BidLedger} from "./bidLedger.js";
+import {BidLedger, BidLedgerError, BidLedgerErrorCode} from "./bidLedger.js";
 import {BidPolicy} from "./bidPolicy.js";
 import {BidPublisher} from "./bidPublisher.js";
 import {BidStore} from "./bidStore.js";
+import {MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuiltPayload} from "./payloadSource.js";
-import {PayloadStore} from "./payloadStore.js";
+import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
 import {ProposerPreferencesTracker} from "./proposerPreferencesTracker.js";
 
 const GWEI_TO_WEI = 1_000_000_000n;
@@ -25,6 +26,8 @@ export type BidderOptions = {
   updateIntervalMs?: number;
   /** Stop updates this far into the proposal slot, in basis points. */
   updateCutoffBps?: number;
+  /** Limit new offers across all parents without reducing recovery capacity for existing commitments. */
+  maxRevisionsPerSlot?: number;
   /** Point within the slot before the proposal slot at which the payload is retrieved and bid on, in basis points */
   deadlineBps: number;
   /** Do not bid while the builder balance is below this value */
@@ -55,13 +58,17 @@ export type BidderModules = {
  * while each parent tuple retains one gossip publication allowance.
  */
 export class Bidder {
-  private readonly dependentRootByEpoch = new Map<Epoch, RootHex>();
   private readonly activeBuilds = new Map<string, {slot: number; controller: AbortController}>();
 
   constructor(
     private readonly modules: BidderModules,
     private readonly opts: BidderOptions
-  ) {}
+  ) {
+    const limit = opts.maxRevisionsPerSlot ?? MAX_BID_REVISIONS_PER_SLOT;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_BID_REVISIONS_PER_SLOT) {
+      throw new RangeError(`maxRevisionsPerSlot must be between 1 and ${MAX_BID_REVISIONS_PER_SLOT}`);
+    }
+  }
 
   async onPayloadAttributes(event: PayloadAttributesEvent): Promise<void> {
     const {clock, config, ledger, logger, metrics, orchestrator, proposerPreferencesTracker} = this.modules;
@@ -79,8 +86,10 @@ export class Bidder {
       return;
     }
 
-    // TODO: the beacon node emits payload attributes once per slot, late in the slot and only for the parent
-    // payload variant it would build on, revisit to start the build earlier and to bid on both variants
+    // The beacon node emits attributes before the slot for the parent variant it would build on. With
+    // `--chain.emitPayloadAttributesEarly` it also emits on block and payload import, so one slot may see
+    // the empty tuple, then the full one, then a repeat. Builds are keyed by tuple to absorb that.
+    // TODO: bid on both variants instead of cancelling the empty build once the full tuple arrives
     const buildId = `${slot}:${parentBlockRoot}:${parentBlockHash}`;
     const updates = (this.opts.updateIntervalMs ?? 0) > 0 && orchestrator.supportsUpdates;
     if (this.activeBuilds.has(buildId) || (!updates && ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot))) {
@@ -101,7 +110,7 @@ export class Bidder {
         return;
       }
 
-      const dependentRoot = await this.getDependentRoot(computeEpochAtSlot(slot));
+      const dependentRoot = await this.getDependentRoot(computeEpochAtSlot(slot), signal);
       signal.throwIfAborted();
       const proposerPreferences = proposerPreferencesTracker.get(slot, dependentRoot);
       if (proposerPreferences === null) {
@@ -139,7 +148,7 @@ export class Bidder {
         await this.bidOnPayload(payload, data, feeRecipient, signal, false);
       }
     } catch (e) {
-      if (!isErrorAborted(e)) {
+      if (!isErrorAborted(e) && !(signal.aborted && e === signal.reason)) {
         metrics?.bids.total.inc({result: BidResult.error});
         logger.error("Failed to bid", logCtx, e as Error);
       }
@@ -213,6 +222,29 @@ export class Bidder {
         },
         signal
       );
+    } catch (error) {
+      if (
+        !best ||
+        !(
+          error instanceof PayloadStoreCapacityError ||
+          (error instanceof Error && error.message === "COMMITMENT_WORKER_CAPACITY") ||
+          (error instanceof BidLedgerError && error.type.code === BidLedgerErrorCode.REVISION_LIMIT)
+        )
+      )
+        throw error;
+      logger.debug("Stopped API updates at commitment capacity", {
+        slot,
+        parentBlockHash,
+        parentBlockRoot,
+        reason:
+          error instanceof PayloadStoreCapacityError || error instanceof BidLedgerError
+            ? error.type.code
+            : error.message,
+        slotBidRevisions: ledger.getRevisionCount(slot),
+      });
+      // Exhausting update capacity must not cancel the already retained bid's scheduled gossip.
+      await timer;
+      await publication;
     } finally {
       timerController.abort();
       await timer;
@@ -274,6 +306,7 @@ export class Bidder {
     signal.throwIfAborted();
     const {executionPayload} = payload;
     const blockHash = toRootHex(executionPayload.blockHash);
+    ledger.assertCanRecordRevision({slot, parentBlockHash, parentBlockRoot}, this.opts.maxRevisionsPerSlot);
     this.modules.payloadStore.add({slot, parentBlockRoot: data.parentBlockRoot, blockHash, payload});
 
     const bid = createExecutionPayloadBid({
@@ -286,8 +319,9 @@ export class Bidder {
       payload: {...payload, fork: ForkName.gloas},
     });
     const signedBid = apiRevision
-      ? this.modules.bidPublisher.prepare(bid)
+      ? await this.modules.bidPublisher.prepare(bid)
       : await this.modules.bidPublisher.publish(bid, signal);
+    if (apiRevision) signal.throwIfAborted();
     this.modules.bidStore.add(signedBid);
 
     metrics?.bids.total.inc({result: apiRevision ? BidResult.prepared : BidResult.published});
@@ -300,23 +334,16 @@ export class Bidder {
       gasLimit: executionPayload.gasLimit,
       transactions: executionPayload.transactions.length,
       blobs: bid.blobKzgCommitments.length,
+      slotBidRevisions: ledger.getRevisionCount(slot),
+      retainedPayloads: this.modules.payloadStore.size,
+      retainedPayloadBytes: this.modules.payloadStore.bytes,
       secFromSlot: clock.secFromSlot(slot - 1),
     });
     return signedBid;
   }
 
-  /** Dependent root of the proposer duties in the given epoch, identifies the proposer preferences to bid against */
-  private async getDependentRoot(epoch: Epoch): Promise<RootHex> {
-    let dependentRoot = this.dependentRootByEpoch.get(epoch);
-    if (dependentRoot === undefined) {
-      dependentRoot = (await this.modules.api.validator.getProposerDutiesV2({epoch})).meta().dependentRoot;
-      this.dependentRootByEpoch.set(epoch, dependentRoot);
-      for (const cachedEpoch of this.dependentRootByEpoch.keys()) {
-        if (cachedEpoch < epoch - 1) {
-          this.dependentRootByEpoch.delete(cachedEpoch);
-        }
-      }
-    }
-    return dependentRoot;
+  /** A reorg can change the dependent root within an epoch. Active builds already coalesce repeated attributes. */
+  private async getDependentRoot(epoch: Epoch, signal: AbortSignal): Promise<RootHex> {
+    return (await this.modules.api.validator.getProposerDutiesV2({epoch}, {signal})).meta().dependentRoot;
   }
 }

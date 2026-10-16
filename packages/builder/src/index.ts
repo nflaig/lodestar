@@ -3,6 +3,7 @@ export {Builder, type BuilderOptions} from "./builder.js";
 export {defaultOptions} from "./defaults.js";
 export {type Metrics, getMetrics} from "./metrics.js";
 export {type Keypair} from "./services/builderSigner.js";
+export {MAX_BID_REVISIONS_PER_SLOT} from "./services/commitmentLimits.js";
 export {
   type BuildHandle,
   type BuildRequest,
@@ -12,3 +13,7 @@ export {
   type PayloadSource,
   type PayloadSourceEngine,
 } from "./services/payloadSource.js";
+export {
+  MAX_ADDITIONAL_PROPOSER_PREFERENCES_SOURCES,
+  type ProposerPreferencesSource,
+} from "./services/proposerPreferencesRecovery.js";

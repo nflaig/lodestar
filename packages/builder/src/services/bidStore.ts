@@ -1,8 +1,9 @@
 import {RootHex, Slot, gloas, ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
+import {PAYLOAD_RETENTION_SLOTS} from "./commitmentLimits.js";
 
 /** Keep bids for this many slots after their slot, same as the payloads they commit to */
-const KEEP_SLOTS = 2;
+const KEEP_SLOTS = PAYLOAD_RETENTION_SLOTS;
 
 /** Retains the published signed bids, a bid is unique per slot and parent */
 export class BidStore {

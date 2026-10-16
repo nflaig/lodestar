@@ -10,11 +10,64 @@ import {defer, toRootHex} from "@lodestar/utils";
 import {type BidIdentity, BidLedger, BidLedgerErrorCode} from "../../../src/services/bidLedger.js";
 import {BidPublisher, BidPublisherError, BidPublisherErrorCode} from "../../../src/services/bidPublisher.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
+import {CommitmentJournalError} from "../../../src/services/commitmentJournalError.js";
 import {getApiClientStub, mockApiErrorResponse, mockApiResponse} from "../utils/apiStub.js";
 
 const builderIndex = 7;
 
 describe("BidPublisher", () => {
+  it("keeps a pending durable revision ineligible and reserves the concurrent gossip tuple", async () => {
+    const disk = defer<void>();
+    const {publisher, ledger, api, signer} = createPublisher({
+      hasPayload: () => true,
+      retainCommitment: () => disk.promise,
+    });
+    const bid = createBid();
+    const result = publisher.publish(bid, new AbortController().signal);
+    expect(ledger.getBidsForSlot(bid.slot)).toHaveLength(0);
+    await expect(
+      publisher.gossip(signer.signExecutionPayloadBid(bid), new AbortController().signal)
+    ).rejects.toMatchObject({
+      type: {code: BidPublisherErrorCode.BID_NOT_PREPARED},
+    });
+    await expect(publisher.publish({...bid, value: 6}, new AbortController().signal)).rejects.toMatchObject({
+      type: {code: BidLedgerErrorCode.DUPLICATE_BID},
+    });
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+    disk.resolve();
+    await result;
+    expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+    expect(ledger.getBidsForSlot(bid.slot)).toHaveLength(1);
+  });
+
+  it("does not publish a canceled preparation after its durable write finishes", async () => {
+    const disk = defer<void>();
+    const {publisher, api} = createPublisher({hasPayload: () => true, retainCommitment: () => disk.promise});
+    const controller = new AbortController();
+    const result = publisher.publish(createBid(), controller.signal);
+    controller.abort();
+    disk.resolve();
+    await expect(result).rejects.toMatchObject({name: "AbortError"});
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+  });
+
+  it("includes pending writes in the revision limit", async () => {
+    const disk = defer<void>();
+    const {publisher, ledger} = createPublisher({hasPayload: () => true, retainCommitment: () => disk.promise});
+    const bid = createBid();
+    for (let i = 0; i < 255; i++) {
+      const root = Buffer.alloc(32);
+      root.writeUInt32BE(i, 28);
+      ledger.recordRevision({...bidIdentity(bid), signedBidRoot: toRootHex(root), valueGwei: i});
+    }
+    const pending = publisher.prepare(bid);
+    await expect(publisher.prepare({...bid, value: 6})).rejects.toMatchObject({
+      type: {code: BidLedgerErrorCode.REVISION_LIMIT},
+    });
+    disk.resolve();
+    await pending;
+    expect(ledger.getRevisionCount(bid.slot)).toBe(256);
+  });
   it("does not expose a signature or gossip when durable retention fails", async () => {
     const {api, publisher} = createPublisher({
       hasPayload: () => true,
@@ -22,9 +75,45 @@ describe("BidPublisher", () => {
         throw Error("disk failed");
       },
     });
-    expect(() => publisher.prepare(createBid())).toThrow("disk failed");
+    await expect(publisher.prepare(createBid())).rejects.toThrow("disk failed");
     await expect(publisher.publish(createBid(), new AbortController().signal)).rejects.toThrow("disk failed");
     expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+  });
+  it("keeps uncertain durable writes in the revision admission budget", async () => {
+    const retainCommitment = vi.fn(async () => {
+      throw Error("worker exited after write");
+    });
+    const {publisher, ledger} = createPublisher({hasPayload: () => true, retainCommitment});
+    const bid = createBid();
+    for (let i = 0; i < 255; i++) {
+      const root = Buffer.alloc(32);
+      root.writeUInt32BE(i, 28);
+      ledger.recordRevision({...bidIdentity(bid), signedBidRoot: toRootHex(root), valueGwei: i});
+    }
+    await expect(publisher.prepare(bid)).rejects.toThrow("worker exited after write");
+    await expect(publisher.prepare({...bid, value: 6})).rejects.toMatchObject({
+      type: {code: BidLedgerErrorCode.REVISION_LIMIT},
+    });
+    expect(retainCommitment).toHaveBeenCalledOnce();
+    expect(ledger.getRevisionCount(bid.slot)).toBe(255);
+  });
+
+  it("releases revision admission when a write was rejected before dispatch", async () => {
+    const retainCommitment = vi
+      .fn()
+      .mockRejectedValueOnce(new CommitmentJournalError("COMMITMENT_WORKER_CAPACITY", false))
+      .mockResolvedValue(undefined);
+    const {publisher, ledger} = createPublisher({hasPayload: () => true, retainCommitment});
+    const bid = createBid();
+    for (let i = 0; i < 255; i++) {
+      const root = Buffer.alloc(32);
+      root.writeUInt32BE(i, 28);
+      ledger.recordRevision({...bidIdentity(bid), signedBidRoot: toRootHex(root), valueGwei: i});
+    }
+    await expect(publisher.prepare(bid)).rejects.toThrow("COMMITMENT_WORKER_CAPACITY");
+    await publisher.prepare(bid);
+    expect(retainCommitment).toHaveBeenCalledTimes(2);
+    expect(ledger.getRevisionCount(bid.slot)).toBe(256);
   });
   it("signs, records, and submits a bid with a retained payload", async () => {
     const bid = createBid();
@@ -175,6 +264,7 @@ describe("BidPublisher", () => {
     const signal = new AbortController().signal;
     const first = publisher.publish(bid, signal);
     const firstOutcome = first.catch(() => undefined);
+    await vi.waitFor(() => expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce());
     if (outcome === "failed") response.reject(Error("connection lost after submission"));
     if (outcome === "accepted") response.resolve(mockApiResponse({}));
     if (outcome !== "pending") await firstOutcome;

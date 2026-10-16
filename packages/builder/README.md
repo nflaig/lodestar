@@ -14,6 +14,25 @@ Typescript implementation of the Ethereum Consensus builder client.
 - Follow the [installation guide](https://chainsafe.github.io/lodestar/) to install Lodestar.
 - Quickly try out the whole stack by [starting a local testnet](https://chainsafe.github.io/lodestar/contribution/advanced-topics/setting-up-a-testnet/).
 
+## Recovering proposer preferences
+
+Proposers gossip their signed preferences once. A beacon node that misses the message never
+emits the matching event, and the builder does not bid for that slot. The builder polls the
+pool of its beacon node at startup and once per slot. Additional trusted beacon nodes on the
+same network can be polled as well:
+
+```sh
+--proposerPreferences.urls http://127.0.0.1:9597,http://127.0.0.1:9598
+```
+
+At most three additional URLs are accepted. Each is verified against the genesis and config of
+the primary beacon node before its pool is used; a node on a different network is excluded for
+the rest of the process. Only signed preferences for the current and next epoch are retained, and
+entries are merged by proposal slot and dependent root, so an entry already known is never
+replaced. The primary beacon node still provides payload attributes, duties and builder status.
+Polls share one deadline, `--proposerPreferences.timeout`, and run outside the bidding path; a
+failing node is reported once and skipped until it responds again.
+
 ## Controlled payloads on a devnet
 
 The builder can use Geth's `testing_buildBlockV1` to build an exact, ordered list of signed transactions.
@@ -66,7 +85,7 @@ using a new workload on a shared devnet; these checks do not independently verif
 ## Incremental payload constructor
 
 An external constructor can keep one session alive and return improving Gloas
-payloads without blob transactions. Add these flags to the existing builder command:
+payloads, including complete blob bundles. Add these flags to the existing builder command:
 
 ```sh
 --payload.constructorUrl http://127.0.0.1:8547 \
@@ -96,9 +115,20 @@ Positive intervals require this constructor source and must be at least 25 ms. T
 source cannot be combined with the controlled transaction-file source or its capture
 directory. `--payload.dryRun` builds without signing or publishing.
 
-The commitment journal permits 64 signed revisions per slot across all parents.
-Payload storage is capped at 192 payloads and 256 MiB of serialized content plus entry
-allowances, which is not a resident memory limit. Exhaustion rejects new work rather than evicting
+The beacon node emits `payload_attributes` once per slot, at two thirds of the slot before
+the proposal. To start construction earlier, run the builder's beacon node with
+`--emitPayloadAttributes --chain.emitPayloadAttributesEarly`. It then also emits as soon
+as the parent of the next slot is known: the empty tuple when the block is imported and
+the full tuple when its execution payload is imported. The regular emission before the
+slot still follows, so one slot may deliver the same tuple twice and the empty tuple before
+the full one. The builder keys builds by tuple, and a changed tuple cancels the earlier build.
+Epoch boundaries keep the regular timing only.
+
+The commitment journal permits 256 signed revisions per slot across all parents.
+Payload storage is capped at 1,280 payloads and 256 MiB of retained content plus entry
+allowances, with a 64 MiB admission budget per slot. Identical immutable blob sidecars
+share storage within a slot; metadata and proof accounting remain conservative.
+This accounting is not a resident memory limit. Exhaustion rejects new work rather than evicting
 advertised payloads. Metrics distinguish prepared API revisions (`prepared`) from
 successful gossip publication (`published`). Keep the constructor RPC private.
 
@@ -106,7 +136,7 @@ Live CLI builders persist Gloas commitments to `<dataDir>/builder-commitments`.
 Payloads and signed bids are synced before exposure; reveal conflict records are
 synced before signing. Recovery restores eligible revisions and checks identity,
 checksums and required payloads before serving. The disk journal is limited to
-768 MiB, 20,000 files and 128 MiB per file. Payloads expire after two slots;
+768 MiB, 51,457 files and 128 MiB per file. Payloads expire after two slots;
 bid and reveal metadata expire after three epochs. Dry runs do not write it.
 
 Recovery conservatively consumes each recorded parent tuple's gossip allowance
@@ -117,6 +147,21 @@ head. An uncertain write stops new journal writes. Use one process per journal
 with local filesystem atomic-rename/fsync semantics, retain the data directory
 across upgrades, and drain existing offers before switching publisher identities.
 Multiple builder identities and replicated recovery are not implemented.
+
+After synchronous startup recovery, one worker owns journal writes and pruning.
+Its queue admits at most eight offers, 64 MiB of offer data and sixteen operations.
+Reveal records have reserved capacity and priority over queued offers. An offer
+becomes eligible only after its durable acknowledgement; queued writes and writes
+with uncertain outcomes consume revision admission. Existing ready bids can still
+be served while a newer revision is being persisted.
+
+Blob bytes, commitments and cell proofs are stored together in content-addressed
+binary files shared by revisions of the same slot. Payload records retain ordered
+references; recovery checks their hashes and bid commitment order. Legacy inline
+blob records remain readable. Older binaries cannot recover live reference-based
+payload records: before rolling back, pause new construction and drain beyond the
+two-slot payload retention window. Preserve the journal and identity files; never
+replace the journal with a backup that omits bids already exposed to proposers.
 
 ## License
 

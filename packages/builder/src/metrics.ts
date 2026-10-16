@@ -78,6 +78,19 @@ export function getMetrics(register: MetricsRegisterExtra, gitData: LodestarGitD
       }),
     },
 
+    proposerPreferences: {
+      recovered: register.gauge<{source: string}>({
+        name: "bc_builder_proposer_preferences_recovered_total",
+        help: "Total count of proposer preferences first learned by polling a beacon node, by source",
+        labelNames: ["source"],
+      }),
+      fetchErrors: register.gauge<{source: string}>({
+        name: "bc_builder_proposer_preferences_fetch_errors_total",
+        help: "Total count of failed proposer preferences polls by source",
+        labelNames: ["source"],
+      }),
+    },
+
     api: {
       bidRequests: register.gauge<{result: BidRequestResult}>({
         name: "bc_builder_api_bid_requests_total",
