@@ -95,17 +95,18 @@ export class AsyncCommitmentJournal {
     bid: gloas.SignedExecutionPayloadBid,
     stored: StoredPayload,
     reference: DurablePayload | undefined
-  ): Promise<void> {
+  ): Promise<"reference" | "snapshot"> {
     if (reference) {
       try {
         await this.retainReference(bid, reference);
-        return;
+        return "reference";
       } catch (error) {
         if (!(error instanceof CommitmentJournalError) || error.message !== "COMMITMENT_REFERENCE_UNAVAILABLE")
           throw error;
       }
     }
     await this.retain(bid, stored);
+    return "snapshot";
   }
 
   prune(slot: number): Promise<void> {

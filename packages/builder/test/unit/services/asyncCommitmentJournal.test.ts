@@ -49,7 +49,13 @@ describe("AsyncCommitmentJournal", () => {
     await Promise.resolve();
     expect(thread.sent.at(-1)?.operation).toEqual({kind: "retain", bid, stored});
     thread.finish();
-    await offer;
+    expect(await offer).toBe("snapshot");
+    const retained = journal.retainShared(bid, stored, reference);
+    thread.finish();
+    expect(await retained).toBe("reference");
+    const ordinary = journal.retainShared(bid, stored, undefined);
+    thread.finish();
+    expect(await ordinary).toBe("snapshot");
     const uncertain = journal.retainShared(bid, stored, reference);
     thread.finish("COMMITMENT_JOURNAL_FAILED");
     await expect(uncertain).rejects.toThrow("COMMITMENT_JOURNAL_FAILED");
