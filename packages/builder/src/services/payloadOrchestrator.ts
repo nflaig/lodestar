@@ -96,6 +96,7 @@ export class PayloadOrchestrator {
     let previous: BuiltPayload | undefined;
     try {
       while (Date.now() < until) {
+        const started = Date.now();
         let payload: BuiltPayload;
         try {
           payload = await this.retrieve(
@@ -123,7 +124,12 @@ export class PayloadOrchestrator {
           await onPayload(payload);
           previous = payload;
         }
-        await sleep(Math.min(intervalMs, Math.max(0, until - Date.now())), signal);
+        const now = Date.now();
+        if (signal.aborted) throw new ErrorAborted();
+        if (now >= until) break;
+        // Retrieval and durable publication share one interval. A minimum
+        // yield preserves cancellation and event-loop fairness on slow updates.
+        await sleep(Math.min(Math.max(1, intervalMs - Math.max(0, now - started)), until - now), signal);
       }
     } finally {
       await this.release(handle);

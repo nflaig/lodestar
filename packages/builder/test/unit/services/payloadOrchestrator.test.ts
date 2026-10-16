@@ -1,7 +1,7 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {ErrorAborted, defer} from "@lodestar/utils";
+import {ErrorAborted, defer, sleep} from "@lodestar/utils";
 import {
   type PayloadBuildJob,
   PayloadOrchestrator,
@@ -361,6 +361,92 @@ describe("PayloadOrchestrator", () => {
     expect(next).not.toBe(resultPromise);
     await vi.advanceTimersByTimeAsync(100);
     expect(source.prepareCalls).toHaveLength(2);
+  });
+
+  it.each([
+    {retrieveMs: 4, publishMs: 16, expected: [0, 25, 50, 75]},
+    {retrieveMs: 4, publishMs: 30, expected: [0, 35, 70]},
+  ])(
+    "counts retrieval and publication towards the update interval: $publishMs ms",
+    async ({retrieveMs, publishMs, expected}) => {
+      const source = new StubPayloadSource();
+      const calls: number[] = [];
+      let publishing = false;
+      source.getPayloadImpl = async (handle) => {
+        expect(publishing).toBe(false);
+        calls.push(Date.now() - NOW);
+        await sleep(retrieveMs);
+        return builtPayload(handle);
+      };
+      const release = vi.fn(async () => {});
+      const orchestrator = createOrchestrator(Object.assign(source, {release}));
+      const onPayload = vi.fn(async () => {
+        publishing = true;
+        await sleep(publishMs);
+        publishing = false;
+      });
+      const result = orchestrator.runUpdates(buildJob(), {intervalMs: 25, until: NOW + 100}, onPayload);
+      await vi.advanceTimersByTimeAsync(150);
+      await result;
+      expect(calls).toEqual(expected);
+      expect(onPayload).toHaveBeenCalledTimes(expected.length);
+      expect(release).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it("keeps unchanged payload polling bounded and releases on cancellation", async () => {
+    const source = new StubPayloadSource();
+    const payload = builtPayload();
+    source.getPayloadImpl = async () => payload;
+    const release = vi.fn(async () => {});
+    const controller = new AbortController();
+    const orchestrator = createOrchestrator(Object.assign(source, {release}), controller);
+    const onPayload = vi.fn(async () => {});
+    const result = orchestrator.runUpdates(buildJob(), {intervalMs: 25, until: NOW + 100}, onPayload);
+    const rejected = expect(result).rejects.toBeInstanceOf(ErrorAborted);
+    await vi.advanceTimersByTimeAsync(74);
+    expect(source.getPayloadCalls).toHaveLength(3);
+    expect(onPayload).toHaveBeenCalledTimes(1);
+    controller.abort();
+    await rejected;
+    expect(release).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(source.getPayloadCalls).toHaveLength(3);
+  });
+
+  it.each([40, 120])("preserves cancellation during a %d ms publication", async (publishMs) => {
+    const source = new StubPayloadSource();
+    const release = vi.fn(async () => {});
+    const controller = new AbortController();
+    const orchestrator = createOrchestrator(Object.assign(source, {release}), controller);
+    const onPayload = vi.fn(async () => sleep(publishMs));
+    const result = orchestrator.runUpdates(buildJob(), {intervalMs: 25, until: NOW + 100}, onPayload);
+    const rejected = expect(result).rejects.toBeInstanceOf(ErrorAborted);
+    await vi.advanceTimersByTimeAsync(10);
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(publishMs);
+    await rejected;
+    expect(source.getPayloadCalls).toHaveLength(1);
+    expect(onPayload).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not extend the polling interval when the wall clock moves backward", async () => {
+    const source = new StubPayloadSource();
+    const calls: number[] = [];
+    source.getPayloadImpl = async (handle) => {
+      calls.push(Date.now());
+      return builtPayload(handle);
+    };
+    const orchestrator = createOrchestrator(source);
+    const onPayload = vi.fn(async () => {
+      if (calls.length === 1) vi.setSystemTime(NOW - 1000);
+    });
+    const result = orchestrator.runUpdates(buildJob(), {intervalMs: 25, until: NOW + 100}, onPayload);
+    await vi.advanceTimersByTimeAsync(26);
+    expect(calls).toEqual([NOW, NOW - 1000 + 25]);
+    await vi.advanceTimersByTimeAsync(1100);
+    await result;
   });
 
   it.each([
