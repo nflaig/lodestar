@@ -3,7 +3,7 @@ import {ChainForkConfig} from "@lodestar/config";
 import {ForkName, MIN_DEPOSIT_AMOUNT, isForkPostGloas} from "@lodestar/params";
 import {IClock, computeEpochAtSlot} from "@lodestar/state-transition";
 import {BuilderIndex, BuilderStatus, Epoch, ExecutionAddress, RootHex, gloas} from "@lodestar/types";
-import {Logger, isErrorAborted, prettyGweiToEth, toHex, toRootHex} from "@lodestar/utils";
+import {Logger, isErrorAborted, prettyGweiToEth, sleep, toHex, toRootHex} from "@lodestar/utils";
 import {BidResult, Metrics} from "../metrics.js";
 import {BidLedger} from "./bidLedger.js";
 import {BidPolicy} from "./bidPolicy.js";
@@ -19,6 +19,7 @@ const GWEI_TO_WEI = 1_000_000_000n;
 export type PayloadAttributesEvent = routes.events.EventData[routes.events.EventType.payloadAttributes];
 
 export type BidderOptions = {
+  dryRun?: boolean;
   /** Point within the slot before the proposal slot at which the payload is retrieved and bid on, in basis points */
   deadlineBps: number;
   /** Do not bid while the builder balance is below this value */
@@ -88,8 +89,17 @@ export class Bidder {
         return;
       }
 
+      const getPayloadAt =
+        Date.now() +
+        clock.msToSlot(slot) -
+        config.SLOT_DURATION_MS +
+        config.getSlotComponentDurationMs(this.opts.deadlineBps);
       const dependentRoot = await this.getDependentRoot(computeEpochAtSlot(slot));
-      const proposerPreferences = proposerPreferencesTracker.get(slot, dependentRoot);
+      let proposerPreferences = proposerPreferencesTracker.get(slot, dependentRoot);
+      while (proposerPreferences === null && Date.now() < getPayloadAt) {
+        await sleep(Math.min(100, getPayloadAt - Date.now()), this.modules.signal);
+        proposerPreferences = proposerPreferencesTracker.get(slot, dependentRoot);
+      }
       if (proposerPreferences === null) {
         logger.debug("No proposer preferences known for slot, not bidding", {...logCtx, dependentRoot});
         metrics?.bids.total.inc({result: BidResult.noProposerPreferences});
@@ -97,8 +107,7 @@ export class Bidder {
       }
       const {feeRecipient, targetGasLimit} = proposerPreferences.message;
 
-      const msToDeadline =
-        clock.msToSlot(slot) - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(this.opts.deadlineBps);
+      const msToDeadline = getPayloadAt - Date.now();
       logger.verbose("Preparing payload build", {...logCtx, msToDeadline, targetGasLimit});
 
       const payload = await orchestrator.run({
@@ -116,8 +125,18 @@ export class Bidder {
             targetGasLimit,
           },
         },
-        getPayloadAt: Date.now() + msToDeadline,
+        getPayloadAt,
       });
+
+      if (this.opts.dryRun) {
+        metrics?.bids.total.inc({result: BidResult.dryRun});
+        logger.info("Built payload without bidding", {
+          ...logCtx,
+          blockHash: toRootHex(payload.executionPayload.blockHash),
+          transactions: payload.executionPayload.transactions.length,
+        });
+        return;
+      }
 
       const {status, balance} = this.modules.getBuilderStatus();
       if (status !== "active" || balance === undefined) {

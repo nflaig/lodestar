@@ -48,6 +48,7 @@ export function createBiddingModules({
   index = 1,
   getBuilderStatus = () => ({status: "active", balance: 10_000_000_000}),
   revealOptions,
+  dryRun,
 }: {
   api: ApiClient;
   config: ChainForkConfig;
@@ -61,6 +62,7 @@ export function createBiddingModules({
   index?: BuilderIndex;
   getBuilderStatus?: () => {status: BuilderStatus | undefined; balance: number | undefined};
   revealOptions?: Partial<RevealerOptions>;
+  dryRun?: boolean;
 }): {ledger: BidLedger; bidStore: BidStore; bidder: Bidder; revealer: Revealer} {
   const ledger = new BidLedger();
   const bidStore = new BidStore();
@@ -94,7 +96,7 @@ export function createBiddingModules({
       metrics: null,
       signal,
     },
-    biddingOptions
+    {...biddingOptions, dryRun}
   );
   const revealer = new Revealer(
     {

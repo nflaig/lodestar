@@ -59,6 +59,7 @@ HackMD
 Hashicorp
 Homebrew
 Hyperledger
+IPC
 IPFS
 IPv
 Infura
@@ -173,6 +174,7 @@ feeRecipient
 flamegraph
 flamegraphs
 floodsub
+forkchoice
 fsSL
 getNetworkIdentity
 gloas
@@ -214,6 +216,7 @@ namespaced
 namespaces
 navbar
 nodemodule
+nonces
 orchestrator
 osx
 params

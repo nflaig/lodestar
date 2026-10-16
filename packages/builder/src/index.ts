@@ -4,6 +4,9 @@ export {defaultOptions} from "./defaults.js";
 export {type Metrics, getMetrics} from "./metrics.js";
 export {type Keypair} from "./services/builderSigner.js";
 export {
+  type BuildHandle,
+  type BuildRequest,
+  type BuiltPayload,
   type EnginePayloadResult,
   EnginePayloadSource,
   type PayloadSource,

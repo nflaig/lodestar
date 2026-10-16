@@ -36,4 +36,19 @@ describe("cmds / builder / args handler", () => {
       })
     ).rejects.toThrow("Cannot put zero address as an executionFeeRecipient");
   });
+
+  it.each([
+    [{"payload.testingUrl": "http://127.0.0.1:8545"}, "--payload.transactionsFile is required"],
+    [{"payload.transactionsFile": "transactions.json"}, "requires --payload.testingUrl"],
+    [
+      {
+        "payload.transactionsFile": "transactions.json",
+        "payload.testingUrl": "http://127.0.0.1:8545",
+        "payload.dryRun": true,
+      },
+      "requires --payload.outputDir",
+    ],
+  ])("rejects incomplete controlled payload options before loading keys", async (args, message) => {
+    await expect(runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", ...args})).rejects.toThrow(message);
+  });
 });

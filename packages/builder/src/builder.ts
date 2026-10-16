@@ -84,6 +84,7 @@ export class Builder {
   private readonly index: BuilderIndex;
   private readonly logger: Logger;
   private readonly executionFeeRecipient: ExecutionAddress;
+  private readonly api: ApiClient;
   private readonly payloadStore: PayloadStore;
   private readonly bidStore: BidStore;
   private readonly ledger: BidLedger;
@@ -121,6 +122,7 @@ export class Builder {
     this.builderApi = builderApi;
 
     this.executionFeeRecipient = opts.executionFeeRecipient;
+    this.api = opts.api;
 
     this.blockObserver.runOnBlock((block) => this.revealer.onBlock(block));
     this.clock.runEverySlot(async (slot) => this.onSlot(slot));
@@ -267,6 +269,7 @@ export class Builder {
   }
 
   private async onSlot(slot: number): Promise<void> {
+    void this.fetchProposerPreferences(this.api);
     this.payloadStore.prune(slot);
     this.bidStore.prune(slot);
     this.proposerPreferencesTracker.prune(slot);
@@ -280,7 +283,7 @@ export class Builder {
    */
   private async fetchProposerPreferences(api: ApiClient): Promise<void> {
     try {
-      const preferences = (await api.beacon.getProposerPreferences()).value();
+      const preferences = (await api.beacon.getProposerPreferences({}, {signal: this.controller.signal})).value();
       for (const signedProposerPreferences of preferences) {
         this.proposerPreferencesTracker.onProposerPreferences(signedProposerPreferences);
       }
