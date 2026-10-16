@@ -85,6 +85,26 @@ describe("AsyncCommitmentJournal", () => {
     await journal.close();
   });
 
+  it.each(["injected renameSync failure", "injected fsyncSync failure", "COMMITMENT_PAYLOAD_REFERENCE"])(
+    "does not fall back to a snapshot after reference failure: %s",
+    async (error) => {
+      const {thread, journal, bid, stored} = setup();
+      const reference = {
+        slot: 1,
+        blockHash: stored.blockHash,
+        parentBlockRoot: toRootHex(stored.parentBlockRoot),
+        commitments: [],
+        files: [],
+      };
+      const offer = journal.retainShared(bid, stored, reference);
+      thread.finish(error);
+      await expect(offer).rejects.toMatchObject({message: error, uncertain: true});
+      expect(thread.sent).toHaveLength(1);
+      expect(thread.sent[0].operation.kind).toBe("retainReference");
+      await journal.close();
+    }
+  );
+
   it("bounds queued offers, reserves reveal capacity, and waits for every acknowledgement on close", async () => {
     const {thread, journal, bid, stored} = setup();
     const offers = Array.from({length: 8}, () => journal.retain(bid, stored));

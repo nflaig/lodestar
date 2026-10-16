@@ -89,6 +89,38 @@ describe("CommitmentJournal", () => {
     }
   );
 
+  it.each(["renameSync", "fsyncSync"] as const)(
+    "poisons reference retention after an uncertain %s failure without recovering an offer",
+    (operation) => {
+      const primary = setup();
+      const secondary = setup();
+      const original = revision(1);
+      const reference = primary.journal.retain(original.signed, original.stored);
+      if (!reference) throw Error("Missing durable reference");
+      const journal = new CommitmentJournal(secondary.directory, identity, undefined, primary.directory);
+      const cause = Object.assign(Error(`injected ${operation} failure`), {code: "EIO"});
+      const failure = vi.spyOn(fs, operation).mockImplementation(() => {
+        throw cause;
+      });
+      let thrown: unknown;
+      try {
+        journal.retainReference(original.signed, reference);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBe(cause);
+      expect(failure).toHaveBeenCalledOnce();
+      failure.mockRestore();
+      expect(() => journal.retainReference(original.signed, reference)).toThrow("COMMITMENT_JOURNAL_FAILED");
+      expect(() => journal.retain(original.signed, original.stored)).toThrow("COMMITMENT_JOURNAL_FAILED");
+      expect(fs.readdirSync(secondary.directory).some((name) => name.startsWith("bid-"))).toBe(false);
+      const recovered = recover(secondary.directory);
+      expect(recovered.count).toBe(0);
+      expect(recovered.bids.has(original.signed)).toBe(false);
+      expect(recover(primary.directory).bids.has(original.signed)).toBe(true);
+    }
+  );
+
   it("retains an acknowledged payload by reference without reading or serializing its bytes", () => {
     const primary = setup();
     const secondary = setup();
