@@ -18,6 +18,11 @@ const CF_CONNECTING_IP_HEADER = "cf-connecting-ip";
 const FORWARDED_FOR_HEADER = "x-forwarded-for";
 const DATE_MILLISECONDS_HEADER = "date-milliseconds";
 const TIMEOUT_MS_HEADER = "x-timeout-ms";
+// Set by a Cloudflare transform rule from http.request.timestamp.sec and .msec
+const EDGE_RECEIVED_SEC_HEADER = "x-edge-received-sec";
+const EDGE_RECEIVED_MSEC_HEADER = "x-edge-received-msec";
+/** Upper bound for the leg from a proposer to the Cloudflare edge that receives its request, the closest one to it */
+const EDGE_ALLOWANCE_MS = 25;
 
 export type BuilderRestApiServerModules = RestApiServerModules & {
   config: ChainForkConfig;
@@ -85,6 +90,19 @@ export class BuilderRestApiServer extends RestApiServer {
       } else done(null, payload);
     });
 
+    // The bid wait budget counts from Date-Milliseconds, the proposer's own clock, which can be off by hundreds of
+    // milliseconds. When Cloudflare received the request, its timestamp minus the edge allowance replaces it.
+    const clientDateMs = new WeakMap<object, number>();
+    this.server.addHook("onRequest", async (req) => {
+      const edgeMs = edgeReceivedMs(req.headers);
+      const dateMs = Number(firstHeaderValue(req.headers[DATE_MILLISECONDS_HEADER]));
+      if (edgeMs === undefined || !Number.isFinite(dateMs)) {
+        return;
+      }
+      clientDateMs.set(req, dateMs);
+      req.headers[DATE_MILLISECONDS_HEADER] = String(edgeMs - EDGE_ALLOWANCE_MS);
+    });
+
     // Only the routes implemented by the builder are registered, routes of earlier forks are not served
     const routes = getRoutes(modules.config, modules.api as BuilderApiMethods);
     for (const operationId of Object.keys(modules.api) as (keyof BuilderApi)[]) {
@@ -101,6 +119,7 @@ export class BuilderRestApiServer extends RestApiServer {
 
       const {slot, proposer_pubkey: proposer} = (req.params ?? {}) as {slot?: number; proposer_pubkey?: string};
       const dateMs = Number(req.headers[DATE_MILLISECONDS_HEADER]);
+      const clientMs = clientDateMs.get(req);
       // Routes without path params or timing headers only log the fields they have
       const logCtx = removeUndefined({
         operationId,
@@ -111,8 +130,9 @@ export class BuilderRestApiServer extends RestApiServer {
         // The proxies in front of the builder API pass on the address of the caller
         ip: firstHeaderValue(req.headers[CF_CONNECTING_IP_HEADER] ?? req.headers[FORWARDED_FOR_HEADER]) ?? req.ip,
         timeoutMs: firstHeaderValue(req.headers[TIMEOUT_MS_HEADER]),
-        // Time the request took to arrive, based on the send time reported by the caller
+        // Time the request took to arrive, from the Cloudflare edge time if there is one, else the caller's
         transitMs: Number.isFinite(dateMs) ? Math.round(Date.now() - res.elapsedTime - dateMs) : undefined,
+        clientTransitMs: clientMs !== undefined ? Math.round(Date.now() - res.elapsedTime - clientMs) : undefined,
         durationMs: Math.round(res.elapsedTime),
       });
 
@@ -135,6 +155,15 @@ export class BuilderRestApiServer extends RestApiServer {
       throw e;
     }
   }
+}
+
+function edgeReceivedMs(headers: Record<string, string | string[] | undefined>): number | undefined {
+  const sec = Number(firstHeaderValue(headers[EDGE_RECEIVED_SEC_HEADER]));
+  const msec = Number(firstHeaderValue(headers[EDGE_RECEIVED_MSEC_HEADER]));
+  if (!Number.isInteger(sec) || sec <= 0 || !Number.isInteger(msec) || msec < 0 || msec > 999) {
+    return undefined;
+  }
+  return sec * 1000 + msec;
 }
 
 function firstHeaderValue(value: string | string[] | undefined): string | undefined {
