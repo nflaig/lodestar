@@ -136,6 +136,59 @@ describe("cmds / builder / api server", () => {
     expect(context.transitMs).toBeGreaterThanOrEqual(40);
   });
 
+  it("times a bid request from the Cloudflare edge instead of the proposer's clock", async () => {
+    const logger = testLogger();
+    const info = vi.spyOn(logger, LogLevel.info);
+    const getExecutionPayloadBid = vi.fn().mockResolvedValue({data: undefined, meta: {version: "gloas"}, status: 204});
+    server = new TestBuilderRestApiServer(
+      {},
+      {
+        config,
+        logger,
+        metrics: null,
+        api: {
+          status: vi.fn(),
+          getExecutionPayloadBid,
+          submitSignedBeaconBlock: vi.fn(),
+          submitBuilderPreferences: vi.fn(),
+        },
+      }
+    );
+    const root = toHex(Buffer.alloc(32, 2));
+    const edgeMs = Date.now() - 100;
+    const request = (edgeMsec: number) =>
+      server?.inject({
+        method: "POST",
+        url: `/eth/v1/builder/execution_payload_bid/5/${root}/${root}/${toHex(Buffer.alloc(48, 1))}`,
+        headers: {
+          "Eth-Consensus-Version": "gloas",
+          "Date-Milliseconds": String(edgeMs - 300),
+          "X-Timeout-Ms": "600",
+          "X-Edge-Received-Sec": String(Math.floor(edgeMs / 1000)),
+          "X-Edge-Received-Msec": String(edgeMsec),
+        },
+        payload: ssz.gloas.SignedBuilderRequestAuth.toJson(ssz.gloas.SignedBuilderRequestAuth.defaultValue()) as object,
+      });
+    expect((await request(edgeMs % 1000))?.statusCode).toBe(204);
+    expect(getExecutionPayloadBid).toHaveBeenLastCalledWith(
+      expect.objectContaining({dateMilliseconds: edgeMs - 25, timeoutMs: 600}),
+      expect.anything()
+    );
+    const context = info.mock.calls.find(([message]) => message === "Builder API request")?.[1] as Record<
+      string,
+      number
+    >;
+    expect(context.transitMs).toBeGreaterThanOrEqual(125);
+    expect(context.clientTransitMs).toBeGreaterThanOrEqual(400);
+
+    // A malformed edge time leaves the proposer's own
+    await request(1000);
+    expect(getExecutionPayloadBid).toHaveBeenLastCalledWith(
+      expect.objectContaining({dateMilliseconds: edgeMs - 300}),
+      expect.anything()
+    );
+  });
+
   it("only logs the fields a request has", async () => {
     const logger = testLogger();
     const info = vi.spyOn(logger, LogLevel.info);
