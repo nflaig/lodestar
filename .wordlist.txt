@@ -26,6 +26,7 @@ Docusaurus
 EIP
 EIPs
 EL
+ENOSPC
 ENR
 ENRs
 ETH
@@ -67,6 +68,7 @@ JSON
 JSObjects
 JWT
 KDE
+KiB
 Kubernetes
 Kurtosis
 LMD
@@ -88,6 +90,7 @@ Nim
 NodeJS
 NodeSource
 OSI
+POSIX
 PR
 PRs
 Plaintext
@@ -172,6 +175,7 @@ env
 envs
 ephemery
 ethers
+failover
 fastconfirm
 feeRecipient
 filesystem
@@ -255,6 +259,7 @@ subnet
 subnets
 sudo
 supernode
+symlink
 tcp
 testnet
 testnets
