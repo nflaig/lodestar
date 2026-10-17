@@ -134,7 +134,7 @@ successful gossip publication (`published`). Keep the constructor RPC private.
 
 Live CLI builders persist Gloas commitments to `<dataDir>/builder-commitments`.
 Payloads and signed bids are synced before exposure; reveal conflict records are
-synced before signing. Recovery restores eligible revisions and checks identity,
+synced before signing. Recovery restores reveal obligations and checks identity,
 checksums, execution-request roots and required payloads before serving. Each
 new offer must match its retained slot, execution hash, execution parent, beacon
 parent, request root and ordered blob commitments. Reusing an immutable payload
@@ -190,6 +190,31 @@ blob records remain readable. Older binaries cannot recover live reference-based
 payload records: before rolling back, pause new construction and drain beyond the
 two-slot payload retention window. Preserve the journal and identity files; never
 replace the journal with a backup that omits bids already exposed to proposers.
+
+## Constructor order generations
+
+A constructor advertising `orderGenerationVersion: 1` uses conditional
+`zbuilder_getPayloadV2` reads. Each ready response grants 250 ms of offer permission,
+measured from the request start with both monotonic and wall clocks. Heartbeats may
+renew unchanged candidates. Expired, unavailable, released or superseded generations
+cannot produce new API or gossip offers. Checks run after durable preparation, before
+each transport attempt and before the final API response is sent. API responses use
+`Cache-Control: no-store`.
+
+The gateway must fence the constructor and drain all outstanding leases before
+acknowledging cancellation or replacement. Lower-value replacement candidates may be
+served through the API; already consumed gossip allowances are not reset. Previously
+signed bids and payloads remain retained for reveal, even after cancellation. Recovery
+restores these obligations without restoring volatile offer permission; a current
+constructor admission is required before offering them again.
+
+This protocol requires session updates. One-shot construction with leased candidates
+is rejected. Constructors advertising version zero, or no version, retain V1 behavior.
+Deploy a compatible gateway, constructor and publisher together before enabling order
+generations. Attempts authorized before a fence can arrive after its acknowledgement
+because of scheduling or network delay. Cancellation does not retract delivered bids, remove
+independently authorized copies, or fence copied processes on other hosts. Arbitrary
+VM snapshot rollback and clock restoration are outside the lease assumptions.
 
 ## Staged P2P bids
 
