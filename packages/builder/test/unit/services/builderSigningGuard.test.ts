@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
+import {Worker} from "node:worker_threads";
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {createBeaconConfig} from "@lodestar/config";
@@ -22,6 +23,19 @@ describe("BuilderSigningGuard", () => {
     const guard = await BuilderSigningGuard.acquire(target);
     guards.push(guard);
     return guard;
+  }
+
+  async function probeFromProcess(): Promise<"ready" | "blocked"> {
+    const child = fork(fileURLToPath(new URL("../fixtures/signingGuardOwner.ts", import.meta.url)), [directory], {
+      execArgv: ["--import", "tsx"],
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+    children.push(child);
+    return new Promise((resolve, reject) => {
+      child.once("message", () => resolve("ready"));
+      child.once("error", reject);
+      child.once("exit", (code) => (code === 1 ? resolve("blocked") : reject(Error(`unexpected exit ${code}`))));
+    });
   }
 
   beforeEach(() => {
@@ -75,6 +89,40 @@ describe("BuilderSigningGuard", () => {
     await expect(acquire()).rejects.toThrow("BUILDER_SIGNER_OWNERSHIP_UNAVAILABLE");
     await guard.close();
     await acquire();
+  });
+
+  it("keeps the kernel lock after another same-process acquisition is rejected", async () => {
+    const guard = await acquire();
+    await expect(acquire()).rejects.toThrow("BUILDER_SIGNER_OWNERSHIP_UNAVAILABLE");
+    expect(() => guard.assertActive()).not.toThrow();
+    expect(await probeFromProcess()).toBe("blocked");
+  });
+
+  it("rejects acquisition in another worker before it can affect the process lock", async () => {
+    const guard = await acquire();
+    const worker = new Worker(
+      `const {parentPort, workerData} = require("node:worker_threads");
+       (async () => {
+         const {register} = await import("tsx/esm/api");
+         register();
+         const {BuilderSigningGuard} = await import(workerData.module);
+         const guard = await BuilderSigningGuard.acquire(workerData.directory);
+         await guard.close();
+         return "acquired";
+       })().then(value => parentPort.postMessage(value), error => parentPort.postMessage(error.message));`,
+      {
+        eval: true,
+        workerData: {module: new URL("../../../src/services/builderSigningGuard.ts", import.meta.url).href, directory},
+      }
+    );
+    try {
+      const [message] = await once(worker, "message");
+      expect(message).toBe("BUILDER_SIGNER_WORKER_THREAD");
+      expect(() => guard.assertActive()).not.toThrow();
+      expect(await probeFromProcess()).toBe("blocked");
+    } finally {
+      await worker.terminate();
+    }
   });
 
   it.skipIf(process.platform !== "linux")("keeps a suspended process fenced and releases after SIGKILL", async () => {

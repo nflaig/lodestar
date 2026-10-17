@@ -164,6 +164,12 @@ recover all commitments before serving. Use a local filesystem with reliable
 exclusive locking and atomic-rename/fsync semantics, retain the data directory
 across upgrades, and drain existing offers before switching publisher identities.
 Never remove or replace the `.writer-lock` directory while an owner may be alive.
+Signer ownership is acquired only from the main thread. A process-wide directory
+registry rejects duplicate opens before they can release a POSIX record lock;
+other code in that process must not open, repair or destroy `.writer-lock/LOCK`.
+The lock database itself needs writable disk space at startup. An unavailable or
+corrupt lock database fails startup closed, even if expired journal files could
+otherwise be pruned. Preserve the directory until the former owner has exited.
 The guard covers the primary identity and its configured staged identities under
 one commitment root. Separate data directories, copied disks, copied keys and
 snapshot rollback are not fenced. Cross-host failover needs an external signer
