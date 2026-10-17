@@ -1,9 +1,10 @@
 import {createHash} from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import type {Type} from "@chainsafe/ssz";
 import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB} from "@lodestar/params";
 import {RootHex, gloas, ssz} from "@lodestar/types";
-import {fromHex, toRootHex} from "@lodestar/utils";
+import {fromHex, toHex, toRootHex} from "@lodestar/utils";
 import {BidLedger} from "./bidLedger.js";
 import {BidStore} from "./bidStore.js";
 import {BID_HISTORY_SLOTS, MAX_COMMITMENT_JOURNAL_FILES, PAYLOAD_RETENTION_SLOTS} from "./commitmentLimits.js";
@@ -161,7 +162,7 @@ export class CommitmentJournal {
         parentBlockRoot: toRootHex(parentBlockRoot),
         sourceId: payload.sourceId,
         value: payload.executionPayloadValue.toString(),
-        payload: ssz.gloas.ExecutionPayload.toJson(payload.executionPayload),
+        payload: payloadToJson(payload.executionPayload),
         requests: ssz.gloas.ExecutionRequests.toJson(payload.executionRequests),
         blobRefs,
       };
@@ -421,7 +422,8 @@ export class CommitmentJournal {
   }
 
   private write(name: string, data: unknown, sharePayload = false): void {
-    const text = JSON.stringify({data, checksum: digest(JSON.stringify(data))});
+    const json = JSON.stringify(data);
+    const text = `{"data":${json},"checksum":"${digest(json)}"}`;
     this.writeBytes(name, Buffer.from(text), sharePayload);
   }
 
@@ -481,6 +483,17 @@ export class CommitmentJournal {
       throw error;
     }
   }
+}
+
+function payloadToJson(payload: gloas.ExecutionPayload): Record<string, unknown> {
+  const json: Record<string, unknown> = {};
+  for (const {fieldName, fieldType, jsonKey} of ssz.gloas.ExecutionPayload.fieldsEntries) {
+    // Keep SSZ field order and encoding identical for checksums, shared files and older readers.
+    if (fieldName === "transactions") json[jsonKey] = Array.from(payload.transactions, (tx) => toHex(tx));
+    else if (fieldName === "blockAccessList") json[jsonKey] = toHex(payload.blockAccessList);
+    else json[jsonKey] = (fieldType as Type<unknown>).toJson(payload[fieldName]);
+  }
+  return json;
 }
 
 function digest(text: string): string {

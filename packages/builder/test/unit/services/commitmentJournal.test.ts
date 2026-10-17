@@ -1,3 +1,4 @@
+import {createHash} from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -58,6 +59,85 @@ afterEach(() => {
 });
 
 describe("CommitmentJournal", () => {
+  it.each([
+    {name: "empty", offset: 0, size: 0, buffer: false, blobs: 0},
+    {name: "Uint8Array subviews", offset: 7, size: 257, buffer: false, blobs: 0},
+    {name: "Buffer subviews and blobs", offset: 19, size: 8192, buffer: true, blobs: 8},
+  ])("preserves canonical JSON bytes and recovery for $name", ({offset, size, buffer, blobs}) => {
+    const {journal, directory} = setup();
+    const original = revision(1);
+    const bytes = (length: number, seed = 0): Uint8Array => {
+      const backing = buffer
+        ? Buffer.alloc(length + offset + 11, 0xcc)
+        : new Uint8Array(length + offset + 11).fill(0xcc);
+      const view = backing.subarray(offset, offset + length);
+      for (let i = 0; i < view.length; i++) view[i] = (i + seed) % 256;
+      return view;
+    };
+    const payload = original.stored.payload;
+    payload.sourceId = 'journal "quoted"\\path\n\u0000 \u2603 \ud800';
+    payload.executionPayloadValue = 123456789012345678901234567890n;
+    payload.executionPayload.transactions = size ? [bytes(0), bytes(1), bytes(size)] : [];
+    payload.executionPayload.blockAccessList = bytes(size * 3);
+    payload.executionPayload.extraData = bytes(32);
+    payload.executionPayload.baseFeePerGas = 12345678901234567890n;
+    payload.blobsBundle = {
+      blobs: Array.from({length: blobs}, (_, i) => bytes(131072, i)),
+      commitments: Array.from({length: blobs}, (_, i) => bytes(48, i)),
+      proofs: Array.from({length: blobs * 128}, (_, i) => bytes(48, i)),
+    };
+    original.signed.message.blobKzgCommitments = payload.blobsBundle.commitments;
+    const expected = {
+      slot,
+      blockHash: original.stored.blockHash,
+      parentBlockRoot: toRootHex(original.stored.parentBlockRoot),
+      sourceId: payload.sourceId,
+      value: payload.executionPayloadValue.toString(),
+      payload: ssz.gloas.ExecutionPayload.toJson(payload.executionPayload),
+      requests: ssz.gloas.ExecutionRequests.toJson(payload.executionRequests),
+      blobRefs: payload.blobsBundle.blobs.map(
+        (blob, i) =>
+          `0x${createHash("sha256")
+            .update(
+              Buffer.concat([
+                blob,
+                payload.blobsBundle.commitments[i],
+                ...payload.blobsBundle.proofs.slice(i * 128, (i + 1) * 128),
+              ])
+            )
+            .digest("hex")}`
+      ),
+    };
+    const checksum = createHash("sha256").update(JSON.stringify(expected)).digest("hex");
+    if (size === 0) {
+      // Recorded with the previous writer, including escaped metadata and bigint fields.
+      expect(checksum).toBe("79cefb636294c9790c8d5af85f003d7d935eea866bdf18012493ba85c1553daf");
+    }
+    const canonical = JSON.stringify({data: expected, checksum});
+    journal.retain(original.signed, original.stored);
+    expect(fs.readdirSync(directory).filter((name) => name.startsWith("blob-"))).toHaveLength(blobs);
+    expect(fs.readFileSync(path.join(directory, `payload-${slot}-${original.stored.blockHash}.json`), "utf8")).toBe(
+      canonical
+    );
+    expect(ssz.gloas.ExecutionPayload.toJson(payload.executionPayload)).toEqual(expected.payload);
+    const recovered = recover(directory);
+    expect(recovered.count).toBe(1);
+    const restored = recovered.payloads.get(original.stored.blockHash)?.payload;
+    if (!restored) throw Error("Missing recovered payload");
+    expect(ssz.gloas.ExecutionPayload.equals(restored.executionPayload, payload.executionPayload)).toBe(true);
+    expect(ssz.gloas.BlobsBundle.equals(restored.blobsBundle, payload.blobsBundle)).toBe(true);
+    expect(restored.sourceId).toBe(payload.sourceId);
+    expect(restored.executionPayloadValue).toBe(payload.executionPayloadValue);
+  });
+
+  it("does not acknowledge a sparse transaction list that cannot be recovered", () => {
+    const {journal, directory} = setup();
+    const original = revision(1);
+    original.stored.payload.executionPayload.transactions = new Array<Uint8Array>(1);
+    expect(() => journal.retain(original.signed, original.stored)).toThrow();
+    expect(recover(directory).count).toBe(0);
+  });
+
   it("acknowledges durable retention when optional reference metadata cannot be read", () => {
     const {journal, directory} = setup();
     const original = revision(1);
@@ -649,5 +729,3 @@ describe("CommitmentJournal", () => {
     expect(fs.readdirSync(directory)).toEqual(["identity.json"]);
   });
 });
-
-import {createHash} from "node:crypto";
