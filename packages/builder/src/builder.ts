@@ -20,6 +20,7 @@ import {BidSelector} from "./services/bidSelector.js";
 import {BidStore} from "./services/bidStore.js";
 import {BlockObserver} from "./services/blockObserver.js";
 import {BuilderSigner, Keypair} from "./services/builderSigner.js";
+import {BuilderSigningGuard} from "./services/builderSigningGuard.js";
 import {BuilderStatusTracker} from "./services/builderStatusTracker.js";
 import {CommitmentJournal} from "./services/commitmentJournal.js";
 import {EnvelopePublisher} from "./services/envelopePublisher.js";
@@ -58,6 +59,7 @@ export type BuilderModules = {
   revealer: Revealer;
   builderApi: BuilderApi | null;
   journal?: AsyncCommitmentJournal;
+  signingGuard?: BuilderSigningGuard;
   preferencesCache?: ProposerPreferencesCache;
   gossipIdentities?: GossipIdentity[];
 };
@@ -125,6 +127,7 @@ export class Builder {
   private readonly bidder: Bidder;
   private readonly revealer: Revealer;
   private readonly journal?: AsyncCommitmentJournal;
+  private readonly signingGuard?: BuilderSigningGuard;
   private readonly preferencesCache?: ProposerPreferencesCache;
   private readonly gossipIdentities: GossipIdentity[];
 
@@ -144,6 +147,7 @@ export class Builder {
     revealer,
     builderApi,
     journal,
+    signingGuard,
     preferencesCache,
     gossipIdentities = [],
   }: BuilderModules) {
@@ -163,6 +167,7 @@ export class Builder {
     this.revealer = revealer;
     this.builderApi = builderApi;
     this.journal = journal;
+    this.signingGuard = signingGuard;
     this.preferencesCache = preferencesCache;
     this.gossipIdentities = gossipIdentities;
 
@@ -191,6 +196,23 @@ export class Builder {
   }
 
   static async init(opts: BuilderOptions): Promise<Builder> {
+    const signingGuard = opts.commitmentDir ? await BuilderSigningGuard.acquire(opts.commitmentDir) : undefined;
+    const startupJournals: AsyncCommitmentJournal[] = [];
+    try {
+      return await Builder.initOwned(opts, signingGuard, startupJournals);
+    } catch (error) {
+      signingGuard?.revoke();
+      await Promise.allSettled(startupJournals.map((journal) => journal.close()));
+      await signingGuard?.close();
+      throw error;
+    }
+  }
+
+  private static async initOwned(
+    opts: BuilderOptions,
+    signingGuard: BuilderSigningGuard | undefined,
+    startupJournals: AsyncCommitmentJournal[]
+  ): Promise<Builder> {
     const {api, logger} = opts;
     const additional = opts.gossipIdentities ?? [];
     if (additional.length > MAX_ADDITIONAL_GOSSIP_IDENTITIES) throw Error("GOSSIP_STAGE_LIMIT");
@@ -221,7 +243,8 @@ export class Builder {
     logger.info("Verified connected beacon node and builder have the same config");
 
     const config = createBeaconConfig(opts.config, genesis.genesisValidatorsRoot);
-    const builderSigner = new BuilderSigner(config, opts.keypair);
+    const assertCanSign = signingGuard ? () => signingGuard.assertActive() : undefined;
+    const builderSigner = new BuilderSigner(config, opts.keypair, assertCanSign);
 
     await waitForNodeReady(api, logger, opts.abortController.signal);
     await logNodeVersion(api, logger);
@@ -285,6 +308,7 @@ export class Builder {
       const recoveredPreferences = await preferencesCache.load(proposerPreferencesTracker, clock.getCurrentSlot());
       logger.info("Restored cached proposer preferences", {recovered: recoveredPreferences});
       journal = await AsyncCommitmentJournal.start({directory: opts.commitmentDir, identity});
+      startupJournals.push(journal);
       logger.info("Recovered builder commitments", {recovered});
     }
     const signal = opts.abortController.signal;
@@ -330,10 +354,9 @@ export class Builder {
         : null;
 
     const gossipIdentities: GossipIdentity[] = [];
-    const startupJournals = journal ? [journal] : [];
     try {
       for (const entry of additional) {
-        const signer = new BuilderSigner(config, entry.keypair);
+        const signer = new BuilderSigner(config, entry.keypair, assertCanSign);
         const identity = await resolveGossipBuilderIdentity(api, signer.getPubkeyHex(), signal);
         if ([index, ...gossipIdentities.map(({stage}) => stage.builderIndex)].includes(identity.index))
           throw Error("GOSSIP_STAGE_DUPLICATE_IDENTITY");
@@ -488,6 +511,7 @@ export class Builder {
         revealer,
         builderApi,
         journal,
+        signingGuard,
       });
     } catch (error) {
       await Promise.allSettled(startupJournals.map((item) => item.close()));
@@ -613,11 +637,13 @@ export class Builder {
   }
 
   async close(): Promise<void> {
+    this.signingGuard?.revoke();
     this.controller.abort();
     await Promise.all([
       this.preferencesCache?.close(this.proposerPreferencesTracker, this.clock.getCurrentSlot()),
       this.journal?.close(),
       ...this.gossipIdentities.map((identity) => identity.journal?.close()),
     ]);
+    await this.signingGuard?.close();
   }
 }

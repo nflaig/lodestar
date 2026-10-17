@@ -135,18 +135,46 @@ successful gossip publication (`published`). Keep the constructor RPC private.
 Live CLI builders persist Gloas commitments to `<dataDir>/builder-commitments`.
 Payloads and signed bids are synced before exposure; reveal conflict records are
 synced before signing. Recovery restores eligible revisions and checks identity,
-checksums and required payloads before serving. The disk journal is limited to
+checksums, execution-request roots and required payloads before serving. Each
+new offer must match its retained slot, execution hash, execution parent, beacon
+parent, request root and ordered blob commitments. Reusing an immutable payload
+hash cannot replace those retained bindings. The disk journal is limited to
 768 MiB, 51,457 files and 128 MiB per file. Payloads expire after two slots;
 bid and reveal metadata expire after three epochs. Dry runs do not write it.
+
+New offers leave software quota for 25,088 reveal records of at most 1 KiB each
+(24.5 MiB), within those same total limits. Existing reveal files consume that
+reserve. Both ordinary writes and staged hard links preserve the remaining
+headroom; no previous offer is deleted to make room. Existing journals above the
+new offer threshold still recover, but cannot guarantee the reserve until old
+records expire. This accounting does not reserve physical blocks or protect
+against ENOSPC, filesystem corruption, a failed disk or a disk that ignores fsync.
 
 Recovery conservatively consumes each recorded parent tuple's gossip allowance
 and reserves the largest offer per recent slot as a possible unsettled liability.
 This covers missed selection events while offline, but can reduce available bidding
 balance until reconciliation or expiry. Startup also processes the current beacon
-head. An uncertain write stops new journal writes. Use one process per journal
-with local filesystem atomic-rename/fsync semantics, retain the data directory
+head. An uncertain write stops new journal writes. Before recovery or signing,
+the builder takes a native exclusive lock in the canonical commitment directory.
+It rejects a second instance, including symlink aliases and another instance in
+the same process. The lock has no stale timeout: a stopped process remains the
+owner, while an exited process releases its kernel lock. Shutdown revokes new
+signing first, drains journal workers, then releases ownership. A successor must
+recover all commitments before serving. Use a local filesystem with reliable
+exclusive locking and atomic-rename/fsync semantics, retain the data directory
 across upgrades, and drain existing offers before switching publisher identities.
-Replicated recovery across processes is not implemented.
+Never remove or replace the `.writer-lock` directory while an owner may be alive.
+Signer ownership is acquired only from the main thread. A process-wide directory
+registry rejects duplicate opens before they can release a POSIX record lock;
+other code in that process must not open, repair or destroy `.writer-lock/LOCK`.
+The lock database itself needs writable disk space at startup. An unavailable or
+corrupt lock database fails startup closed, even if expired journal files could
+otherwise be pruned. Preserve the directory until the former owner has exited.
+The guard covers the primary identity and its configured staged identities under
+one commitment root. Separate data directories, copied disks, copied keys and
+snapshot rollback are not fenced. Cross-host failover needs an external signer
+or fencing system and a journal that includes every acknowledged offer. This
+local guard does not provide replicated recovery or make the builder mainnet ready.
 
 After synchronous startup recovery, one worker owns journal writes and pruning.
 Its queue admits at most eight offers, 64 MiB of offer data and sixteen operations.
