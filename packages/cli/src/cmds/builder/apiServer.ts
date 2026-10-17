@@ -1,6 +1,6 @@
 import {Endpoint} from "@lodestar/api";
 import {BuilderApiMethods, getRoutes} from "@lodestar/api/builder/server";
-import {ApiError, FastifyRoute} from "@lodestar/api/server";
+import {ApiError, FastifyRoute, canSendResponse} from "@lodestar/api/server";
 import {RestApiServer, RestApiServerModules, RestApiServerOpts} from "@lodestar/beacon-node";
 import {BuilderApi} from "@lodestar/builder";
 import {ChainForkConfig} from "@lodestar/config";
@@ -71,6 +71,19 @@ export class BuilderRestApiServer extends RestApiServer {
     };
 
     super(opts, modules);
+
+    // Bid eligibility is short-lived. Intermediaries must never replay an
+    // earlier response after the constructor has fenced its order generation.
+    this.server.addHook("onRequest", async (_req, res) => {
+      res.header("Cache-Control", "no-store");
+    });
+    this.server.addHook("onSend", (_req, res, payload, done) => {
+      if (!canSendResponse(res)) {
+        res.code(204);
+        res.removeHeader("Content-Length");
+        done(null, null);
+      } else done(null, payload);
+    });
 
     // Only the routes implemented by the builder are registered, routes of earlier forks are not served
     const routes = getRoutes(modules.config, modules.api as BuilderApiMethods);

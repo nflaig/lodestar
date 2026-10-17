@@ -8,6 +8,7 @@ import type {
   SSEPayloadAttributes,
 } from "@lodestar/types";
 import {LodestarError} from "@lodestar/utils";
+import type {OfferEligibility} from "./offerEligibility.js";
 
 export type PayloadId = string;
 
@@ -38,6 +39,8 @@ export type BuiltPayload = {
   executionRequests: ExecutionRequests<ForkPostGloas>;
   blobsBundle: BlobsBundle<ForkPostGloas>;
   executionPayloadValue: bigint;
+  /** Optional volatile authorization for new offers. Retention is independent. */
+  offerEligibility?: OfferEligibility;
 };
 
 export type EnginePayloadResult = {

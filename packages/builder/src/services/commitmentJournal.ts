@@ -444,7 +444,7 @@ export class CommitmentJournal {
           toRootHex(bid.executionRequestsRoot)
         )
           throw Error("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
-        bids.add(signed);
+        bids.add(signed, "recovery");
       }
       recovered++;
     }
