@@ -211,7 +211,8 @@ constructor admission is required before offering them again.
 This protocol requires session updates. One-shot construction with leased candidates
 is rejected. Constructors advertising version zero, or no version, retain V1 behavior.
 Deploy a compatible gateway, constructor and publisher together before enabling order
-generations. Cancellation does not retract bids already delivered to proposers, remove
+generations. Attempts authorized before a fence can arrive after its acknowledgement
+because of scheduling or network delay. Cancellation does not retract delivered bids, remove
 independently authorized copies, or fence copied processes on other hosts. Arbitrary
 VM snapshot rollback and clock restoration are outside the lease assumptions.
 
