@@ -142,6 +142,14 @@ hash cannot replace those retained bindings. The disk journal is limited to
 768 MiB, 51,457 files and 128 MiB per file. Payloads expire after two slots;
 bid and reveal metadata expire after three epochs. Dry runs do not write it.
 
+New offers leave software quota for 25,088 reveal records of at most 1 KiB each
+(24.5 MiB), within those same total limits. Existing reveal files consume that
+reserve. Both ordinary writes and staged hard links preserve the remaining
+headroom; no previous offer is deleted to make room. Existing journals above the
+new offer threshold still recover, but cannot guarantee the reserve until old
+records expire. This accounting does not reserve physical blocks or protect
+against ENOSPC, filesystem corruption, a failed disk or a disk that ignores fsync.
+
 Recovery conservatively consumes each recorded parent tuple's gossip allowance
 and reserves the largest offer per recent slot as a possible unsettled liability.
 This covers missed selection events while offline, but can reduce available bidding
