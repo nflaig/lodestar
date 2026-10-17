@@ -1,3 +1,4 @@
+export {type BidStreamRequest, type BuilderBidStreamApi, type RetainedBidStream} from "./api/bidStream.js";
 export {type BuilderApi} from "./api/impl.js";
 export {Builder, type BuilderOptions} from "./builder.js";
 export {defaultOptions} from "./defaults.js";

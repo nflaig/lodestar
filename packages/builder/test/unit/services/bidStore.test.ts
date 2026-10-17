@@ -39,6 +39,57 @@ describe("BidStore", () => {
     expect(store.get(5, toRootHex(otherParentHash), toRootHex(parentBlockRoot))).toBe(otherBid);
   });
 
+  it("notifies only the subscribed context after the bid is retained", () => {
+    const store = new BidStore();
+    const bid = signedBid(5);
+    const notify = vi.fn(() => {
+      expect(store.has(bid)).toBe(true);
+      expect(store.get(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBe(bid);
+    });
+    const unsubscribe = store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), notify);
+    store.add(signedBid(6));
+    store.add(signedBid(5, Buffer.alloc(32, 9)));
+    const otherRoot = signedBid(5);
+    otherRoot.message.parentBlockRoot = Buffer.alloc(32, 9);
+    store.add(otherRoot);
+    expect(notify).not.toHaveBeenCalled();
+    store.add(bid);
+    expect(notify).toHaveBeenCalledOnce();
+    unsubscribe();
+    unsubscribe();
+    store.add(bid);
+    expect(notify).toHaveBeenCalledOnce();
+  });
+
+  it("does not let a stale unsubscribe remove a newer subscription for the same context", () => {
+    const store = new BidStore();
+    const first = store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), () => {});
+    first();
+    const notify = vi.fn();
+    const second = store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), notify);
+    first();
+    store.add(signedBid(5));
+    expect(notify).toHaveBeenCalledOnce();
+    second();
+  });
+
+  it("does not let a broken stream subscriber prevent durable bid publication", () => {
+    const store = new BidStore();
+    const broken = vi.fn(() => {
+      throw Error("closed stream");
+    });
+    const healthy = vi.fn();
+    store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), broken);
+    store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), healthy);
+    const bid = signedBid(5);
+    expect(() => store.add(bid)).not.toThrow();
+    expect(store.has(bid)).toBe(true);
+    expect(healthy).toHaveBeenCalledOnce();
+    store.add(bid);
+    expect(broken).toHaveBeenCalledOnce();
+    expect(healthy).toHaveBeenCalledTimes(2);
+  });
+
   it("prunes bids two slots after their slot", () => {
     const store = new BidStore();
     store.add(signedBid(5));

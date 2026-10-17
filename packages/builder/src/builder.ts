@@ -5,6 +5,7 @@ import {ForkName, SLOTS_PER_EPOCH} from "@lodestar/params";
 import {Clock, ClockOptions, IClock} from "@lodestar/state-transition";
 import {BuilderIndex, ExecutionAddress} from "@lodestar/types";
 import {Logger, isErrorAborted, toHex, toRootHex} from "@lodestar/utils";
+import {BuilderBidStreamApi, getBuilderBidStreamApi} from "./api/bidStream.js";
 import {BuilderApi, BuilderApiOptions, getBuilderApi} from "./api/impl.js";
 import {defaultOptions} from "./defaults.js";
 import {waitForGenesis} from "./genesis.js";
@@ -58,6 +59,7 @@ export type BuilderModules = {
   bidder: Bidder;
   revealer: Revealer;
   builderApi: BuilderApi | null;
+  builderBidStreamApi?: BuilderBidStreamApi | null;
   journal?: AsyncCommitmentJournal;
   signingGuard?: BuilderSigningGuard;
   preferencesCache?: ProposerPreferencesCache;
@@ -113,6 +115,7 @@ export class Builder {
   readonly builderSigner: BuilderSigner;
   readonly proposerPreferencesTracker: ProposerPreferencesTracker;
   readonly builderApi: BuilderApi | null;
+  readonly builderBidStreamApi: BuilderBidStreamApi | null;
   private readonly proposerPreferencesRecovery: ProposerPreferencesRecovery;
   private readonly blockObserver: BlockObserver;
   private readonly builderStatusTracker: BuilderStatusTracker;
@@ -146,6 +149,7 @@ export class Builder {
     bidder,
     revealer,
     builderApi,
+    builderBidStreamApi = null,
     journal,
     signingGuard,
     preferencesCache,
@@ -166,6 +170,7 @@ export class Builder {
     this.bidder = bidder;
     this.revealer = revealer;
     this.builderApi = builderApi;
+    this.builderBidStreamApi = builderBidStreamApi;
     this.journal = journal;
     this.signingGuard = signingGuard;
     this.preferencesCache = preferencesCache;
@@ -335,23 +340,19 @@ export class Builder {
       {...opts.reveal, cutoffBps: opts.reveal.cutoffBps ?? config.PAYLOAD_ATTESTATION_DUE_BPS}
     );
 
-    const builderApi =
-      opts.builderApi !== undefined
-        ? getBuilderApi(
-            {
-              config,
-              logger,
-              clock,
-              api,
-              bidStore,
-              proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
-              builderIndex: index,
-              metrics: opts.metrics,
-              signal,
-            },
-            opts.builderApi
-          )
-        : null;
+    const builderApiModules = {
+      config,
+      logger,
+      clock,
+      api,
+      bidStore,
+      proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
+      builderIndex: index,
+      metrics: opts.metrics,
+      signal,
+    };
+    const builderApi = opts.builderApi ? getBuilderApi(builderApiModules, opts.builderApi) : null;
+    const builderBidStreamApi = opts.builderApi ? getBuilderBidStreamApi(builderApiModules, opts.builderApi) : null;
 
     const gossipIdentities: GossipIdentity[] = [];
     try {
@@ -510,6 +511,7 @@ export class Builder {
         bidder,
         revealer,
         builderApi,
+        builderBidStreamApi,
         journal,
         signingGuard,
       });

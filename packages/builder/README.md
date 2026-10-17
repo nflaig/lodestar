@@ -216,6 +216,58 @@ because of scheduling or network delay. Cancellation does not retract delivered 
 independently authorized copies, or fence copied processes on other hosts. Arbitrary
 VM snapshot rollback and clock restoration are outside the lease assumptions.
 
+## Experimental Gloas bid streaming
+
+Enable `--builderApi --builderApi.bidStream` to serve the WebSocket extension used by
+[Commit-Boost v0.12.0-rc1](https://github.com/Commit-Boost/commit-boost-client/releases/tag/v0.12.0-rc1)
+and [Helix PR #670](https://github.com/gattaca-com/helix/pull/670). This is an experimental
+extension, not a replacement for the standard HTTP builder API. The normal POST bid,
+preferences and signed-block routes remain available.
+
+```text
+GET /eth/v1/builder/execution_payload_bid_stream/{slot}/{parent_hash}/{parent_root}/{proposer_pubkey}
+Eth-Consensus-Version: gloas
+Date-Milliseconds: <request send time in Unix milliseconds>
+X-Timeout-Ms: <total request timeout in milliseconds>
+X-Request-Auth: <standard padded base64 of SSZ SignedBuilderRequestAuth>
+```
+
+The upgrade authenticates the proposer, slot and agreed auth data exactly as HTTP does.
+With `--builderApi.publicUrl https://builder-plataberget.nflaig.dev`, the proposer's
+`auth_data` is the UTF-8 hostname `builder-plataberget.nflaig.dev`, unless
+`--builderApi.authData` overrides it. The JSON auth object is not sent in this header;
+serialize it as SSZ before base64 encoding. A successful upgrade sends binary messages:
+byte `0x01` (frame version), byte `0x07` (Gloas), then SSZ `SignedExecutionPayloadBid`.
+Clients must retain the latest valid message, including a lower replacement after an
+order-generation change.
+
+For Commit-Boost, set `get_header = "stream"` on the existing builder relay entry:
+
+```toml
+[[relays]]
+id = "plataberget-builder"
+url = "https://<registered-builder-pubkey>@builder-plataberget.nflaig.dev"
+get_header = "stream"
+```
+
+Use the actual registered builder key and the appropriate network configuration.
+Commit-Boost opens one stream per bid request and can fall back to HTTP if the upgrade
+fails. A repeated proposer request opens a new stream and can return a newer bid.
+
+The stream sends an eligible retained bid immediately, then updates after durable
+retention. It reserves the same transit and 50 ms response margin as HTTP and closes
+before the caller's deadline. Ping/pong RTT is logged for diagnosis; it does not change
+that margin or assume symmetric network latency. There are at most 64 pending or open
+streams, four per authenticated proposer, one write in flight and one coalesced update indication per
+connection. A 25 ms local eligibility check observes lease renewal without fetching or
+building a payload. Client data frames are rejected; compression is disabled. A peer
+that does not complete close is terminated after 100 ms.
+
+Every send rechecks current offer permission after serialization. Previously sent bids
+remain durably retained for reveal. Closing a stream, cancellation, or a newer message
+does not withdraw a bid already delivered to a proposer. Streaming does not enable
+constructor order generations or alter gossip identities, pricing or construction timing.
+
 ## Staged P2P bids
 
 Gloas peers accept at most one gossip bid per builder index, slot and parent tuple.

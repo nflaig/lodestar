@@ -221,8 +221,14 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   let builder: Builder | null = null;
   if (builderApiOpts !== undefined) {
     const builderApiServer = new BuilderRestApiServer(
-      {address: args["builderApi.address"], port: args["builderApi.port"]},
-      {config, logger, api: getBuilderApiBeforeInit(config, () => builder?.builderApi ?? null), metrics: null}
+      {address: args["builderApi.address"], port: args["builderApi.port"], bidStream: args["builderApi.bidStream"]},
+      {
+        config,
+        logger,
+        api: getBuilderApiBeforeInit(config, () => builder?.builderApi ?? null),
+        getBidStreamApi: () => builder?.builderBidStreamApi ?? null,
+        metrics: null,
+      }
     );
     onGracefulShutdownCbs.push(() => builderApiServer.close());
     await builderApiServer.listen();

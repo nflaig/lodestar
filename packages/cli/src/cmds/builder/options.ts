@@ -56,6 +56,7 @@ export type IBuilderCliArgs = LogArgs & {
   "builderApi.address"?: string;
   "builderApi.publicUrl"?: string;
   "builderApi.authData"?: string;
+  "builderApi.bidStream"?: boolean;
 
   metrics?: boolean;
   "metrics.port"?: number;
@@ -349,6 +350,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     type: "string",
     description:
       "URL proposers reach the builder API at. Proposers must sign their requests with its hostname as auth data unless `--builderApi.authData` is set",
+    group: "builderApi",
+  },
+
+  "builderApi.bidStream": {
+    description: "Enable the experimental authenticated Gloas WebSocket bid stream alongside the HTTP builder API",
+    type: "boolean",
+    default: false,
     group: "builderApi",
   },
 

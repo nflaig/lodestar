@@ -54,4 +54,47 @@ describe("ProposerDutiesTracker", () => {
     expect(api.validator.getProposerDutiesV2).toHaveBeenCalledTimes(2);
     expect(api.validator.getProposerDutiesV2).toHaveBeenLastCalledWith({epoch: 1});
   });
+  it("shares concurrent misses and releases a failed lookup for retry", async () => {
+    let fail: ((error: Error) => void) | undefined;
+    api.validator.getProposerDutiesV2.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          fail = reject;
+        })
+    );
+    const first = tracker.getProposer(1);
+    const second = tracker.getProposer(2);
+    const rejected = Promise.all([
+      expect(first).rejects.toThrow("unavailable"),
+      expect(second).rejects.toThrow("unavailable"),
+    ]);
+    expect(api.validator.getProposerDutiesV2).toHaveBeenCalledTimes(1);
+    fail?.(Error("unavailable"));
+    await rejected;
+    expect((await tracker.getProposer(1))?.validatorIndex).toBe(1);
+    expect(api.validator.getProposerDutiesV2).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let an earlier epoch's slow lookup replace the refreshed duties", async () => {
+    type Response = Awaited<ReturnType<typeof api.validator.getProposerDutiesV2>>;
+    let finishOld: ((response: Response) => void) | undefined;
+    api.validator.getProposerDutiesV2.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishOld = resolve;
+        })
+    );
+    const old = tracker.getProposer(SLOTS_PER_EPOCH);
+    clock.currentSlot = SLOTS_PER_EPOCH;
+    const fresh = await tracker.getProposer(SLOTS_PER_EPOCH);
+    finishOld?.(
+      mockApiResponse({
+        data: [{slot: SLOTS_PER_EPOCH, validatorIndex: 999, pubkey: Buffer.alloc(48)}],
+        meta: {executionOptimistic: false, dependentRoot: "0x00"},
+      })
+    );
+    expect((await old)?.validatorIndex).toBe(fresh?.validatorIndex);
+    expect((await tracker.getProposer(SLOTS_PER_EPOCH))?.validatorIndex).toBe(fresh?.validatorIndex);
+    expect(api.validator.getProposerDutiesV2).toHaveBeenCalledTimes(2);
+  });
 });

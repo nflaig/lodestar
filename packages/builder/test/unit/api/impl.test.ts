@@ -6,6 +6,7 @@ import {DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, ForkName} from "@lo
 import {ZERO_HASH, computeDomain, computeSigningRoot} from "@lodestar/state-transition";
 import {gloas, ssz} from "@lodestar/types";
 import * as utils from "@lodestar/utils";
+import {BuilderBidStreamApi, getBuilderBidStreamApi} from "../../../src/api/bidStream.js";
 import {BuilderApi, getBuilderApi} from "../../../src/api/impl.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {ProposerDutiesTracker} from "../../../src/services/proposerDutiesTracker.js";
@@ -29,6 +30,7 @@ describe("builder api", () => {
   let clock: ClockMock;
   let bidStore: BidStore;
   let builderApi: BuilderApi;
+  let streamApi: BuilderBidStreamApi;
   let signedBid: gloas.SignedExecutionPayloadBid;
   let controller: AbortController;
 
@@ -46,6 +48,21 @@ describe("builder api", () => {
     bidStore = new BidStore();
     controller = new AbortController();
     builderApi = getBuilderApi(
+      {
+        config,
+        logger: getMockedLogger(),
+        clock,
+        api,
+        bidStore,
+        proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
+        builderIndex,
+        metrics: null,
+        signal: controller.signal,
+      },
+      {authData}
+    );
+
+    streamApi = getBuilderBidStreamApi(
       {
         config,
         logger: getMockedLogger(),
@@ -102,6 +119,57 @@ describe("builder api", () => {
     block.signature = secretKey.sign(signingRoot).toBytes();
     return block;
   }
+
+  describe("retained bid stream", () => {
+    it("authenticates the exact request context and observes later retained revisions", async () => {
+      const started = performance.now();
+      const stream = await streamApi.open(bidRequest({dateMilliseconds: Date.now(), timeoutMs: 500}));
+      expect(stream.deadline).toBeGreaterThan(started);
+      expect(stream.deadline).toBeLessThanOrEqual(started + 451);
+      expect(stream.current()).toBe(signedBid);
+      const notify = vi.fn();
+      const unsubscribe = stream.subscribe(notify);
+      const later = structuredClone(signedBid);
+      later.message.value += 1;
+      later.message.blockHash = Buffer.alloc(32, 8);
+      bidStore.add(later);
+      expect(notify).toHaveBeenCalledOnce();
+      expect(stream.current()).toBe(later);
+      expect(stream.canOffer(later)).toBe(true);
+      const different = await streamApi.open(bidRequest({parentRoot: Buffer.alloc(32, 9)}));
+      expect(different.current()).toBeNull();
+      unsubscribe();
+      controller.abort();
+      expect(stream.canOffer(later)).toBe(false);
+    });
+
+    it.each([
+      {requestAuth: signAuth({data: authData, slot: slot + 1}), statusCode: 400},
+      {requestAuth: signAuth({data: new Uint8Array([1]), slot}), statusCode: 400},
+      {requestAuth: signAuth(undefined, otherKey), statusCode: 401},
+    ])("uses the HTTP authentication rules ($statusCode)", async ({requestAuth, statusCode}) => {
+      await expect(streamApi.open(bidRequest({requestAuth}))).rejects.toMatchObject({statusCode});
+    });
+
+    it("withdraws future stream offers without losing previously signed reveal obligations", async () => {
+      const lease = {
+        generation: "0x0",
+        ready: true,
+        validUntil: performance.now() + 1000,
+        validUntilUnixMs: Date.now() + 1000,
+      };
+      bidStore.add(signedBid, {generation: "0x0", lease});
+      const stream = await streamApi.open(bidRequest());
+      expect(stream.current()).toBe(signedBid);
+      lease.generation = "0x1";
+      expect(stream.current()).toBeNull();
+      expect(stream.canOffer(signedBid)).toBe(false);
+      expect(bidStore.has(signedBid)).toBe(true);
+      await expect(builderApi.submitSignedBeaconBlock({signedBlock: {data: signBlock()}})).resolves.toEqual({
+        status: 202,
+      });
+    });
+  });
 
   describe("getExecutionPayloadBid", () => {
     it("stops offering an expired generation while accepting its already committed signed block", async () => {
