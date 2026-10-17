@@ -31,6 +31,7 @@ function revision(value: number, targetSlot = slot) {
   signed.message.slot = targetSlot;
   signed.message.blockHash = payload.executionPayload.blockHash;
   signed.message.parentBlockHash = payload.executionPayload.parentHash;
+  signed.message.executionRequestsRoot = ssz.gloas.ExecutionRequests.hashTreeRoot(payload.executionRequests);
   signed.message.value = value;
   signed.signature.fill(value);
   return {
@@ -59,6 +60,64 @@ afterEach(() => {
 });
 
 describe("CommitmentJournal", () => {
+  it.each(["requests", "parent", "payload hash", "payload slot"])(
+    "rejects an unrevealable %s binding before acknowledging a commitment",
+    (field) => {
+      const {journal, directory} = setup();
+      const original = revision(1);
+      if (field === "requests") original.signed.message.executionRequestsRoot.fill(0xee);
+      if (field === "parent") original.signed.message.parentBlockHash = Buffer.alloc(32, 0xee);
+      if (field === "payload hash") original.stored.payload.executionPayload.blockHash = Buffer.alloc(32, 0xee);
+      if (field === "payload slot") original.stored.payload.executionPayload.slotNumber++;
+      expect(() => journal.retain(original.signed, original.stored)).toThrow(/COMMITMENT_/);
+      expect(fs.readdirSync(directory).filter((name) => name.startsWith("bid-"))).toHaveLength(0);
+    }
+  );
+
+  it("rejects a mismatched requests root during recovery of an existing checksum-valid journal", () => {
+    const {journal, directory} = setup();
+    const original = revision(1);
+    journal.retain(original.signed, original.stored);
+    const previous = fs.readdirSync(directory).find((name) => name.startsWith("bid-"));
+    if (!previous) throw Error("Missing retained bid");
+    original.signed.message.executionRequestsRoot.fill(0xee);
+    const data = ssz.gloas.SignedExecutionPayloadBid.toJson(original.signed);
+    const checksum = createHash("sha256").update(JSON.stringify(data)).digest("hex");
+    const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(original.signed));
+    fs.unlinkSync(path.join(directory, previous));
+    fs.writeFileSync(path.join(directory, `bid-${slot}-${root}.json`), JSON.stringify({data, checksum}));
+    expect(() => recover(directory)).toThrow("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
+  });
+
+  it.each(["requests", "parent"])("rejects a mismatched %s in a staged durable reference", (field) => {
+    const {journal, directory} = setup();
+    const original = revision(1);
+    const reference = journal.retain(original.signed, original.stored);
+    if (!reference) throw Error("Missing durable reference");
+    const stagedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "builder-staged-journal-"));
+    directories.push(stagedDirectory);
+    const staged = new CommitmentJournal(stagedDirectory, identity, slot, directory);
+    if (field === "requests") original.signed.message.executionRequestsRoot.fill(0xee);
+    else original.signed.message.parentBlockHash = Buffer.alloc(32, 0xee);
+    expect(() => staged.retainReference(original.signed, reference)).toThrow(/COMMITMENT_/);
+    expect(fs.readdirSync(stagedDirectory).filter((name) => name.startsWith("bid-"))).toHaveLength(0);
+    expect(recover(directory).count).toBe(1);
+  });
+
+  it.each([false, true])("does not rebind a retained hash to new requests after restart=%s", (restart) => {
+    const {journal, directory} = setup();
+    const original = revision(1);
+    journal.retain(original.signed, original.stored);
+    const next = restart ? new CommitmentJournal(directory, identity) : journal;
+    original.stored.payload.executionRequests.deposits.push(ssz.electra.DepositRequest.defaultValue());
+    original.signed.message.executionRequestsRoot = ssz.gloas.ExecutionRequests.hashTreeRoot(
+      original.stored.payload.executionRequests
+    );
+    original.signed.message.value++;
+    expect(() => next.retain(original.signed, original.stored)).toThrow("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
+    expect(recover(directory).count).toBe(1);
+  });
+
   it.each([
     {name: "empty", offset: 0, size: 0, buffer: false, blobs: 0},
     {name: "Uint8Array subviews", offset: 7, size: 257, buffer: false, blobs: 0},

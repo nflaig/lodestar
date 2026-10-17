@@ -41,6 +41,8 @@ describe("AsyncCommitmentJournal", () => {
       slot: 1,
       blockHash: stored.blockHash,
       parentBlockRoot: toRootHex(stored.parentBlockRoot),
+      parentBlockHash: toRootHex(stored.payload.executionPayload.parentHash),
+      executionRequestsRoot: toRootHex(ssz.gloas.ExecutionRequests.hashTreeRoot(stored.payload.executionRequests)),
       commitments: [],
       files: [],
     };
@@ -69,6 +71,8 @@ describe("AsyncCommitmentJournal", () => {
       slot: 1,
       blockHash: stored.blockHash,
       parentBlockRoot: toRootHex(stored.parentBlockRoot),
+      parentBlockHash: toRootHex(stored.payload.executionPayload.parentHash),
+      executionRequestsRoot: toRootHex(ssz.gloas.ExecutionRequests.hashTreeRoot(stored.payload.executionRequests)),
       commitments: [],
       files: [],
     };
@@ -93,6 +97,8 @@ describe("AsyncCommitmentJournal", () => {
         slot: 1,
         blockHash: stored.blockHash,
         parentBlockRoot: toRootHex(stored.parentBlockRoot),
+        parentBlockHash: toRootHex(stored.payload.executionPayload.parentHash),
+        executionRequestsRoot: toRootHex(ssz.gloas.ExecutionRequests.hashTreeRoot(stored.payload.executionRequests)),
         commitments: [],
         files: [],
       };
