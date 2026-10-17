@@ -2,6 +2,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
 import {ErrorAborted, defer, sleep} from "@lodestar/utils";
+import {PayloadSourceNotReady} from "../../../src/services/offerEligibility.js";
 import {
   type PayloadBuildJob,
   PayloadOrchestrator,
@@ -113,6 +114,23 @@ describe("PayloadOrchestrator", () => {
     await expect(duplicate).resolves.toEqual(builtPayload());
     expect(source.prepareCalls).toHaveLength(1);
     expect(source.getPayloadCalls).toHaveLength(1);
+  });
+
+  it("rejects one-shot mode for a source requiring renewable offer leases", async () => {
+    const source = new StubPayloadSource();
+    source.getPayloadImpl = async () => ({
+      ...builtPayload(),
+      offerEligibility: {
+        generation: "0x0",
+        lease: {generation: "0x0", ready: true, validUntil: Infinity, validUntilUnixMs: Infinity},
+      },
+    });
+    const result = createOrchestrator(source).run(buildJob());
+    const rejected = expect(result).rejects.toMatchObject({
+      type: {code: PayloadOrchestratorErrorCode.LEASED_PAYLOAD_REQUIRES_UPDATES},
+    });
+    await vi.advanceTimersByTimeAsync(100);
+    await rejected;
   });
 
   it("builds different branches independently", async () => {
@@ -393,6 +411,24 @@ describe("PayloadOrchestrator", () => {
       expect(release).toHaveBeenCalledTimes(1);
     }
   );
+
+  it("waits through an invalidated generation without re-exposing the previous payload", async () => {
+    const source = new StubPayloadSource();
+    const first = builtPayload();
+    const second = {...first, executionPayloadValue: 0n};
+    let calls = 0;
+    source.getPayloadImpl = async () => {
+      calls++;
+      if (calls === 1) return first;
+      if (calls < 4) throw new PayloadSourceNotReady();
+      return second;
+    };
+    const onPayload = vi.fn(async () => {});
+    const result = createOrchestrator(source).runUpdates(buildJob(), {intervalMs: 25, until: NOW + 150}, onPayload);
+    await vi.advanceTimersByTimeAsync(160);
+    await result;
+    expect(onPayload.mock.calls).toEqual([[first], [second]]);
+  });
 
   it("keeps unchanged payload polling bounded and releases on cancellation", async () => {
     const source = new StubPayloadSource();

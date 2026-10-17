@@ -12,6 +12,7 @@ import {BidStore} from "./bidStore.js";
 import {MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import {GossipStage, getMinGossipBidValue, validateGossipStages} from "./gossipStages.js";
+import {isOfferEligible} from "./offerEligibility.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuiltPayload} from "./payloadSource.js";
 import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
@@ -201,6 +202,7 @@ export class Bidder {
     const gossipBest = (): void => {
       if (
         !best ||
+        !this.modules.bidStore.canOffer(best) ||
         publication ||
         Date.now() < job.getPayloadAt ||
         Date.now() >= primaryUntil ||
@@ -214,7 +216,7 @@ export class Bidder {
       highestAttemptedValue = Math.max(highestAttemptedValue, signed.message.value);
       publicationPending = true;
       publication = this.modules.bidPublisher
-        .gossip(signed, signal)
+        .gossip(signed, signal, this.modules.bidStore.getOfferEligibility(signed))
         .then(() => {
           metrics?.bids.total.inc({result: BidResult.published});
           logger.info("Gossiped execution payload bid", {
@@ -258,7 +260,8 @@ export class Bidder {
             publicationPending ||
             stagesStartedAt >= stageTime(stage.deadlineBps) ||
             Date.now() >= expires ||
-            !best
+            !best ||
+            !this.modules.bidStore.canOffer(best)
           )
             return;
           if (stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)) return;
@@ -268,7 +271,13 @@ export class Bidder {
           try {
             const minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
             const signed = await this.bidOnPayload(
-              {...stored.payload, fork: ForkName.gloas},
+              {
+                ...stored.payload,
+                fork: ForkName.gloas,
+                // The same immutable hash can be re-admitted in a new order
+                // generation. Its durable snapshot may carry an older lease.
+                offerEligibility: this.modules.bidStore.getOfferEligibility(best),
+              },
               data,
               feeRecipient,
               signal,
@@ -277,11 +286,17 @@ export class Bidder {
               minimum - 1
             );
             // Persistence may finish after a parent switch, shutdown, or this stage's window.
-            if (!signed || signal.aborted || Date.now() >= expires || signed.message.value <= highestAttemptedValue)
+            if (
+              !signed ||
+              signal.aborted ||
+              Date.now() >= expires ||
+              signed.message.value <= highestAttemptedValue ||
+              !stage.bidStore.canOffer(signed)
+            )
               return;
             highestAttemptedValue = signed.message.value;
             const preparedAt = performance.now();
-            await stage.bidPublisher.gossip(signed, signal);
+            await stage.bidPublisher.gossip(signed, signal, stage.bidStore.getOfferEligibility(signed));
             const publishedAt = performance.now();
             metrics?.bids.total.inc({result: BidResult.published});
             logger.info("Gossiped execution payload bid", {
@@ -369,6 +384,7 @@ export class Bidder {
     const parentBlockHash = toRootHex(data.parentBlockHash);
     const logCtx = {slot, parentBlockRoot, parentBlockHash};
     signal.throwIfAborted();
+    if (!isOfferEligible(payload.offerEligibility)) return null;
     if (this.opts.dryRun) {
       metrics?.bids.total.inc({result: BidResult.dryRun});
       logger.info("Built payload without bidding", {
@@ -407,7 +423,7 @@ export class Bidder {
 
     if (value <= minimumValue) return null;
     const previous = bidStore.get(slot, parentBlockHash, parentBlockRoot);
-    if (apiRevision && previous && value <= previous.message.value) return null;
+    if (apiRevision && previous && value <= previous.message.value) return previous;
     signal.throwIfAborted();
     const {executionPayload} = payload;
     const blockHash = toRootHex(executionPayload.blockHash);
@@ -423,9 +439,15 @@ export class Bidder {
       value,
       payload: {...payload, fork: ForkName.gloas},
     });
-    const signedBid = apiRevision ? await bidPublisher.prepare(bid) : await bidPublisher.publish(bid, signal);
+    const signedBid = await bidPublisher.prepare(bid);
+    // Retain before exposure, including when transport completion is uncertain
+    // or arrives after cancellation. Reveal ownership does not expire with offers.
+    bidStore.add(signedBid, payload.offerEligibility);
     if (apiRevision) signal.throwIfAborted();
-    bidStore.add(signedBid);
+    // Disk persistence can outlive a cancellation, lease, parent or shutdown.
+    // The signature remains retained even when it is no longer a new offer.
+    if (!isOfferEligible(payload.offerEligibility)) return null;
+    if (!apiRevision) await bidPublisher.gossip(signedBid, signal, payload.offerEligibility);
 
     metrics?.bids.total.inc({result: apiRevision ? BidResult.prepared : BidResult.published});
     logger.info(

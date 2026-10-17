@@ -76,15 +76,10 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
       // The builder is ready to serve requests once it is started
     },
 
-    async getExecutionPayloadBid({
-      slot,
-      parentHash,
-      parentRoot,
-      proposerPubkey,
-      requestAuth,
-      dateMilliseconds,
-      timeoutMs,
-    }) {
+    async getExecutionPayloadBid(
+      {slot, parentHash, parentRoot, proposerPubkey, requestAuth, dateMilliseconds, timeoutMs},
+      context
+    ) {
       if (modules.signal?.aborted) throw new ApiError(503, "Builder is stopping");
       const started = performance.now();
       const transitMs = Date.now() - dateMilliseconds;
@@ -146,6 +141,8 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
         logger.debug("No execution payload bid to serve", logCtx);
         return {data: undefined, meta: {version}, status: 204};
       }
+
+      context?.setResponseGuard?.(() => bidStore.canOffer(signedBid));
 
       metrics?.api.bidRequests.inc({result: BidRequestResult.served});
       logger.info("Served execution payload bid", {

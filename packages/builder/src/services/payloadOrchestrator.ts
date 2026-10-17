@@ -1,4 +1,5 @@
 import {ErrorAborted, LodestarError, TimeoutError, retry, sleep, withTimeout} from "@lodestar/utils";
+import {PayloadSourceNotReady} from "./offerEligibility.js";
 import type {BuildHandle, BuildRequest, BuiltPayload, PayloadSource} from "./payloadSource.js";
 
 const PREPARE_RETRY_DELAY = 100;
@@ -20,6 +21,7 @@ export enum PayloadOrchestratorErrorCode {
   PREPARE_DEADLINE_REACHED = "PAYLOAD_ORCHESTRATOR_ERROR_PREPARE_DEADLINE_REACHED",
   PREPARE_TIMEOUT = "PAYLOAD_ORCHESTRATOR_ERROR_PREPARE_TIMEOUT",
   GET_PAYLOAD_TIMEOUT = "PAYLOAD_ORCHESTRATOR_ERROR_GET_PAYLOAD_TIMEOUT",
+  LEASED_PAYLOAD_REQUIRES_UPDATES = "PAYLOAD_ORCHESTRATOR_ERROR_LEASED_PAYLOAD_REQUIRES_UPDATES",
 }
 
 export type PayloadOrchestratorErrorType =
@@ -34,7 +36,9 @@ export type PayloadOrchestratorErrorType =
       lastError: string | null;
     }
   | {
-      code: PayloadOrchestratorErrorCode.GET_PAYLOAD_TIMEOUT;
+      code:
+        | PayloadOrchestratorErrorCode.GET_PAYLOAD_TIMEOUT
+        | PayloadOrchestratorErrorCode.LEASED_PAYLOAD_REQUIRES_UPDATES;
       jobId: string;
     };
 
@@ -106,6 +110,10 @@ export class PayloadOrchestrator {
             Math.min(this.options.getPayloadTimeout, until - Date.now())
           );
         } catch (error) {
+          if (error instanceof PayloadSourceNotReady && !signal.aborted) {
+            await sleep(Math.min(intervalMs, Math.max(1, until - Date.now())), signal);
+            continue;
+          }
           // Ending the final poll at the cutoff does not invalidate a ready
           // revision. Earlier timeouts and jobs with no result remain errors.
           if (
@@ -120,7 +128,9 @@ export class PayloadOrchestrator {
         }
         signal.throwIfAborted();
         if (Date.now() >= until) break;
-        if (payload !== previous) {
+        // An unchanged leased candidate may become eligible again after a
+        // slow durable write. Its heartbeat must retry selection/publication.
+        if (payload !== previous || payload.offerEligibility !== undefined) {
           await onPayload(payload);
           previous = payload;
         }
@@ -140,7 +150,13 @@ export class PayloadOrchestrator {
     const handle = await this.prepare(job, signal);
     try {
       await sleep(job.getPayloadAt - Date.now(), signal);
-      return await this.retrieve(job.id, handle, signal);
+      const payload = await this.retrieve(job.id, handle, signal);
+      if (payload.offerEligibility)
+        throw new PayloadOrchestratorError(
+          {code: PayloadOrchestratorErrorCode.LEASED_PAYLOAD_REQUIRES_UPDATES, jobId: job.id},
+          "Order generation leases require continuous payload updates"
+        );
+      return payload;
     } finally {
       await this.release(handle);
     }

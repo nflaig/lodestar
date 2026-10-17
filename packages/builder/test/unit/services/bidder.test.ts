@@ -7,6 +7,7 @@ import {BuilderStatus, ssz} from "@lodestar/types";
 import {toHex, toRootHex} from "@lodestar/utils";
 import {Bidder, type BidderOptions, PayloadAttributesEvent} from "../../../src/services/bidder.js";
 import {BidLedger} from "../../../src/services/bidLedger.js";
+import {BidPublisher} from "../../../src/services/bidPublisher.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
@@ -239,6 +240,58 @@ describe("Bidder", () => {
     expect(payloadSource.prepare).toHaveBeenCalledOnce();
     expect(payloadSource.release).toHaveBeenCalledOnce();
     expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("retries an unchanged leased candidate after its durable write outlives the first lease", async () => {
+    addProposerPreferences();
+    payloadSource.supportsUpdates = true;
+    const lease = {generation: "0x1", ready: true, validUntil: 0, validUntilUnixMs: 0};
+    const candidate = {
+      ...mockBuiltPayload({slot, parentHash: parentBlockHash, prevRandao}),
+      fork: ForkName.gloas as const,
+      offerEligibility: {generation: "0x1", lease},
+    };
+    payloadSource.getPayload.mockImplementation(async () => {
+      lease.validUntil = performance.now() + 250;
+      lease.validUntilUnixMs = Date.now() + 250;
+      return candidate;
+    });
+    const original = BidPublisher.prototype.prepare;
+    const prepare = vi.spyOn(BidPublisher.prototype, "prepare").mockImplementation(async function (
+      this: BidPublisher,
+      bid
+    ) {
+      const signed = await original.call(this, bid);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return signed;
+    });
+    try {
+      const {bidder, bidStore} = createBidder(undefined, false, {updateIntervalMs: 25, updateCutoffBps: 1000});
+      const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+      await vi.advanceTimersByTimeAsync(300);
+      expect(bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBeNull();
+      await vi.advanceTimersByTimeAsync(msToDeadline - 300);
+      expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+      expect(prepare).toHaveBeenCalledOnce();
+      const signed = api.beacon.publishExecutionPayloadBid.mock.calls[0][0].signedExecutionPayloadBid;
+      expect(bidStore.has(signed)).toBe(true);
+      controller.abort();
+      await bidding;
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  it("retains a directly published signature when gossip delivery has an uncertain result", async () => {
+    addProposerPreferences();
+    api.beacon.publishExecutionPayloadBid.mockRejectedValue(new Error("connection lost after send"));
+    const {bidder, bidStore} = createBidder();
+    const bidding = bidder.onPayloadAttributes(payloadAttributesEvent());
+    await vi.advanceTimersByTimeAsync(msToDeadline);
+    await bidding;
+    const signed = api.beacon.publishExecutionPayloadBid.mock.calls[0][0].signedExecutionPayloadBid;
+    expect(bidStore.has(signed)).toBe(true);
+    expect(payloadStore.has(toRootHex(signed.message.blockHash))).toBe(true);
   });
 
   it.each([64, 256])("rejects before retaining or signing at an admission limit of %i revisions", async (limit) => {

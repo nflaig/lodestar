@@ -408,6 +408,9 @@ importers:
       '@lodestar/utils':
         specifier: workspace:^
         version: link:../utils
+      classic-level:
+        specifier: ^1.4.1
+        version: 1.4.1
     devDependencies:
       '@lodestar/logger':
         specifier: workspace:^

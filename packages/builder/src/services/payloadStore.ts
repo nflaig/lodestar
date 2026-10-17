@@ -3,6 +3,7 @@ import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB, ForkPostGloas} from "@lodes
 import {BlobsBundle, ExecutionPayload, Root, RootHex, Slot, gloas, ssz} from "@lodestar/types";
 import {LodestarError} from "@lodestar/utils";
 import {MAX_RETAINED_PAYLOADS, PAYLOAD_RETENTION_SLOTS} from "./commitmentLimits.js";
+import type {OfferEligibility} from "./offerEligibility.js";
 
 // NOTE: BuiltPayload will migrate to payloadSource.ts when the payload source lands; the store
 // holds it here for now.
@@ -13,6 +14,7 @@ export type BuiltPayload = {
   blobsBundle: BlobsBundle<ForkPostGloas>;
   /** Value of the payload to the fee recipient in wei, as reported by the execution client */
   executionPayloadValue: bigint;
+  offerEligibility?: OfferEligibility;
 };
 
 export type StoredPayload = {

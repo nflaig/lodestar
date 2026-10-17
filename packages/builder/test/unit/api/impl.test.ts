@@ -104,6 +104,22 @@ describe("builder api", () => {
   }
 
   describe("getExecutionPayloadBid", () => {
+    it("stops offering an expired generation while accepting its already committed signed block", async () => {
+      const lease = {
+        generation: "0x2",
+        ready: true,
+        validUntil: performance.now() + 10000,
+        validUntilUnixMs: Date.now() + 10000,
+      };
+      bidStore.add(signedBid, {generation: "0x2", lease});
+      expect((await builderApi.getExecutionPayloadBid(bidRequest())).data).toBe(signedBid);
+      const committed = signBlock();
+      lease.generation = "0x3";
+      expect((await builderApi.getExecutionPayloadBid(bidRequest())).status).toBe(204);
+      await expect(builderApi.submitSignedBeaconBlock({signedBlock: {data: committed}})).resolves.toEqual({
+        status: 202,
+      });
+    });
     it("returns the published bid of the requested slot and parent", async () => {
       const response = await builderApi.getExecutionPayloadBid(bidRequest());
 

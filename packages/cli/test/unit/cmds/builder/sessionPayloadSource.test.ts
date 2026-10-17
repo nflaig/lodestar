@@ -4,7 +4,7 @@ import {createServer} from "node:http";
 import {RLP} from "@ethereumjs/rlp";
 import {describe, expect, it, vi} from "vitest";
 import {type EngineApiRpcReturnTypes, JsonRpcHttpClient, serializePayloadAttributes} from "@lodestar/beacon-node";
-import type {BuildRequest} from "@lodestar/builder";
+import {type BuildRequest, PayloadSourceNotReady} from "@lodestar/builder";
 import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
 import {ErrorAborted, FetchError, toHex, toRootHex} from "@lodestar/utils";
@@ -77,12 +77,95 @@ describe("SessionPayloadSource", () => {
     return {source, fetch, signals, request: buildRequest()};
   }
 
+  it("changes generations even when value drops and the block hash repeats", async () => {
+    const {source, fetch, request} = setup();
+    const now = vi.spyOn(performance, "now").mockReturnValue(100);
+    try {
+      fetch.mockResolvedValueOnce({sessionId: "leased", orderGenerationVersion: 1});
+      const handle = await source.prepare(request, signal);
+      const output = payloadResponse(request);
+      fetch.mockResolvedValueOnce({generation: "0x0", ready: true, leaseMs: 250, payload: output});
+      const old = await source.getPayload(handle, signal);
+      expect(old.offerEligibility?.lease.validUntil).toBe(350);
+      fetch.mockResolvedValueOnce({generation: "0x1", ready: false, leaseMs: 250, payload: null});
+      await expect(source.getPayload(handle, signal)).rejects.toBeInstanceOf(PayloadSourceNotReady);
+      expect(old.offerEligibility?.lease.ready).toBe(false);
+      fetch.mockResolvedValueOnce({
+        generation: "0x1",
+        ready: true,
+        leaseMs: 250,
+        payload: {...output, blockValue: "0x1"},
+      });
+      const next = await source.getPayload(handle, signal);
+      expect(next.executionPayloadValue).toBe(1n);
+      expect(next.offerEligibility?.generation).toBe("0x1");
+      expect(old.offerEligibility?.generation).toBe("0x0");
+      fetch.mockResolvedValueOnce({generation: "0x1", ready: true, leaseMs: 250, payload: null});
+      expect(await source.getPayload(handle, signal)).toBe(next);
+      fetch.mockResolvedValueOnce({generation: "0x0", ready: true, leaseMs: 250, payload: output});
+      await expect(source.getPayload(handle, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH, reason: "Order generation rollback"},
+      });
+      expect(next.offerEligibility?.lease.ready).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("charges delayed RPC delivery against the lease and never renews from response arrival", async () => {
+    const {source, fetch, request} = setup();
+    const now = vi.spyOn(performance, "now").mockReturnValue(100);
+    try {
+      fetch.mockResolvedValueOnce({sessionId: "delayed", orderGenerationVersion: 1});
+      const handle = await source.prepare(request, signal);
+      fetch.mockImplementationOnce(async () => {
+        now.mockReturnValue(351);
+        return {generation: "0x0", ready: true, leaseMs: 250, payload: payloadResponse(request)};
+      });
+      await expect(source.getPayload(handle, signal)).rejects.toBeInstanceOf(PayloadSourceNotReady);
+      fetch.mockResolvedValueOnce({generation: "0x0", ready: true, leaseMs: 250, payload: null});
+      const renewed = await source.getPayload(handle, signal);
+      expect(renewed.offerEligibility?.lease.validUntil).toBe(601);
+      expect(fetch).toHaveBeenLastCalledWith({
+        method: "zbuilder_getPayloadV2",
+        params: [handle.payloadId, payloadResponse(request).executionPayload.blockHash, "0x0"],
+      });
+      fetch.mockResolvedValueOnce(true);
+      await source.release(handle, signal);
+      expect(renewed.offerEligibility?.lease.ready).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   function transportError(code: string): FetchError {
     return new FetchError(
       "http://constructor",
       new TypeError("fetch failed", {cause: Object.assign(new Error("closed"), {code})})
     );
   }
+
+  it("cannot revive an offer with a read response arriving after release", async () => {
+    const {source, fetch, request} = setup();
+    fetch.mockResolvedValueOnce({sessionId: "released", orderGenerationVersion: 1});
+    const handle = await source.prepare(request, signal);
+    const response = {generation: "0x0", ready: true, leaseMs: 250, payload: payloadResponse(request)};
+    fetch.mockResolvedValueOnce(response);
+    const first = await source.getPayload(handle, signal);
+    let finish!: (value: typeof response) => void;
+    fetch.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    const late = source.getPayload(handle, signal);
+    fetch.mockResolvedValueOnce(true);
+    await source.release(handle, signal);
+    finish(response);
+    await expect(late).rejects.toMatchObject({type: {code: SessionPayloadErrorCode.UNKNOWN_HANDLE}});
+    expect(first.offerEligibility?.lease.ready).toBe(false);
+  });
 
   it("recovers a payload through the real HTTP client after the peer closes the socket", async () => {
     const request = buildRequest();
