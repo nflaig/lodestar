@@ -461,6 +461,23 @@ describe("SessionPayloadSource", () => {
       expect(source.getResources()).toMatchObject({preparing: 0, active: 0, releasing: 0, uncertain: 0});
     });
 
+    it("does not reserve a worker when creating the RPC client fails before fetch", async () => {
+      const rpc = new JsonRpcHttpClient(["http://127.0.0.1:1"]);
+      const fetch = vi.spyOn(rpc, "fetch").mockResolvedValueOnce({sessionId: "recovered"});
+      const factory = vi.fn(() => rpc);
+      const source = new SessionPayloadSource("session", factory, {boundedAlternates: true});
+      for (let i = 0; i < 2; i++) {
+        factory.mockImplementationOnce(() => {
+          throw new Error("client unavailable before fetch");
+        });
+        await expect(source.prepare(buildRequest(), signal)).rejects.toThrow("client unavailable before fetch");
+        expect(source.getResources()).toMatchObject({preparing: 0, active: 0, uncertain: 0, alternatesDisabled: false});
+        expect(fetch).not.toHaveBeenCalled();
+      }
+      await expect(source.prepare(buildRequest(), signal)).resolves.toMatchObject({payloadId: "recovered"});
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
     it("reconciles cleanup failures that appear between primary allocation attempts", async () => {
       const {source, fetch, request} = setup(true);
       fetch

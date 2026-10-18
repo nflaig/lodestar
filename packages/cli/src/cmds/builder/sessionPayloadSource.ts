@@ -121,28 +121,26 @@ export class SessionPayloadSource implements PayloadSource {
     }
     if (signal.aborted) throw new ErrorAborted();
     const resources = this.getResources();
-    if (resources) {
-      if (
-        resources.preparing + resources.active + resources.releasing + resources.uncertain >= resources.capacity ||
+    if (
+      resources &&
+      (resources.preparing + resources.active + resources.releasing + resources.uncertain >= resources.capacity ||
         (alternate &&
           (resources.active !== 1 ||
             resources.preparing !== 0 ||
             resources.releasing !== 0 ||
-            resources.uncertain !== 0))
-      )
-        throw new SessionPayloadError({
-          code: SessionPayloadErrorCode.CAPACITY,
-          reason: "Constructor resources occupied",
-        });
-      this.preparing++;
-    }
+            resources.uncertain !== 0)))
+    )
+      throw new SessionPayloadError({
+        code: SessionPayloadErrorCode.CAPACITY,
+        reason: "Constructor resources occupied",
+      });
+    const beginRpc = this.rpc(bounded ? AbortSignal.timeout(6000) : signal);
+    if (bounded) this.preparing++;
     let result: {sessionId: string; orderGenerationVersion?: number; alternateSessionVersion?: number};
     try {
       // Cancelling the build must not discard a late allocation handle. Keep
       // one bounded request alive, then end any handle the caller no longer owns.
-      result = await this.rpc(bounded ? AbortSignal.timeout(6000) : signal).fetch<typeof result, typeof call.params>(
-        call
-      );
+      result = await beginRpc.fetch<typeof result, typeof call.params>(call);
     } catch (error) {
       if (bounded) {
         const rejection = error instanceof ErrorJsonRpcResponse ? error.response.error : undefined;
