@@ -31,6 +31,7 @@ function attributes(root: number, hash: number): AlternatePayloadAttributesEvent
   data.parentBlockRoot = Buffer.alloc(32, root);
   data.parentBlockHash = Buffer.alloc(32, hash);
   data.payloadAttributes.parentBeaconBlockRoot = data.parentBlockRoot;
+  data.payloadAttributes.slotNumber = 1;
   data.payloadAttributes.timestamp = 12;
   return {
     version: ForkName.gloas,
@@ -91,7 +92,7 @@ describe("alternate parent bidder", () => {
       const payloadId = String(++nextId);
       const payload: BuiltPayload = {
         ...mockBuiltPayload({
-          slot: 1,
+          slot: request.payloadAttributes.slotNumber,
           parentHash: fromHex(request.forkchoiceState.headBlockHash),
           prevRandao: request.payloadAttributes.prevRandao,
           blockHash: Buffer.alloc(32, nextId),
@@ -158,6 +159,7 @@ describe("alternate parent bidder", () => {
       canRetainAlternate,
       retainCommitment,
       logger,
+      proposerPreferencesTracker,
     };
   }
 
@@ -287,21 +289,232 @@ describe("alternate parent bidder", () => {
     expect(m.payloadSource.prepare).toHaveBeenCalledTimes(2);
   });
 
-  it("preempts alternate work for a new primary and retains already offered branches", async () => {
+  it("prioritizes the new primary and retries its unpublished alternate only after confirmed cleanup", async () => {
     const m = setup();
     const old = attributes(4, 5);
+    const ended = defer<void>();
+    m.payloadSource.release.mockImplementation(async (handle) => {
+      if (handle.payloadId === "2") await ended.promise;
+      m.sessions.delete(handle.payloadId);
+    });
     m.start(old);
     m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
     await vi.advanceTimersByTimeAsync(100);
     const alternate = m.sessions.get("2");
     expect(alternate).toBeDefined();
     m.start(attributes(8, 9));
-    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(100);
     expect(m.payloadSource.release.mock.calls.map(([handle]) => handle.payloadId)).toContain("2");
     expect(m.offer(attributes(4, 6))).toBeNull();
     expect(m.offer(attributes(8, 9))).not.toBeNull();
     expect(m.offer(old)).not.toBeNull();
+    expect(m.payloadSource.prepare).toHaveBeenCalledTimes(3);
+    expect(m.sessions.size).toBe(2);
+    ended.resolve();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(m.offer(attributes(4, 6))).not.toBeNull();
+    expect(m.payloadSource.prepare.mock.calls.map(([request]) => request.requireUnleased === true)).toEqual([
+      false,
+      true,
+      false,
+      true,
+    ]);
     expect(m.sessions.size).toBe(1);
+  });
+
+  it("allows at most one preemption retry per tuple across repeated primary switches", async () => {
+    const m = setup();
+    const alternate = attributes(4, 6);
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(alternate);
+    await vi.advanceTimersByTimeAsync(100);
+    m.start(attributes(8, 9));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(2);
+    m.start(attributes(10, 11));
+    await vi.advanceTimersByTimeAsync(600);
+    m.bidder.onAlternatePayloadAttributes(alternate);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(2);
+    expect(m.offer(alternate)).toBeNull();
+    expect(m.offer(attributes(10, 11))).not.toBeNull();
+    expect(m.sessions.size).toBe(1);
+  });
+
+  it.each(["slot", "proposer", "dependent root"] as const)(
+    "does not retry a preempted alternate when the new primary changes %s",
+    async (changed) => {
+      const m = setup();
+      const alternate = attributes(4, 6);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(100);
+      const next = attributes(8, 9);
+      const root = changed === "dependent root" ? Buffer.alloc(32, 8) : dependentRoot;
+      if (changed === "slot") {
+        next.data.proposalSlot = 2;
+        next.data.payloadAttributes.slotNumber = 2;
+        next.data.payloadAttributes.timestamp = 24;
+      }
+      if (changed === "proposer") next.data.proposerIndex = 4;
+      m.api.validator.getProposerDutiesV2.mockResolvedValue(
+        mockApiResponse({
+          data: [{slot: next.data.proposalSlot, validatorIndex: next.data.proposerIndex, pubkey: Buffer.alloc(48, 3)}],
+          meta: {executionOptimistic: false, dependentRoot: toRootHex(root)},
+        })
+      );
+      const preferences = ssz.gloas.SignedProposerPreferences.defaultValue();
+      preferences.message.proposalSlot = next.data.proposalSlot;
+      preferences.message.dependentRoot = root;
+      preferences.message.targetGasLimit = 60_000_000n;
+      m.proposerPreferencesTracker.onProposerPreferences(preferences);
+      m.start(next);
+      await vi.advanceTimersByTimeAsync(700);
+      expect(m.offer(next)).not.toBeNull();
+      expect(m.offer(alternate)).toBeNull();
+      expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(1);
+    }
+  );
+
+  it.each(["shutdown", "slot expired"] as const)(
+    "does not retry after %s while preempted cleanup is pending",
+    async (reason) => {
+      const m = setup();
+      const ended = defer<void>();
+      m.payloadSource.release.mockImplementation(async (handle) => {
+        if (handle.payloadId === "2") await ended.promise;
+        m.sessions.delete(handle.payloadId);
+      });
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
+      await vi.advanceTimersByTimeAsync(100);
+      m.start(attributes(8, 9));
+      await vi.advanceTimersByTimeAsync(100);
+      if (reason === "shutdown") controller.abort();
+      else vi.setSystemTime(12_000);
+      ended.resolve();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(1);
+      expect(m.offer(attributes(4, 6))).toBeNull();
+    }
+  );
+
+  it("does not turn a normal alternate deadline failure into a primary-preemption retry", async () => {
+    const m = setup();
+    const blocked = defer<BuiltPayload>();
+    m.payloadSource.getPayload.mockImplementation(async (handle) => {
+      if (handle.payloadId === "2") return blocked.promise;
+      const session = m.sessions.get(handle.payloadId);
+      if (!session) throw Error("Missing session");
+      return session.payload;
+    });
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
+    await vi.advanceTimersByTimeAsync(550);
+    m.start(attributes(8, 9));
+    await vi.advanceTimersByTimeAsync(600);
+    m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(1);
+    expect(m.offer(attributes(4, 6))).toBeNull();
+    expect(m.offer(attributes(8, 9))).not.toBeNull();
+    expect(m.logger.debug).toHaveBeenCalledWith("Skipping alternate parent bid", {
+      slot: 1,
+      parentBlockRoot: toRootHex(attributes(4, 6).data.parentBlockRoot),
+      parentBlockHash: toRootHex(attributes(4, 6).data.parentBlockHash),
+      reason: "deadline_before_retention",
+    });
+  });
+
+  it("keeps a preemption retry queued while alternate cleanup remains uncertain", async () => {
+    const m = setup();
+    let uncertain = 0;
+    m.payloadSource.getResources.mockImplementation(() => ({
+      capacity: 2,
+      active: m.sessions.size,
+      preparing: 0,
+      releasing: 0,
+      uncertain,
+      alternatesDisabled: false,
+    }));
+    m.payloadSource.release.mockImplementation(async (handle) => {
+      m.sessions.delete(handle.payloadId);
+      if (handle.payloadId === "2") {
+        uncertain = 1;
+        throw Error("UncertainEnd");
+      }
+    });
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
+    await vi.advanceTimersByTimeAsync(100);
+    m.start(attributes(8, 9));
+    await vi.advanceTimersByTimeAsync(600);
+    expect(m.offer(attributes(8, 9))).not.toBeNull();
+    expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(1);
+    expect(m.offer(attributes(4, 6))).toBeNull();
+    uncertain = 0;
+    await vi.advanceTimersByTimeAsync(550);
+    expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(2);
+    expect(m.offer(attributes(4, 6))).not.toBeNull();
+  });
+
+  it("does not retry a failed retrieval when a primary switch arrives during cleanup", async () => {
+    const m = setup();
+    const ended = defer<void>();
+    m.payloadSource.release.mockImplementation(async (handle) => {
+      if (handle.payloadId === "2") await ended.promise;
+      m.sessions.delete(handle.payloadId);
+    });
+    m.payloadSource.getPayload.mockImplementation(async (handle) => {
+      if (handle.payloadId === "2") throw Error("WorkerRejected");
+      const session = m.sessions.get(handle.payloadId);
+      if (!session) throw Error("Missing session");
+      return session.payload;
+    });
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
+    await vi.advanceTimersByTimeAsync(460);
+    m.start(attributes(8, 9));
+    await vi.advanceTimersByTimeAsync(10);
+    ended.resolve();
+    await vi.advanceTimersByTimeAsync(600);
+    expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(1);
+    expect(m.offer(attributes(4, 6))).toBeNull();
+  });
+
+  it("counts a retry against the four actual alternate attempts per slot", async () => {
+    const m = setup();
+    const alternate = attributes(4, 6);
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(alternate);
+    await vi.advanceTimersByTimeAsync(100);
+    m.start(attributes(8, 9));
+    await vi.advanceTimersByTimeAsync(600);
+    expect(m.offer(alternate)).not.toBeNull();
+    for (let i = 10; i < 13; i++) m.bidder.onAlternatePayloadAttributes(attributes(i, i));
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(4);
+    expect(m.offer(attributes(10, 10))).not.toBeNull();
+    expect(m.offer(attributes(11, 11))).not.toBeNull();
+    expect(m.offer(attributes(12, 12))).toBeNull();
+  });
+
+  it("does not retry a tuple retained while it becomes the primary", async () => {
+    const m = setup();
+    const alternate = attributes(4, 6);
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(alternate);
+    await vi.advanceTimersByTimeAsync(100);
+    m.start(alternate);
+    await vi.advanceTimersByTimeAsync(600);
+    const retained = m.offer(alternate);
+    expect(retained).not.toBeNull();
+    m.start(attributes(8, 9));
+    m.bidder.onAlternatePayloadAttributes(alternate);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(1);
+    expect(m.offer(alternate)).toBe(retained);
+    expect(m.logger.debug).not.toHaveBeenCalledWith("Retrying preempted alternate parent bid", expect.anything());
   });
 
   it("declines bids above branch-specific collateral and omits unknown identities", async () => {
@@ -378,6 +591,46 @@ describe("alternate parent bidder", () => {
       expect(m.bidStore.canOffer(retained[0])).toBe(false);
       expect(m.offer(alternate)).toBeNull();
       expect(observed).toEqual([]);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(1);
+      expect(m.logger.debug).toHaveBeenCalledWith("Skipping alternate parent bid", {
+        slot: 1,
+        parentBlockRoot: toRootHex(alternate.data.parentBlockRoot),
+        parentBlockHash: toRootHex(alternate.data.parentBlockHash),
+        reason: reason === "new primary" ? "aborted_after_retention" : "deadline_after_retention",
+      });
+    }
+  );
+
+  it.each(["journal busy", "wall deadline"] as const)(
+    "diagnoses an alternate skipped before persistence because of %s without retrying it",
+    async (reason) => {
+      const m = setup();
+      const alternate = attributes(4, 6);
+      m.payloadSource.getPayload.mockImplementation(async (handle) => {
+        const session = m.sessions.get(handle.payloadId);
+        if (!session) throw Error("Missing session");
+        if (handle.payloadId === "2") {
+          if (reason === "journal busy") m.canRetainAlternate.mockReturnValue(false);
+          else vi.setSystemTime(600);
+        }
+        return session.payload;
+      });
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(m.offer(alternate)).toBeNull();
+      expect(m.logger.debug).toHaveBeenCalledWith("Skipping alternate parent bid", {
+        slot: 1,
+        parentBlockRoot: toRootHex(alternate.data.parentBlockRoot),
+        parentBlockHash: toRootHex(alternate.data.parentBlockHash),
+        reason: reason === "journal busy" ? "journal_busy" : "deadline_before_retention",
+      });
+      m.canRetainAlternate.mockReturnValue(true);
+      m.start(attributes(8, 9));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased)).toHaveLength(1);
     }
   );
 

@@ -33,6 +33,16 @@ type PrimaryBuild = {
   feeRecipient?: ExecutionAddress;
 };
 
+type AlternateBuild = {
+  event: AlternatePayloadAttributesEvent;
+  primary: PrimaryBuild;
+  controller: AbortController;
+  signal: AbortSignal;
+  deadline: number;
+  retentionStarted: boolean;
+  preemptedBy?: PrimaryBuild;
+};
+
 export type PayloadAttributesEvent = routes.events.EventData[routes.events.EventType.payloadAttributes];
 export type AlternatePayloadAttributesEvent = routes.events.AlternatePayloadAttributesEvent;
 
@@ -84,9 +94,12 @@ export type BidderModules = {
 export class Bidder {
   private readonly activeBuilds = new Map<string, {slot: number; controller: AbortController}>();
   private primary: PrimaryBuild | undefined;
-  private readonly alternateQueue = new Map<string, AlternatePayloadAttributesEvent>();
-  private readonly alternateAttempts = new Map<number, Set<string>>();
-  private alternateController: AbortController | undefined;
+  private readonly alternateQueue = new Map<
+    string,
+    {event: AlternatePayloadAttributesEvent; retryFor?: PrimaryBuild}
+  >();
+  private readonly alternateAttempts = new Map<number, string[]>();
+  private alternateBuild: AlternateBuild | undefined;
   private alternateTask: Promise<void> | undefined;
   private alternateWake: ReturnType<typeof setTimeout> | undefined;
 
@@ -149,25 +162,40 @@ export class Bidder {
     if (this.activeBuilds.has(buildId) || (!updates && ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot))) {
       return;
     }
+    // A delayed event must not displace a newer primary or its reserved native worker.
+    if (this.primary && this.primary.slot > slot) return;
+    const controller = new AbortController();
+    const primary: PrimaryBuild = {id: buildId, slot, data, controller, ready: false};
+    const alternate = this.alternateBuild;
+    if (
+      alternate &&
+      !alternate.signal.aborted &&
+      Date.now() < alternate.deadline &&
+      alternate.primary === this.primary &&
+      alternate.event.data.proposalSlot === slot &&
+      alternate.event.data.proposerIndex === data.proposerIndex
+    )
+      alternate.preemptedBy = primary;
     for (const [id, active] of this.activeBuilds) {
       if (id !== buildId && active.slot <= slot) active.controller.abort();
     }
-    // A delayed event must not displace a newer primary or its reserved native worker.
-    if (this.primary && this.primary.slot > slot) return;
-    this.alternateController?.abort();
+    alternate?.controller.abort();
     clearTimeout(this.alternateWake);
     this.alternateWake = undefined;
     for (const [id, queued] of this.alternateQueue) {
-      if (id === buildId || queued.data.proposalSlot !== slot || queued.data.proposerIndex !== data.proposerIndex)
+      if (
+        queued.retryFor ||
+        id === buildId ||
+        queued.event.data.proposalSlot !== slot ||
+        queued.event.data.proposerIndex !== data.proposerIndex
+      )
         this.alternateQueue.delete(id);
     }
     for (const attemptedSlot of this.alternateAttempts.keys()) {
       if (attemptedSlot < slot) this.alternateAttempts.delete(attemptedSlot);
     }
-    const controller = new AbortController();
     const active = {slot, controller};
     this.activeBuilds.set(buildId, active);
-    const primary: PrimaryBuild = {id: buildId, slot, data, controller, ready: false};
     this.primary = primary;
     const signal = AbortSignal.any([controller.signal, this.modules.signal]);
 
@@ -229,7 +257,7 @@ export class Bidder {
       if (this.activeBuilds.get(buildId) === active) this.activeBuilds.delete(buildId);
       if (this.primary === primary) {
         this.primary = undefined;
-        this.alternateController?.abort();
+        this.alternateBuild?.controller.abort();
         this.alternateQueue.clear();
         clearTimeout(this.alternateWake);
         this.alternateWake = undefined;
@@ -252,13 +280,13 @@ export class Bidder {
     const id = `${data.proposalSlot}:${toRootHex(data.parentBlockRoot)}:${toRootHex(data.parentBlockHash)}`;
     if (
       id === primary.id ||
-      this.alternateAttempts.get(data.proposalSlot)?.has(id) ||
+      this.alternateAttempts.get(data.proposalSlot)?.includes(id) ||
       this.alternateQueue.has(id) ||
       this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
       this.modules.bidStore.get(data.proposalSlot, toRootHex(data.parentBlockHash), toRootHex(data.parentBlockRoot))
     )
       return;
-    this.alternateQueue.set(id, event);
+    this.alternateQueue.set(id, {event});
     this.tryAlternate();
   }
 
@@ -281,7 +309,7 @@ export class Bidder {
       primary.dependentRoot === undefined ||
       !resources ||
       resources.alternatesDisabled ||
-      (this.alternateAttempts.get(primary.slot)?.size ?? 0) >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
+      (this.alternateAttempts.get(primary.slot)?.length ?? 0) >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
       clock.msToSlot(primary.slot) <= duration + 50
     )
       return;
@@ -308,21 +336,51 @@ export class Bidder {
       retry();
       return;
     }
+    for (const [id, queued] of this.alternateQueue) {
+      const {event, retryFor} = queued;
+      if (
+        id === primary.id ||
+        event.data.proposalSlot !== primary.slot ||
+        event.data.proposerIndex !== primary.data.proposerIndex ||
+        toRootHex(event.context.dependentRoot) !== primary.dependentRoot ||
+        (retryFor !== undefined && retryFor !== primary) ||
+        this.hasRetainedAlternate(event)
+      )
+        this.alternateQueue.delete(id);
+    }
     const next = this.alternateQueue.entries().next().value;
     if (!next) return;
-    const [id, event] = next;
-    const attempts = this.alternateAttempts.get(primary.slot) ?? new Set<string>();
-    if (attempts.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT) return;
-    attempts.add(id);
+    const [id, {event}] = next;
+    const attempts = this.alternateAttempts.get(primary.slot) ?? [];
+    if (attempts.length >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT) return;
+    attempts.push(id);
     this.alternateAttempts.set(primary.slot, attempts);
     this.alternateQueue.delete(id);
     const controller = new AbortController();
-    this.alternateController = controller;
     const signal = AbortSignal.any([controller.signal, primary.controller.signal, this.modules.signal]);
     const deadline = Date.now() + duration;
+    const alternate: AlternateBuild = {event, primary, controller, signal, deadline, retentionStarted: false};
+    this.alternateBuild = alternate;
     const timer = setTimeout(() => controller.abort(), duration);
-    this.alternateTask = this.buildAlternate(primary, id, event, deadline, signal)
+    let preempted = false;
+    this.alternateTask = this.buildAlternate(id, alternate)
       .catch((error: unknown) => {
+        const aborted = signal.aborted && (isErrorAborted(error) || error === signal.reason);
+        preempted = alternate.preemptedBy !== undefined && aborted;
+        if (
+          aborted &&
+          !preempted &&
+          !primary.controller.signal.aborted &&
+          !this.modules.signal.aborted &&
+          !alternate.retentionStarted &&
+          Date.now() >= deadline
+        )
+          this.modules.logger.debug("Skipping alternate parent bid", {
+            slot: event.data.proposalSlot,
+            parentBlockRoot: toRootHex(event.data.parentBlockRoot),
+            parentBlockHash: toRootHex(event.data.parentBlockHash),
+            reason: "deadline_before_retention",
+          });
         if (!signal.aborted && !isErrorAborted(error))
           this.modules.logger.debug(
             "Skipping alternate parent bid",
@@ -333,19 +391,44 @@ export class Bidder {
       .finally(() => {
         clearTimeout(timer);
         controller.abort();
-        this.alternateController = undefined;
+        this.alternateBuild = undefined;
         this.alternateTask = undefined;
+        const replacement = alternate.preemptedBy;
+        if (
+          preempted &&
+          replacement &&
+          id !== replacement.id &&
+          this.primary === replacement &&
+          !replacement.controller.signal.aborted &&
+          !this.modules.signal.aborted &&
+          !alternate.retentionStarted &&
+          attempts.filter((attemptedId) => attemptedId === id).length === 1 &&
+          attempts.length < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
+          clock.getCurrentSlot() < primary.slot &&
+          this.alternateQueue.size < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
+          !this.hasRetainedAlternate(event)
+        ) {
+          this.alternateQueue.set(id, {event, retryFor: replacement});
+          this.modules.logger.debug("Retrying preempted alternate parent bid", {
+            slot: primary.slot,
+            parentBlockRoot: toRootHex(event.data.parentBlockRoot),
+            parentBlockHash: toRootHex(event.data.parentBlockHash),
+          });
+        }
         this.tryAlternate();
       });
   }
 
-  private async buildAlternate(
-    primary: PrimaryBuild,
-    id: string,
-    event: AlternatePayloadAttributesEvent,
-    deadline: number,
-    signal: AbortSignal
-  ): Promise<void> {
+  private hasRetainedAlternate(event: AlternatePayloadAttributesEvent): boolean {
+    const parentBlockRoot = toRootHex(event.data.parentBlockRoot);
+    const parentBlockHash = toRootHex(event.data.parentBlockHash);
+    return this.modules.ledger
+      .getBidsForSlot(event.data.proposalSlot)
+      .some((bid) => bid.parentBlockRoot === parentBlockRoot && bid.parentBlockHash === parentBlockHash);
+  }
+
+  private async buildAlternate(id: string, alternate: AlternateBuild): Promise<void> {
+    const {primary, event, deadline, signal} = alternate;
     const {data} = event;
     const dependentRoot = toRootHex(event.context.dependentRoot);
     signal.throwIfAborted();
@@ -380,6 +463,9 @@ export class Bidder {
         await this.bidOnPayload(payload, data, preferences.message.feeRecipient, signal, true, this.modules, -1, {
           coverableGwei,
           deadline,
+          onRetentionAttempted: () => {
+            alternate.retentionStarted = true;
+          },
         });
       },
       signal
@@ -606,7 +692,7 @@ export class Bidder {
     identity: Pick<BidderModules, "ledger" | "bidPublisher" | "bidStore" | "getBuilderStatus" | "builderIndex"> = this
       .modules,
     minimumValue = -1,
-    alternateAdmission?: {coverableGwei: number; deadline: number}
+    alternateAdmission?: {coverableGwei: number; deadline: number; onRetentionAttempted: () => void}
   ): Promise<gloas.SignedExecutionPayloadBid | null> {
     const {clock, logger, metrics} = this.modules;
     const {ledger, bidPublisher, bidStore, builderIndex} = identity;
@@ -617,7 +703,10 @@ export class Bidder {
     const parentBlockHash = toRootHex(data.parentBlockHash);
     const logCtx = {slot, parentBlockRoot, parentBlockHash};
     signal.throwIfAborted();
-    if (alternateAdmission && Date.now() >= alternateAdmission.deadline) return null;
+    if (alternateAdmission && Date.now() >= alternateAdmission.deadline) {
+      logger.debug("Skipping alternate parent bid", {...logCtx, reason: "deadline_before_retention"});
+      return null;
+    }
     if (!isOfferEligible(payload.offerEligibility)) return null;
     if (this.opts.dryRun) {
       metrics?.bids.total.inc({result: BidResult.dryRun});
@@ -664,7 +753,10 @@ export class Bidder {
     signal.throwIfAborted();
     const {executionPayload} = payload;
     const blockHash = toRootHex(executionPayload.blockHash);
-    if (alternate && this.modules.canRetainAlternate?.() !== true) return null;
+    if (alternate && this.modules.canRetainAlternate?.() !== true) {
+      logger.debug("Skipping alternate parent bid", {...logCtx, reason: "journal_busy"});
+      return null;
+    }
     const revisionLimit = Math.floor(
       (this.opts.maxRevisionsPerSlot ?? MAX_BID_REVISIONS_PER_SLOT) / (alternate ? 2 : 1)
     );
@@ -685,13 +777,24 @@ export class Bidder {
       payload: {...payload, fork: ForkName.gloas},
     });
     signal.throwIfAborted();
-    if (alternateAdmission && Date.now() >= alternateAdmission.deadline) return null;
+    if (alternateAdmission && Date.now() >= alternateAdmission.deadline) {
+      logger.debug("Skipping alternate parent bid", {...logCtx, reason: "deadline_before_retention"});
+      return null;
+    }
+    alternateAdmission?.onRetentionAttempted();
     const signedBid = await bidPublisher.prepare(bid, revisionLimit);
     // Retain before exposure, including when transport completion is uncertain
     // or arrives after cancellation. Reveal ownership does not expire with offers.
-    const alternateExpired = alternateAdmission && (signal.aborted || Date.now() >= alternateAdmission.deadline);
+    const deadlineExpired = alternateAdmission !== undefined && Date.now() >= alternateAdmission.deadline;
+    const alternateExpired = alternateAdmission && (signal.aborted || deadlineExpired);
     bidStore.add(signedBid, alternateExpired ? "recovery" : payload.offerEligibility);
-    if (alternateExpired) return null;
+    if (alternateExpired) {
+      logger.debug("Skipping alternate parent bid", {
+        ...logCtx,
+        reason: deadlineExpired ? "deadline_after_retention" : "aborted_after_retention",
+      });
+      return null;
+    }
     if (apiRevision) signal.throwIfAborted();
     // Disk persistence can outlive a cancellation, lease, parent or shutdown.
     // The signature remains retained even when it is no longer a new offer.

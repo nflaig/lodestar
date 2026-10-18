@@ -150,7 +150,10 @@ Alternates start only after an unleased primary snapshot is retained. One spare 
 worker produces one alternate snapshot at a time, with at most four attempts per slot.
 `--bidding.alternateBuildDurationMs` defaults to 500 ms and accepts 250 through 1000 ms.
 Construction stops for a new primary and does not start near scheduled gossip or too
-late to finish before the slot. Cleanup continues to occupy capacity until the native
+late to finish before the slot. An unpublished alternate preempted by a primary change
+may retry once for the same slot, proposer and dependent root. The retry counts toward
+the four-attempt limit and waits for confirmed cleanup and a retained primary bid.
+Cleanup continues to occupy capacity until the native
 constructor confirms it; an unknown allocation outcome disables further alternates.
 Half of the revision, payload-byte and payload-count admission limits remains reserved
 for primary work. Alternates enter the durable journal only while it is idle.
