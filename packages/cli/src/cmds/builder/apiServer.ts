@@ -1,9 +1,10 @@
 import {Endpoint} from "@lodestar/api";
 import {BuilderApiMethods, getRoutes} from "@lodestar/api/builder/server";
-import {ApiError, FastifyRoute} from "@lodestar/api/server";
+import {ApiError, FastifyRoute, canSendResponse} from "@lodestar/api/server";
 import {RestApiServer, RestApiServerModules, RestApiServerOpts} from "@lodestar/beacon-node";
-import {BuilderApi} from "@lodestar/builder";
+import {BuilderApi, BuilderBidStreamApi} from "@lodestar/builder";
 import {ChainForkConfig} from "@lodestar/config";
+import {registerBidStream} from "./bidStream.js";
 
 export const builderRestApiServerOptsDefault: RestApiServerOpts = {
   address: "127.0.0.1",
@@ -22,6 +23,7 @@ const TIMEOUT_MS_HEADER = "x-timeout-ms";
 export type BuilderRestApiServerModules = RestApiServerModules & {
   config: ChainForkConfig;
   api: BuilderApi;
+  getBidStreamApi?: () => BuilderBidStreamApi | null;
 };
 
 /**
@@ -62,15 +64,46 @@ export function getBuilderApiBeforeInit(config: ChainForkConfig, getBuilderApi: 
   };
 }
 
+export type BuilderRestApiServerOpts = RestApiServerOpts & {bidStream?: boolean};
+
 export class BuilderRestApiServer extends RestApiServer {
-  constructor(optsArg: Partial<RestApiServerOpts>, modules: BuilderRestApiServerModules) {
-    const opts = {
+  constructor(optsArg: Partial<BuilderRestApiServerOpts>, modules: BuilderRestApiServerModules) {
+    const opts: BuilderRestApiServerOpts = {
       ...builderRestApiServerOptsDefault,
       // optsArg is a Partial type, any of its properties can be undefined
       ...Object.fromEntries(Object.entries(optsArg).filter(([_, v]) => v != null)),
     };
 
     super(opts, modules);
+
+    // Bid eligibility is short-lived. Intermediaries must never replay an
+    // earlier response after the constructor has fenced its order generation.
+    this.server.addHook("onRequest", async (_req, res) => {
+      res.header("Cache-Control", "no-store");
+    });
+    this.server.addHook("onSend", (_req, res, payload, done) => {
+      if (!canSendResponse(res)) {
+        res.code(204);
+        res.removeHeader("Content-Length");
+        done(null, null);
+      } else done(null, payload);
+    });
+
+    if (opts.bidStream) {
+      // Upgrade sockets no longer have Node's HTTP timeouts. Successful streams
+      // hijack the response; every ordinary or rejected route must close its socket.
+      this.server.addHook("onResponse", async (request) => {
+        if (request.headers.upgrade !== undefined) request.raw.socket.destroy();
+      });
+      void this.server.register(async (server) => {
+        await registerBidStream(
+          server,
+          modules.getBidStreamApi ?? (() => null),
+          this.logger,
+          modules.config.SLOT_DURATION_MS
+        );
+      });
+    }
 
     // Only the routes implemented by the builder are registered, routes of earlier forks are not served
     const routes = getRoutes(modules.config, modules.api as BuilderApiMethods);

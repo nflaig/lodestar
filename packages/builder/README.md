@@ -110,6 +110,59 @@ using the best ready bid at `bidding.deadlineBps` in the preceding slot. API pol
 continues until `updateCutoffBps` of the proposal slot; 1000 is 1.2 seconds into a
 12-second slot. Parent changes cancel construction without deleting old commitments.
 
+## Experimental alternate parent bids
+
+The builder can retain an API and stream bid for additional parent tuples using the
+same builder identity. Enable this on the beacon node:
+
+```sh
+--chain.emitPayloadAttributes true \
+--chain.emitPayloadAttributesAlternates true \
+--chain.payloadAttributesAlternateBuilderIndices 0
+```
+
+Replace `0` with the primary builder's registered index. On the builder, keep session
+updates enabled and add `--bidding.alternateBranches true`. The constructor must
+support `zbuilder_beginAlternateV1(parentHash, payloadAttributes, extraData?)`, returning
+`{sessionId, orderGenerationVersion: 0, alternateSessionVersion: 1}`. This method rejects
+renewable order-generation leases before allocating a session. Older constructors
+cannot silently accept this request as ordinary session work.
+
+The existing `payload_attributes` event carries alternate tuples in an optional
+`context` object containing `role: "alternate"`, `dependent_root`, and `builders`.
+Ordinary events have no context and keep their existing wire format. No additional
+event topic or subscription is required. Alternate tuples cover the current beacon
+head and its direct parent, each with available FULL and EMPTY variants. EMPTY excludes the
+parent execution payload; the new block can still contain transactions. Each context
+uses its own prepared state, withdrawals and execution requests. The event includes
+the proposer dependent root and branch-specific identity/collateral metadata for at
+most 16 configured builder indices. A differing proposer or dependent root, a missing
+cached state, or missing/ineligible builder metadata causes that alternate to be skipped.
+Enable beacon emission only on a dedicated builder endpoint whose subscribers all
+understand the context extension. An older subscriber can ignore unknown metadata
+and treat every alternate as its new primary. Upgrade the publisher first, then
+enable alternate emission on the beacon node.
+
+Keep `chain.fastConfirmation` disabled (the default). Alternate events are suppressed
+with fast confirmation because its safe execution hash can be ahead of an alternate parent.
+
+Alternates start only after an unleased primary snapshot is retained. One spare native
+worker produces one alternate snapshot at a time, with at most four attempts per slot.
+`--bidding.alternateBuildDurationMs` defaults to 500 ms and accepts 250 through 1000 ms.
+Construction stops for a new primary and does not start near scheduled gossip or too
+late to finish before the slot. An unpublished alternate preempted by a primary change
+may retry once for the same slot, proposer and dependent root. The retry counts toward
+the four-attempt limit and waits for confirmed cleanup and a retained primary bid.
+Cleanup continues to occupy capacity until the native
+constructor confirms it; an unknown allocation outcome disables further alternates.
+Half of the revision, payload-byte and payload-count admission limits remains reserved
+for primary work. Alternates enter the durable journal only while it is idle.
+
+This initial mode publishes alternate bids through HTTP and WebSocket only. Primary
+and staged gossip behavior is unchanged. Previously advertised payloads remain retained
+for reveal when a new primary replaces their branch. The work limits can omit contexts;
+enabling this option does not guarantee a bid for every possible parent.
+
 The default update interval is zero, retaining one retrieval at the usual deadline.
 Positive intervals require this constructor source and must be at least 25 ms. This
 source cannot be combined with the controlled transaction-file source or its capture
@@ -134,19 +187,47 @@ successful gossip publication (`published`). Keep the constructor RPC private.
 
 Live CLI builders persist Gloas commitments to `<dataDir>/builder-commitments`.
 Payloads and signed bids are synced before exposure; reveal conflict records are
-synced before signing. Recovery restores eligible revisions and checks identity,
-checksums and required payloads before serving. The disk journal is limited to
+synced before signing. Recovery restores reveal obligations and checks identity,
+checksums, execution-request roots and required payloads before serving. Each
+new offer must match its retained slot, execution hash, execution parent, beacon
+parent, request root and ordered blob commitments. Reusing an immutable payload
+hash cannot replace those retained bindings. The disk journal is limited to
 768 MiB, 51,457 files and 128 MiB per file. Payloads expire after two slots;
 bid and reveal metadata expire after three epochs. Dry runs do not write it.
+
+New offers leave software quota for 25,088 reveal records of at most 1 KiB each
+(24.5 MiB), within those same total limits. Existing reveal files consume that
+reserve. Both ordinary writes and staged hard links preserve the remaining
+headroom; no previous offer is deleted to make room. Existing journals above the
+new offer threshold still recover, but cannot guarantee the reserve until old
+records expire. This accounting does not reserve physical blocks or protect
+against ENOSPC, filesystem corruption, a failed disk or a disk that ignores fsync.
 
 Recovery conservatively consumes each recorded parent tuple's gossip allowance
 and reserves the largest offer per recent slot as a possible unsettled liability.
 This covers missed selection events while offline, but can reduce available bidding
 balance until reconciliation or expiry. Startup also processes the current beacon
-head. An uncertain write stops new journal writes. Use one process per journal
-with local filesystem atomic-rename/fsync semantics, retain the data directory
+head. An uncertain write stops new journal writes. Before recovery or signing,
+the builder takes a native exclusive lock in the canonical commitment directory.
+It rejects a second instance, including symlink aliases and another instance in
+the same process. The lock has no stale timeout: a stopped process remains the
+owner, while an exited process releases its kernel lock. Shutdown revokes new
+signing first, drains journal workers, then releases ownership. A successor must
+recover all commitments before serving. Use a local filesystem with reliable
+exclusive locking and atomic-rename/fsync semantics, retain the data directory
 across upgrades, and drain existing offers before switching publisher identities.
-Replicated recovery across processes is not implemented.
+Never remove or replace the `.writer-lock` directory while an owner may be alive.
+Signer ownership is acquired only from the main thread. A process-wide directory
+registry rejects duplicate opens before they can release a POSIX record lock;
+other code in that process must not open, repair or destroy `.writer-lock/LOCK`.
+The lock database itself needs writable disk space at startup. An unavailable or
+corrupt lock database fails startup closed, even if expired journal files could
+otherwise be pruned. Preserve the directory until the former owner has exited.
+The guard covers the primary identity and its configured staged identities under
+one commitment root. Separate data directories, copied disks, copied keys and
+snapshot rollback are not fenced. Cross-host failover needs an external signer
+or fencing system and a journal that includes every acknowledged offer. This
+local guard does not provide replicated recovery or make the builder mainnet ready.
 
 After synchronous startup recovery, one worker owns journal writes and pruning.
 Its queue admits at most eight offers, 64 MiB of offer data and sixteen operations.
@@ -162,6 +243,83 @@ blob records remain readable. Older binaries cannot recover live reference-based
 payload records: before rolling back, pause new construction and drain beyond the
 two-slot payload retention window. Preserve the journal and identity files; never
 replace the journal with a backup that omits bids already exposed to proposers.
+
+## Constructor order generations
+
+A constructor advertising `orderGenerationVersion: 1` uses conditional
+`zbuilder_getPayloadV2` reads. Each ready response grants 250 ms of offer permission,
+measured from the request start with both monotonic and wall clocks. Heartbeats may
+renew unchanged candidates. Expired, unavailable, released or superseded generations
+cannot produce new API or gossip offers. Checks run after durable preparation, before
+each transport attempt and before the final API response is sent. API responses use
+`Cache-Control: no-store`.
+
+The gateway must fence the constructor and drain all outstanding leases before
+acknowledging cancellation or replacement. Lower-value replacement candidates may be
+served through the API; already consumed gossip allowances are not reset. Previously
+signed bids and payloads remain retained for reveal, even after cancellation. Recovery
+restores these obligations without restoring volatile offer permission; a current
+constructor admission is required before offering them again.
+
+This protocol requires session updates. One-shot construction with leased candidates
+is rejected. Constructors advertising version zero, or no version, retain V1 behavior.
+Deploy a compatible gateway, constructor and publisher together before enabling order
+generations. Attempts authorized before a fence can arrive after its acknowledgement
+because of scheduling or network delay. Cancellation does not retract delivered bids, remove
+independently authorized copies, or fence copied processes on other hosts. Arbitrary
+VM snapshot rollback and clock restoration are outside the lease assumptions.
+
+## Experimental Gloas bid streaming
+
+Enable `--builderApi --builderApi.bidStream` to serve the WebSocket extension used by
+[Commit-Boost v0.12.0-rc1](https://github.com/Commit-Boost/commit-boost-client/releases/tag/v0.12.0-rc1)
+and [Helix PR #670](https://github.com/gattaca-com/helix/pull/670). This is an experimental
+extension, not a replacement for the standard HTTP builder API. The normal POST bid,
+preferences and signed-block routes remain available.
+
+```text
+GET /eth/v1/builder/execution_payload_bid_stream/{slot}/{parent_hash}/{parent_root}/{proposer_pubkey}
+Eth-Consensus-Version: gloas
+Date-Milliseconds: <request send time in Unix milliseconds>
+X-Timeout-Ms: <total request timeout in milliseconds>
+X-Request-Auth: <standard padded base64 of SSZ SignedBuilderRequestAuth>
+```
+
+The upgrade authenticates the proposer, slot and agreed auth data exactly as HTTP does.
+With `--builderApi.publicUrl https://builder-plataberget.nflaig.dev`, the proposer's
+`auth_data` is the UTF-8 hostname `builder-plataberget.nflaig.dev`, unless
+`--builderApi.authData` overrides it. The JSON auth object is not sent in this header;
+serialize it as SSZ before base64 encoding. A successful upgrade sends binary messages:
+byte `0x01` (frame version), byte `0x07` (Gloas), then SSZ `SignedExecutionPayloadBid`.
+Clients must retain the latest valid message, including a lower replacement after an
+order-generation change.
+
+For Commit-Boost, set `get_header = "stream"` on the existing builder relay entry:
+
+```toml
+[[relays]]
+id = "plataberget-builder"
+url = "https://<registered-builder-pubkey>@builder-plataberget.nflaig.dev"
+get_header = "stream"
+```
+
+Use the actual registered builder key and the appropriate network configuration.
+Commit-Boost opens one stream per bid request and can fall back to HTTP if the upgrade
+fails. A repeated proposer request opens a new stream and can return a newer bid.
+
+The stream sends an eligible retained bid immediately, then updates after durable
+retention. It reserves the same transit and 50 ms response margin as HTTP and closes
+before the caller's deadline. Ping/pong RTT is logged for diagnosis; it does not change
+that margin or assume symmetric network latency. There are at most 64 pending or open
+streams, four per authenticated proposer, one write in flight and one coalesced update indication per
+connection. A 25 ms local eligibility check observes lease renewal without fetching or
+building a payload. Client data frames are rejected; compression is disabled. A peer
+that does not complete close is terminated after 100 ms.
+
+Every send rechecks current offer permission after serialization. Previously sent bids
+remain durably retained for reveal. Closing a stream, cancellation, or a newer message
+does not withdraw a bid already delivered to a proposer. Streaming does not enable
+constructor order generations or alter gossip identities, pricing or construction timing.
 
 ## Staged P2P bids
 
