@@ -66,6 +66,10 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   const updateCutoffBps = args["bidding.updateCutoffBps"];
   const maxRevisionsPerSlot = args["bidding.maxRevisionsPerSlot"];
   const alternateBranches = args["bidding.alternateBranches"] ?? false;
+  const beginReservations = args["payload.beginReservations"] ?? false;
+  if (beginReservations && !constructorUrl) {
+    throw new YargsError("--payload.beginReservations requires --payload.constructorUrl");
+  }
   const alternateBuildDurationMs = args["bidding.alternateBuildDurationMs"] ?? 500;
   if (
     !Number.isSafeInteger(updateIntervalMs) ||
@@ -177,7 +181,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
           signal,
           timeout: args["execution.timeout"],
         }),
-      {boundedAlternates: alternateBranches, logger}
+      {boundedAlternates: alternateBranches, beginReservations, logger}
     );
     logger.info("Session payload source", {
       url: toPrintableUrl(constructorUrl),

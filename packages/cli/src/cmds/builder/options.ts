@@ -30,6 +30,7 @@ export type IBuilderCliArgs = LogArgs & {
   "payload.transactionsFile"?: string;
   "payload.testingUrl"?: string;
   "payload.constructorUrl"?: string;
+  "payload.beginReservations"?: boolean;
   "payload.outputDir"?: string;
   "payload.dryRun"?: boolean;
 
@@ -176,6 +177,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
   "payload.constructorUrl": {
     description: "Private zbuilder session RPC URL for incrementally constructed, validated payloads",
     type: "string",
+    group: "payload",
+  },
+
+  "payload.beginReservations": {
+    description: "Use server-issued constructor reservations to recover safely from lost session-begin replies",
+    type: "boolean",
+    default: false,
     group: "payload",
   },
 

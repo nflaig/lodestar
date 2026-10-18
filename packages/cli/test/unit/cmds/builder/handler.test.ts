@@ -63,6 +63,12 @@ describe("cmds / builder / args handler", () => {
     ).rejects.toThrow("--bidding.maxRevisionsPerSlot must be between 1 and 256");
   });
 
+  it("requires a constructor for recoverable begins", async () => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "payload.beginReservations": true})
+    ).rejects.toThrow("--payload.beginReservations requires --payload.constructorUrl");
+  });
+
   it("rejects alternate branches without a session source and updates", async () => {
     await expect(
       runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateBranches": true})

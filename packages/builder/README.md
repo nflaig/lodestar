@@ -110,6 +110,23 @@ using the best ready bid at `bidding.deadlineBps` in the preceding slot. API pol
 continues until `updateCutoffBps` of the proposal slot; 1000 is 1.2 seconds into a
 12-second slot. Parent changes cancel construction without deleting old commitments.
 
+### Recoverable constructor allocation
+
+With a compatible native constructor, enable `--payload.beginReservations true` to
+reserve a single-use session identity before beginning construction. A lost reserve
+response cannot allocate a worker. A lost begin response remains counted against
+capacity until `zbuilder_cancelBeginV1` confirms that the worker and any delayed begin
+have been cleared. Begin is never retried; cleanup retries use the known reservation.
+This option does not enable alternate branches or bundle cancellation.
+
+The constructor must implement `zbuilder_reserveBeginV1`, `zbuilder_beginReservedV1`
+and `zbuilder_cancelBeginV1` with protocol version 1. This opt-in has no legacy
+fallback. Reservations are scoped to one native process instance, so a native restart
+requires coordinated publisher restart and recovery of its durable reveal journal.
+Routing a reservation to another instance fails closed and keeps its capacity
+uncertain. A cleanup timeout also retains capacity; later reconciliation may recover
+it without restarting either process. Already signed payloads remain revealable.
+
 ## Experimental alternate parent bids
 
 The builder can retain an API and stream bid for additional parent tuples using the
@@ -153,8 +170,9 @@ Construction stops for a new primary and does not start near scheduled gossip or
 late to finish before the slot. An unpublished alternate preempted by a primary change
 may retry once for the same slot, proposer and dependent root. The retry counts toward
 the four-attempt limit and waits for confirmed cleanup and a retained primary bid.
-Cleanup continues to occupy capacity until the native
-constructor confirms it; an unknown allocation outcome disables further alternates.
+Cleanup continues to occupy capacity until the native constructor confirms it.
+Without begin reservations, an unknown allocation outcome disables further alternates.
+With begin reservations, confirmed cancellation recovers capacity after a lost reply.
 Half of the revision, payload-byte and payload-count admission limits remains reserved
 for primary work. Alternates enter the durable journal only while it is idle.
 
