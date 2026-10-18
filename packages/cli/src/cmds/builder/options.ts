@@ -15,6 +15,8 @@ export type IBuilderCliArgs = LogArgs & {
   keystore: string;
   keystorePassword: string;
   builderPubkey?: string;
+  assumeBuilderIndex?: number;
+  assumeBuilderBalanceGwei?: number;
   executionFeeRecipient: string;
   requestTimeout: number;
 
@@ -74,6 +76,21 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
   builderPubkey: {
     description: "Builder's expected public key based on the keystore from 'keystore' option",
     type: "string",
+  },
+
+  assumeBuilderIndex: {
+    description:
+      "Before the Gloas fork, assume this builder index for the deposit the fork onboards, to bid for the first Gloas slot. " +
+      "Verified against the beacon node after the first Gloas block, bidding stops if the registry disagrees",
+    type: "number",
+    implies: ["assumeBuilderBalanceGwei"],
+  },
+
+  assumeBuilderBalanceGwei: {
+    description:
+      "Balance in gwei assumed with 'assumeBuilderIndex' until the beacon node reports the builder, the deposit amount",
+    type: "number",
+    implies: ["assumeBuilderIndex"],
   },
 
   executionFeeRecipient: {

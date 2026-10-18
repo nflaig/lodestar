@@ -56,6 +56,8 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
 
   const keypair = await loadBuilderKeypair(logger, args.keystore, args.keystorePassword, args.builderPubkey);
 
+  const assumedIdentity = parseAssumedIdentity(args.assumeBuilderIndex, args.assumeBuilderBalanceGwei);
+
   const onGracefulShutdownCbs: (() => Promise<void> | void)[] = [];
   onGracefulShutdown(async () => {
     for (const cb of onGracefulShutdownCbs) await cb();
@@ -144,6 +146,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
     builderApi: builderApiOpts,
+    assumedIdentity,
     reveal: {
       cutoffBps: args["reveal.cutoffBps"],
       adversarialWithholdExecutionPayload: args["adversarial.withhold.executionPayload"],
@@ -168,4 +171,23 @@ function getBuilderApiAuthData(args: IBuilderCliArgs): Uint8Array {
     return new TextEncoder().encode(new URL(args["builderApi.publicUrl"]).hostname);
   }
   throw new YargsError("--builderApi requires either --builderApi.publicUrl or --builderApi.authData");
+}
+
+function parseAssumedIdentity(
+  index: number | undefined,
+  balanceGwei: number | undefined
+): {index: number; balanceGwei: number} | undefined {
+  if (index === undefined && balanceGwei === undefined) {
+    return undefined;
+  }
+  if (index === undefined || balanceGwei === undefined) {
+    throw new YargsError("assumeBuilderIndex and assumeBuilderBalanceGwei must be set together");
+  }
+  if (!Number.isInteger(index) || index < 0) {
+    throw new YargsError(`assumeBuilderIndex must be a non-negative integer, got ${index}`);
+  }
+  if (!Number.isInteger(balanceGwei) || balanceGwei <= 0) {
+    throw new YargsError(`assumeBuilderBalanceGwei must be a positive integer, got ${balanceGwei}`);
+  }
+  return {index, balanceGwei};
 }
