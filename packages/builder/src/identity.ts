@@ -10,7 +10,7 @@ import {
   isStatePostGloas,
 } from "@lodestar/state-transition";
 import {BuilderStatus, Slot, getBuilderStatus as getStatusOfBuilder} from "@lodestar/types";
-import {ErrorAborted, Logger, TimeoutError, isErrorAborted, isFetchError, sleep, toHex} from "@lodestar/utils";
+import {ErrorAborted, Logger, TimeoutError, isErrorAborted, isFetchError, retry, sleep, toHex} from "@lodestar/utils";
 
 /**
  * Point within the last slot before the Gloas fork at which the builder registry of the fork is
@@ -42,6 +42,35 @@ export async function resolveBuilderIdentity(
   });
 
   return builderEntry;
+}
+
+/** Additional gossip keys must already be registered; never wait for a deposit during primary startup. */
+export async function resolveGossipBuilderIdentity(
+  api: ApiClient,
+  pubkey: string,
+  signal: AbortSignal
+): Promise<routes.beacon.BuilderResponse> {
+  const response = await retry(
+    async () => {
+      const result = await api.beacon.getStateBuilders(
+        {stateId: "head", builderIds: [pubkey]},
+        {signal, timeoutMs: 2000}
+      );
+      result.assertOk();
+      return result;
+    },
+    {
+      retries: 1,
+      retryDelay: 100,
+      signal,
+      shouldRetry: (error) =>
+        error instanceof ApiError ? error.status >= 500 : error instanceof TimeoutError || isFetchError(error),
+    }
+  );
+  const entries = response.value();
+  if (entries.length !== 1 || toHex(entries[0].builder.pubkey) !== pubkey) throw Error("GOSSIP_BUILDER_NOT_REGISTERED");
+  if (entries[0].builder.version !== PAYLOAD_BUILDER_VERSION) throw Error("GOSSIP_BUILDER_VERSION_MISMATCH");
+  return entries[0];
 }
 
 export async function getBuilderStatus(

@@ -42,6 +42,7 @@ export class BuilderStatusTracker {
       this.status = builderStatus.status;
       this.balanceGwei = builderStatus.balance;
       this.logger.info("Builder status", {
+        builderIndex: this.index,
         status: builderStatus.status,
         balance: prettyGweiToEth(builderStatus.balance),
         epoch: currentEpoch,

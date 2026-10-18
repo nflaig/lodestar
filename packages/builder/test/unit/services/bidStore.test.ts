@@ -1,7 +1,8 @@
-import {describe, expect, it} from "vitest";
+import {afterEach, describe, expect, it, vi} from "vitest";
 import {ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
 import {BidStore} from "../../../src/services/bidStore.js";
+import type {OfferLease} from "../../../src/services/offerEligibility.js";
 
 const parentBlockHash = Buffer.alloc(32, 1);
 const parentBlockRoot = Buffer.alloc(32, 2);
@@ -38,6 +39,57 @@ describe("BidStore", () => {
     expect(store.get(5, toRootHex(otherParentHash), toRootHex(parentBlockRoot))).toBe(otherBid);
   });
 
+  it("notifies only the subscribed context after the bid is retained", () => {
+    const store = new BidStore();
+    const bid = signedBid(5);
+    const notify = vi.fn(() => {
+      expect(store.has(bid)).toBe(true);
+      expect(store.get(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBe(bid);
+    });
+    const unsubscribe = store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), notify);
+    store.add(signedBid(6));
+    store.add(signedBid(5, Buffer.alloc(32, 9)));
+    const otherRoot = signedBid(5);
+    otherRoot.message.parentBlockRoot = Buffer.alloc(32, 9);
+    store.add(otherRoot);
+    expect(notify).not.toHaveBeenCalled();
+    store.add(bid);
+    expect(notify).toHaveBeenCalledOnce();
+    unsubscribe();
+    unsubscribe();
+    store.add(bid);
+    expect(notify).toHaveBeenCalledOnce();
+  });
+
+  it("does not let a stale unsubscribe remove a newer subscription for the same context", () => {
+    const store = new BidStore();
+    const first = store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), () => {});
+    first();
+    const notify = vi.fn();
+    const second = store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), notify);
+    first();
+    store.add(signedBid(5));
+    expect(notify).toHaveBeenCalledOnce();
+    second();
+  });
+
+  it("does not let a broken stream subscriber prevent durable bid publication", () => {
+    const store = new BidStore();
+    const broken = vi.fn(() => {
+      throw Error("closed stream");
+    });
+    const healthy = vi.fn();
+    store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), broken);
+    store.subscribe(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot), healthy);
+    const bid = signedBid(5);
+    expect(() => store.add(bid)).not.toThrow();
+    expect(store.has(bid)).toBe(true);
+    expect(healthy).toHaveBeenCalledOnce();
+    store.add(bid);
+    expect(broken).toHaveBeenCalledOnce();
+    expect(healthy).toHaveBeenCalledTimes(2);
+  });
+
   it("prunes bids two slots after their slot", () => {
     const store = new BidStore();
     store.add(signedBid(5));
@@ -47,5 +99,75 @@ describe("BidStore", () => {
 
     store.prune(8);
     expect(store.get(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBeNull();
+  });
+});
+
+describe("offer generations", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("withdraws a cancelled generation but retains its signed reveal commitment", () => {
+    vi.spyOn(performance, "now").mockReturnValue(100);
+    const store = new BidStore();
+    const lease: OfferLease = {generation: "0x0", validUntil: 350, validUntilUnixMs: Infinity, ready: true};
+    const old = signedBid(5);
+    old.message.value = 100;
+    store.add(old, {generation: "0x0", lease});
+    expect(store.canOffer(old)).toBe(true);
+    lease.generation = "0x1";
+    lease.ready = false;
+    expect(store.get(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBeNull();
+    expect(store.has(old)).toBe(true);
+    const replacement = signedBid(5);
+    replacement.message.value = 10;
+    replacement.message.blockHash = Buffer.alloc(32, 8);
+    lease.ready = true;
+    store.add(replacement, {generation: "0x1", lease});
+    expect(store.get(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBe(replacement);
+    expect(store.canOffer(old)).toBe(false);
+    expect(store.has(old)).toBe(true);
+    // A slow stale signing/retention completion must not displace the new bid.
+    store.add(old, {generation: "0x0", lease});
+    expect(store.get(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBe(replacement);
+  });
+
+  it("expires offers on a stopped constructor and allows only a current heartbeat to renew", () => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(100);
+    const store = new BidStore();
+    const lease: OfferLease = {generation: "0x0", validUntil: 350, validUntilUnixMs: Infinity, ready: true};
+    const bid = signedBid(5);
+    store.add(bid, {generation: "0x0", lease});
+    now.mockReturnValue(350);
+    expect(store.canOffer(bid)).toBe(false);
+    expect(store.has(bid)).toBe(true);
+    lease.validUntil = 600;
+    expect(store.canOffer(bid)).toBe(true);
+    lease.generation = "0x1";
+    expect(store.canOffer(bid)).toBe(false);
+    store.prune(8);
+    expect(store.has(bid)).toBe(false);
+  });
+
+  it("recovers reveal obligations without restoring volatile offer permission", () => {
+    const store = new BidStore();
+    const bid = signedBid(5);
+    store.add(bid, "recovery");
+    expect(store.has(bid)).toBe(true);
+    expect(store.canOffer(bid)).toBe(false);
+    expect(store.get(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBeNull();
+    store.add(bid);
+    expect(store.canOffer(bid)).toBe(true);
+  });
+
+  it("expires across host suspend even if the monotonic clock does not advance", () => {
+    vi.spyOn(performance, "now").mockReturnValue(100);
+    const wall = vi.spyOn(Date, "now").mockReturnValue(1000);
+    const store = new BidStore();
+    const lease: OfferLease = {generation: "0x0", validUntil: 350, validUntilUnixMs: 1250, ready: true};
+    const bid = signedBid(5);
+    store.add(bid, {generation: "0x0", lease});
+    expect(store.canOffer(bid)).toBe(true);
+    wall.mockReturnValue(1300);
+    expect(store.canOffer(bid)).toBe(false);
+    expect(store.has(bid)).toBe(true);
   });
 });

@@ -52,6 +52,7 @@ export class Revealer {
         const {builderIndex, value} = observed.signedBid.message;
         logger.info("Execution payload bid not selected", {
           slot,
+          builderIndex: this.modules.builderIndex,
           blockRoot,
           value: prettyGweiToEth(Math.max(...bids.map((bid) => bid.valueGwei))),
           selectedBuilderIndex: builderIndex === BUILDER_INDEX_SELF_BUILD ? "self-build" : builderIndex,
@@ -63,7 +64,7 @@ export class Revealer {
     metrics?.bids.won.inc();
 
     const {blockHash} = selection.bid;
-    const logCtx = {slot, blockRoot, blockHash};
+    const logCtx = {slot, blockRoot, blockHash, builderIndex: this.modules.builderIndex};
     logger.info("Execution payload bid selected", {...logCtx, value: prettyGweiToEth(selection.bid.valueGwei)});
 
     const storedPayload = payloadStore.get(blockHash);
