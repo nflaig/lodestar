@@ -1,6 +1,6 @@
 import {ErrorAborted, LodestarError, TimeoutError, retry, sleep, withTimeout} from "@lodestar/utils";
 import {PayloadSourceNotReady} from "./offerEligibility.js";
-import type {BuildHandle, BuildRequest, BuiltPayload, PayloadSource} from "./payloadSource.js";
+import type {BuildHandle, BuildRequest, BuiltPayload, PayloadSource, PayloadSourceResources} from "./payloadSource.js";
 
 const PREPARE_RETRY_DELAY = 100;
 
@@ -22,6 +22,7 @@ export enum PayloadOrchestratorErrorCode {
   PREPARE_TIMEOUT = "PAYLOAD_ORCHESTRATOR_ERROR_PREPARE_TIMEOUT",
   GET_PAYLOAD_TIMEOUT = "PAYLOAD_ORCHESTRATOR_ERROR_GET_PAYLOAD_TIMEOUT",
   LEASED_PAYLOAD_REQUIRES_UPDATES = "PAYLOAD_ORCHESTRATOR_ERROR_LEASED_PAYLOAD_REQUIRES_UPDATES",
+  ALTERNATE_SOURCE_UNSUPPORTED = "PAYLOAD_ORCHESTRATOR_ERROR_ALTERNATE_SOURCE_UNSUPPORTED",
 }
 
 export type PayloadOrchestratorErrorType =
@@ -38,7 +39,8 @@ export type PayloadOrchestratorErrorType =
   | {
       code:
         | PayloadOrchestratorErrorCode.GET_PAYLOAD_TIMEOUT
-        | PayloadOrchestratorErrorCode.LEASED_PAYLOAD_REQUIRES_UPDATES;
+        | PayloadOrchestratorErrorCode.LEASED_PAYLOAD_REQUIRES_UPDATES
+        | PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED;
       jobId: string;
     };
 
@@ -51,6 +53,7 @@ export class PayloadOrchestratorError extends LodestarError<PayloadOrchestratorE
 export class PayloadOrchestrator {
   private readonly jobs = new Map<string, Promise<BuiltPayload>>();
   private readonly updateJobs = new Map<string, Promise<void>>();
+  private readonly snapshotJobs = new Map<string, Promise<void>>();
 
   constructor(
     private readonly source: PayloadSource,
@@ -62,6 +65,18 @@ export class PayloadOrchestrator {
     return this.source.supportsUpdates === true;
   }
 
+  get supportsBoundedAlternates(): boolean {
+    return this.source.supportsBoundedAlternates === true;
+  }
+
+  getResources(): PayloadSourceResources | undefined {
+    return this.source.getResources?.();
+  }
+
+  async reconcileResources(signal: AbortSignal = this.signal): Promise<void> {
+    await this.source.reconcileResources?.(AbortSignal.any([this.signal, signal]));
+  }
+
   run(job: PayloadBuildJob, signal: AbortSignal = this.signal): Promise<BuiltPayload> {
     const {id} = job;
     let promise = this.jobs.get(id);
@@ -70,6 +85,48 @@ export class PayloadOrchestrator {
       this.jobs.set(id, promise);
     }
     return promise;
+  }
+
+  /** Deliver one unleased alternate before its separately accounted cleanup finishes. */
+  runSnapshot(
+    job: PayloadBuildJob,
+    onPayload: (payload: BuiltPayload) => Promise<void>,
+    signal: AbortSignal = this.signal
+  ): Promise<void> {
+    let promise = this.snapshotJobs.get(job.id);
+    if (promise === undefined) {
+      promise = this.runSnapshotJob(job, onPayload, AbortSignal.any([this.signal, signal])).finally(() =>
+        this.snapshotJobs.delete(job.id)
+      );
+      this.snapshotJobs.set(job.id, promise);
+    }
+    return promise;
+  }
+
+  private async runSnapshotJob(
+    job: PayloadBuildJob,
+    onPayload: (payload: BuiltPayload) => Promise<void>,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (!job.request.requireUnleased || !this.supportsBoundedAlternates)
+      throw new PayloadOrchestratorError({
+        code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED,
+        jobId: job.id,
+      });
+    const handle = await this.prepare(job, signal);
+    try {
+      await sleep(job.getPayloadAt - Date.now(), signal);
+      const payload = await this.retrieve(job.id, handle, signal);
+      signal.throwIfAborted();
+      if (payload.offerEligibility)
+        throw new PayloadOrchestratorError({
+          code: PayloadOrchestratorErrorCode.LEASED_PAYLOAD_REQUIRES_UPDATES,
+          jobId: job.id,
+        });
+      await onPayload(payload);
+    } finally {
+      await this.release(handle);
+    }
   }
 
   /** Poll ready snapshots until the cutoff. A callback completes before the next poll. */
@@ -163,6 +220,8 @@ export class PayloadOrchestrator {
   }
 
   private async prepare({id, request, getPayloadAt}: PayloadBuildJob, signal: AbortSignal): Promise<BuildHandle> {
+    if (request.requireUnleased && !this.supportsBoundedAlternates)
+      throw new PayloadOrchestratorError({code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED, jobId: id});
     const prepareTimeout = getPayloadAt - Date.now();
     if (!(prepareTimeout > 0)) {
       throw new PayloadOrchestratorError(
@@ -184,7 +243,7 @@ export class PayloadOrchestrator {
             return handle;
           },
           {
-            retries: Infinity,
+            retries: request.requireUnleased ? 0 : Infinity,
             retryDelay: PREPARE_RETRY_DELAY,
             onRetry: (error) => {
               lastError = error;
@@ -228,8 +287,10 @@ export class PayloadOrchestrator {
     // also expire abandoned handles if transport fails during release.
     const release = this.source.release;
     if (!release) return;
-    await withTimeout((signal = AbortSignal.timeout(1000)) => release.call(this.source, handle, signal), 1000).catch(
-      () => {}
-    );
+    const timeout = this.supportsBoundedAlternates ? 6000 : 1000;
+    await withTimeout(
+      (signal = AbortSignal.timeout(timeout)) => release.call(this.source, handle, signal),
+      timeout
+    ).catch(() => {});
   }
 }

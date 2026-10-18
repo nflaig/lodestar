@@ -79,6 +79,10 @@ export class AsyncCommitmentJournal {
     return this.enqueue({kind: "retain", bid, stored}, bytes);
   }
 
+  canRetainAlternate(): boolean {
+    return this.initialized && !this.failure && !this.closing && !this.active && this.queue.length === 0;
+  }
+
   retainReveal(record: RevealRecord): Promise<void> {
     return this.enqueue({kind: "reveal", record}, 1024);
   }

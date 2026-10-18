@@ -15,6 +15,7 @@ export {
   EnginePayloadSource,
   type PayloadSource,
   type PayloadSourceEngine,
+  type PayloadSourceResources,
 } from "./services/payloadSource.js";
 export {
   MAX_ADDITIONAL_PROPOSER_PREFERENCES_SOURCES,

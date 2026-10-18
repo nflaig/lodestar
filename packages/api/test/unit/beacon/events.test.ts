@@ -120,3 +120,51 @@ describe("beacon / events / payload_attributes codec", () => {
     expect(payloadAttributesType.fromJson(json)).toEqual(event);
   });
 });
+
+describe("beacon / events / payload_attributes_alternate codec", () => {
+  const type = getTypeByEvent(createChainForkConfig(defaultChainConfig))[EventType.payloadAttributesAlternate];
+
+  it("preserves the existing Gloas payload attributes schema and both parents", () => {
+    const event: EventData[EventType.payloadAttributesAlternate] = {
+      version: ForkName.gloas,
+      data: {
+        ...ssz.gloas.SSEPayloadAttributes.defaultValue(),
+        parentBlockRoot: new Uint8Array(32).fill(1),
+        parentBlockHash: new Uint8Array(32).fill(2),
+      },
+      dependentRoot: new Uint8Array(32).fill(3),
+      builders: [
+        {index: 0, pubkey: new Uint8Array(48).fill(4), version: 1, active: true, availableGwei: 1_000_000_000},
+      ],
+    };
+    expect(type.fromJson(type.toJson(event))).toEqual(event);
+    const primary = getTypeByEvent(createChainForkConfig(defaultChainConfig))[EventType.payloadAttributes];
+    expect(type.toJson(event)).toMatchObject(primary.toJson(event) as Record<string, unknown>);
+    expect(type.toJson(event)).toHaveProperty("builders", [
+      {index: "0", pubkey: `0x${"04".repeat(48)}`, version: "1", active: true, available_gwei: "1000000000"},
+    ]);
+  });
+
+  it("requires metadata and bounds its registry entries", () => {
+    const event: EventData[EventType.payloadAttributesAlternate] = {
+      version: ForkName.gloas,
+      data: ssz.gloas.SSEPayloadAttributes.defaultValue(),
+      dependentRoot: new Uint8Array(32),
+      builders: [],
+    };
+    const json = type.toJson(event) as Record<string, unknown>;
+    expect(() => type.fromJson({...json, dependent_root: undefined})).toThrow();
+    expect(() => type.fromJson({...json, builders: undefined})).toThrow();
+    const one = {index: "0", pubkey: `0x${"04".repeat(48)}`, version: "1", active: true, available_gwei: "1"};
+    expect(() => type.fromJson({...json, builders: Array.from({length: 17}, () => one)})).toThrow();
+  });
+
+  it("rejects a pre-Gloas alternate envelope", () => {
+    expect(() =>
+      type.fromJson({
+        version: ForkName.fulu,
+        data: ssz.fulu.SSEPayloadAttributes.toJson(ssz.fulu.SSEPayloadAttributes.defaultValue()),
+      })
+    ).toThrow();
+  });
+});

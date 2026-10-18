@@ -273,6 +273,12 @@ export const eventTestData: EventData = {
       },
     }),
   },
+  [EventType.payloadAttributesAlternate]: {
+    version: ForkName.gloas,
+    data: ssz.gloas.SSEPayloadAttributes.defaultValue(),
+    dependentRoot: new Uint8Array(32),
+    builders: [],
+  },
   [EventType.blobSidecar]: blobSidecarSSE.fromJson({
     block_root: "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2",
     index: "1",

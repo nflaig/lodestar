@@ -110,6 +110,46 @@ using the best ready bid at `bidding.deadlineBps` in the preceding slot. API pol
 continues until `updateCutoffBps` of the proposal slot; 1000 is 1.2 seconds into a
 12-second slot. Parent changes cancel construction without deleting old commitments.
 
+## Experimental alternate parent bids
+
+The builder can retain an API and stream bid for additional parent tuples using the
+same builder identity. Enable this on the beacon node:
+
+```sh
+--chain.emitPayloadAttributes true \
+--chain.emitPayloadAttributesAlternates true \
+--chain.payloadAttributesAlternateBuilderIndices 0
+```
+
+Replace `0` with the primary builder's registered index. On the builder, keep session
+updates enabled and add `--bidding.alternateBranches true`. The constructor must
+support `zbuilder_beginAlternateV1(parentHash, payloadAttributes, extraData?)`, returning
+`{sessionId, orderGenerationVersion: 0, alternateSessionVersion: 1}`. This method rejects
+renewable order-generation leases before allocating a session. Older constructors
+cannot silently accept this request as ordinary session work.
+
+The separate `payload_attributes_alternate` event covers the current beacon head and
+its direct parent, each with available FULL and EMPTY variants. EMPTY excludes the
+parent execution payload; the new block can still contain transactions. Each context
+uses its own prepared state, withdrawals and execution requests. The event includes
+the proposer dependent root and branch-specific identity/collateral metadata for at
+most 16 configured builder indices. A differing proposer or dependent root, a missing
+cached state, or missing/ineligible builder metadata causes that alternate to be skipped.
+
+Alternates start only after an unleased primary snapshot is retained. One spare native
+worker produces one alternate snapshot at a time, with at most four attempts per slot.
+`--bidding.alternateBuildDurationMs` defaults to 500 ms and accepts 250 through 1000 ms.
+Construction stops for a new primary and does not start near scheduled gossip or too
+late to finish before the slot. Cleanup continues to occupy capacity until the native
+constructor confirms it; an unknown allocation outcome disables further alternates.
+Half of the revision, payload-byte and payload-count admission limits remains reserved
+for primary work. Alternates enter the durable journal only while it is idle.
+
+This initial mode publishes alternate bids through HTTP and WebSocket only. Primary
+and staged gossip behavior is unchanged. Previously advertised payloads remain retained
+for reveal when a new primary replaces their branch. The work limits can omit contexts;
+enabling this option does not guarantee a bid for every possible parent.
+
 The default update interval is zero, retaining one retrieval at the usual deadline.
 Positive intervals require this constructor source and must be at least 25 ms. This
 source cannot be combined with the controlled transaction-file source or its capture

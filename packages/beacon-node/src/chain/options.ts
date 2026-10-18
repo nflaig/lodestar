@@ -80,6 +80,10 @@ export type BlockProcessOpts = {
    * execution payload import. Requires `emitPayloadAttributes`. The regular emission before the slot still runs.
    */
   emitPayloadAttributesEarly?: boolean;
+  /** Emit bounded Gloas head/parent FULL/EMPTY alternatives after authoritative payload attributes. */
+  emitPayloadAttributesAlternates?: boolean;
+  /** Builder indices whose collateral is reported for each prepared alternate, at most 16. */
+  payloadAttributesAlternateBuilderIndices?: number[];
 
   /**
    * Used to specify to specify to run verifications only and not
@@ -123,6 +127,8 @@ export const defaultChainOptions: IChainOptions = {
   pruneHistory: false,
   emitPayloadAttributes: false,
   emitPayloadAttributesEarly: false,
+  emitPayloadAttributesAlternates: false,
+  payloadAttributesAlternateBuilderIndices: [],
   // for gossip block validation, it's unlikely we see a reorg with 32 slots
   // for attestation validation, having this value ensures we don't have to regen states most of the time
   maxSkipSlots: 32,

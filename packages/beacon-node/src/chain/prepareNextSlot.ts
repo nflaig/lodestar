@@ -27,7 +27,7 @@ import {
   isStatePostFulu,
   isStatePostGloas,
 } from "@lodestar/state-transition";
-import {Bytes32, RootHex, Slot, ValidatorIndex} from "@lodestar/types";
+import {Bytes32, RootHex, SSEPayloadAttributes, Slot, ValidatorIndex} from "@lodestar/types";
 import {Logger, fromHex, isErrorAborted, sleep, toRootHex} from "@lodestar/utils";
 import {GENESIS_SLOT} from "../constants/constants.js";
 import {BuilderStatus} from "../execution/builder/http.js";
@@ -37,6 +37,7 @@ import {ClockEvent} from "../util/clock.js";
 import {isQueueErrorAborted} from "../util/queue/index.js";
 import {ForkchoiceCaller} from "./forkChoice/index.js";
 import {IBeaconChain} from "./interface.js";
+import {PayloadAttributesAlternates} from "./payloadAttributesAlternates.js";
 import {getPayloadAttributesForSSE, prepareExecutionPayload} from "./produceBlock/produceBlockBody.js";
 import {RegenCaller} from "./regen/index.js";
 
@@ -60,11 +61,15 @@ const BUILDER_PREVERIFY_LIMIT_BPS = 2000;
  */
 const BUILDER_STATUS_CHECK_BEFORE_SLOT_BPS = 1667;
 
+// Give the current block time to arrive before preparing on the previous head (2s for 12s slots).
+const EARLY_PAYLOAD_ATTRIBUTES_FALLBACK_BPS = 1667;
+
 type EarlyPayloadAttributesTrigger = {
   clockSlot: Slot;
   blockRoot: RootHex;
   /** Payload import adds the FULL variant without recomputing the head, unlike block import */
   recomputeHead: boolean;
+  missedSlot?: boolean;
 };
 
 type EmittedPayloadAttributes = {prepareSlot: Slot; parentBlockRoot: RootHex; parentBlockHash: RootHex};
@@ -84,6 +89,8 @@ export class PrepareNextSlotScheduler {
   private lastEmittedPayloadAttributes: EmittedPayloadAttributes | null = null;
   private earlyTrigger: EarlyPayloadAttributesTrigger | null = null;
   private earlyRunning = false;
+  private earlyFallbackTimeout: ReturnType<typeof setTimeout> | null = null;
+  private readonly alternates?: PayloadAttributesAlternates;
 
   constructor(
     private readonly chain: IBeaconChain,
@@ -92,8 +99,12 @@ export class PrepareNextSlotScheduler {
     private readonly logger: Logger,
     private readonly signal: AbortSignal
   ) {
+    if (this.chain.opts.emitPayloadAttributes === true && this.chain.opts.emitPayloadAttributesAlternates === true) {
+      this.alternates = new PayloadAttributesAlternates(chain, config, logger, signal);
+    }
     this.chain.clock.on(ClockEvent.slot, this.prepareForNextSlot);
     if (this.chain.opts.emitPayloadAttributes === true && this.chain.opts.emitPayloadAttributesEarly === true) {
+      this.chain.clock.on(ClockEvent.slot, this.onEarlyFallbackSlot);
       this.chain.emitter.on(routes.events.EventType.block, this.onBlockImported);
       this.chain.emitter.on(routes.events.EventType.executionPayload, this.onExecutionPayloadImported);
     }
@@ -101,6 +112,11 @@ export class PrepareNextSlotScheduler {
       "abort",
       () => {
         this.chain.clock.off(ClockEvent.slot, this.prepareForNextSlot);
+        this.chain.clock.off(ClockEvent.slot, this.onEarlyFallbackSlot);
+        if (this.earlyFallbackTimeout !== null) {
+          clearTimeout(this.earlyFallbackTimeout);
+          this.earlyFallbackTimeout = null;
+        }
         this.chain.emitter.off(routes.events.EventType.block, this.onBlockImported);
         this.chain.emitter.off(routes.events.EventType.executionPayload, this.onExecutionPayloadImported);
       },
@@ -274,13 +290,14 @@ export class PrepareNextSlotScheduler {
         const finalizedBlockHash = getFinalizedExecutionBlockHash(this.chain.forkChoice);
 
         let payloadAttributes: PayloadAttributes | undefined;
+        let primaryAttributes: SSEPayloadAttributes | undefined;
         // If emitPayloadAttributes is true emit a SSE payloadAttributes event for
         // every slot. Without the flag, only emit the event if we are proposing in the next slot.
         if (
           (feeRecipient || this.chain.opts.emitPayloadAttributes === true) &&
           this.chain.emitter.listenerCount(routes.events.EventType.payloadAttributes)
         ) {
-          payloadAttributes = this.emitPayloadAttributes(fork as ForkPostBellatrix, {
+          primaryAttributes = this.emitPayloadAttributes(fork as ForkPostBellatrix, {
             prepareSlot,
             parentBlock: updatedHead,
             parentBlockHash,
@@ -289,6 +306,7 @@ export class PrepareNextSlotScheduler {
             finalizedBlockHash,
             feeRecipient,
           });
+          payloadAttributes = primaryAttributes.payloadAttributes;
         }
 
         if (feeRecipient) {
@@ -318,6 +336,15 @@ export class PrepareNextSlotScheduler {
           });
         }
 
+        if (primaryAttributes !== undefined) {
+          this.alternates?.request({
+            clockSlot,
+            headRoot,
+            primaryParent: updatedHead,
+            primary: primaryAttributes,
+            preparedState,
+          });
+        }
         this.computeStateHashTreeRoot(preparedState, isEpochTransition);
       } else {
         // Pre-bellatrix only reaches here at an epoch transition to precompute the next epoch state
@@ -448,7 +475,7 @@ export class PrepareNextSlotScheduler {
       finalizedBlockHash: RootHex;
       feeRecipient: string | undefined;
     }
-  ): PayloadAttributes {
+  ): SSEPayloadAttributes {
     const data = getPayloadAttributesForSSE(fork, this.chain, {
       prepareState,
       prepareSlot,
@@ -464,7 +491,7 @@ export class PrepareNextSlotScheduler {
       parentBlockRoot: parentBlock.blockRoot,
       parentBlockHash: toRootHex(parentBlockHash),
     };
-    return data.payloadAttributes;
+    return data;
   }
 
   private onBlockImported = ({slot, block}: routes.events.EventData[routes.events.EventType.block]): void => {
@@ -478,8 +505,41 @@ export class PrepareNextSlotScheduler {
     this.requestEarlyPayloadAttributes({clockSlot: slot, blockRoot, recomputeHead: true});
   };
 
+  private onEarlyFallbackSlot = (clockSlot: Slot): void => {
+    if (this.earlyFallbackTimeout !== null) {
+      clearTimeout(this.earlyFallbackTimeout);
+      this.earlyFallbackTimeout = null;
+    }
+    if (
+      !isForkPostGloas(this.config.getForkName(clockSlot + 1)) ||
+      computeEpochAtSlot(clockSlot + 1) !== computeEpochAtSlot(clockSlot) ||
+      this.signal.aborted ||
+      this.chain.opts.emitPayloadAttributes !== true ||
+      this.chain.opts.emitPayloadAttributesEarly !== true
+    ) {
+      return;
+    }
+
+    const grace = this.config.getSlotComponentDurationMs(EARLY_PAYLOAD_ATTRIBUTES_FALLBACK_BPS);
+    const elapsed = this.chain.clock.msFromSlot(clockSlot);
+    // currentSlot can recursively emit catch-up events. Only read it after slot dispatch completes.
+    if (elapsed < 0 || elapsed >= grace) return;
+    this.earlyFallbackTimeout = setTimeout(() => {
+      this.earlyFallbackTimeout = null;
+      if (!this.canEmitEarlyPayloadAttributes(clockSlot)) {
+        return;
+      }
+      const head = this.chain.forkChoice.getHead();
+      // Do not compete with imports or move checkpoint regeneration ahead of the regular run.
+      if (head.slot >= clockSlot || computeEpochAtSlot(head.slot) !== computeEpochAtSlot(clockSlot)) {
+        return;
+      }
+      this.requestEarlyPayloadAttributes({clockSlot, blockRoot: head.blockRoot, recomputeHead: true, missedSlot: true});
+    }, grace - elapsed);
+  };
+
   /**
-   * Import events for the current slot coalesce into at most one running and one pending early
+   * Import events and the missed-slot fallback coalesce into at most one running and one pending early
    * emission. The pending trigger keeps the latest block root and any requested head recompute.
    */
   private requestEarlyPayloadAttributes(trigger: EarlyPayloadAttributesTrigger): void {
@@ -529,6 +589,7 @@ export class PrepareNextSlotScheduler {
     clockSlot,
     blockRoot,
     recomputeHead,
+    missedSlot = false,
   }: EarlyPayloadAttributesTrigger): Promise<void> {
     const prepareSlot = clockSlot + 1;
     const fork = this.config.getForkName(prepareSlot);
@@ -540,13 +601,18 @@ export class PrepareNextSlotScheduler {
       return;
     }
 
-    if (this.chain.forkChoice.getHead().blockRoot !== blockRoot) {
+    if (!missedSlot && this.chain.forkChoice.getHead().blockRoot !== blockRoot) {
       return;
     }
     const head = recomputeHead
       ? this.chain.recomputeForkChoiceHead(ForkchoiceCaller.prepareEarlyPayloadAttributes)
       : this.chain.forkChoice.getHead();
-    if (head.blockRoot !== blockRoot || !isGloasBlock(head) || head.payloadStatus === PayloadStatus.PENDING) {
+    if (
+      (!missedSlot && head.blockRoot !== blockRoot) ||
+      !isGloasBlock(head) ||
+      head.payloadStatus === PayloadStatus.PENDING ||
+      (missedSlot && (head.slot >= clockSlot || computeEpochAtSlot(head.slot) !== computeEpochAtSlot(clockSlot)))
+    ) {
       return;
     }
     const buildOnFull = this.chain.forkChoice.shouldBuildOnFull(head, prepareSlot);
@@ -587,7 +653,7 @@ export class PrepareNextSlotScheduler {
       return;
     }
 
-    this.emitPayloadAttributes(fork, {
+    const primary = this.emitPayloadAttributes(fork, {
       prepareSlot,
       parentBlock: head,
       parentBlockHash,
@@ -599,11 +665,13 @@ export class PrepareNextSlotScheduler {
       finalizedBlockHash: getFinalizedExecutionBlockHash(this.chain.forkChoice),
       feeRecipient: this.chain.beaconProposerCache.get(preparedState.getBeaconProposer(prepareSlot)),
     });
+    this.alternates?.request({clockSlot, headRoot: head.blockRoot, primaryParent: head, primary, preparedState});
     this.logger.verbose("Emitted early payload attributes", {
       prepareSlot,
       parentBlockRoot: head.blockRoot,
       parentBlockHash: toRootHex(parentBlockHash),
       buildOnFull,
+      trigger: missedSlot ? "missedSlot" : "import",
     });
   }
 

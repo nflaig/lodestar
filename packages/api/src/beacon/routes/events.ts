@@ -1,4 +1,4 @@
-import {ContainerType, ListBasicType, ValueOf} from "@chainsafe/ssz";
+import {ContainerType, ListBasicType, ListCompositeType, ValueOf} from "@chainsafe/ssz";
 import {ChainForkConfig} from "@lodestar/config";
 import {ForkName, MAX_BLOB_COMMITMENTS_PER_BLOCK, isForkPostGloas} from "@lodestar/params";
 import {
@@ -27,6 +27,25 @@ import {Endpoint, RouteDefinitions, Schema} from "../../utils/index.js";
 import {VersionType} from "../../utils/metadata.js";
 
 const stringType = new StringType();
+export const MAX_PAYLOAD_ATTRIBUTES_ALTERNATE_BUILDERS = 16;
+const alternateBuilder = new ContainerType(
+  {
+    index: ssz.BuilderIndex,
+    pubkey: ssz.BLSPubkey,
+    version: ssz.Uint8,
+    active: ssz.Boolean,
+    availableGwei: ssz.UintNum64,
+  },
+  {jsonCase: "eth2"}
+);
+const alternateMetadata = new ContainerType(
+  {
+    dependentRoot: ssz.Root,
+    builders: new ListCompositeType(alternateBuilder, MAX_PAYLOAD_ATTRIBUTES_ALTERNATE_BUILDERS),
+  },
+  {jsonCase: "eth2"}
+);
+export type AlternateBuilder = ValueOf<typeof alternateBuilder>;
 export const blobSidecarSSE = new ContainerType(
   {
     blockRoot: stringType,
@@ -141,6 +160,7 @@ export enum EventType {
   lightClientFinalityUpdate = "light_client_finality_update",
   /** Payload attributes for block proposal */
   payloadAttributes = "payload_attributes",
+  payloadAttributesAlternate = "payload_attributes_alternate",
   /** The node has received a valid BlobSidecar (from P2P or API) */
   blobSidecar = "blob_sidecar",
   /** The node has received a valid DataColumnSidecar (from P2P or API) */
@@ -178,6 +198,7 @@ export const eventTypes: {[K in EventType]: K} = {
   [EventType.lightClientOptimisticUpdate]: EventType.lightClientOptimisticUpdate,
   [EventType.lightClientFinalityUpdate]: EventType.lightClientFinalityUpdate,
   [EventType.payloadAttributes]: EventType.payloadAttributes,
+  [EventType.payloadAttributesAlternate]: EventType.payloadAttributesAlternate,
   [EventType.blobSidecar]: EventType.blobSidecar,
   [EventType.dataColumnSidecar]: EventType.dataColumnSidecar,
   [EventType.executionPayload]: EventType.executionPayload,
@@ -234,6 +255,12 @@ export type EventData = {
   [EventType.lightClientOptimisticUpdate]: {version: ForkName; data: LightClientOptimisticUpdate};
   [EventType.lightClientFinalityUpdate]: {version: ForkName; data: LightClientFinalityUpdate};
   [EventType.payloadAttributes]: {version: ForkName; data: SSEPayloadAttributes};
+  [EventType.payloadAttributesAlternate]: {
+    version: ForkName;
+    data: gloas.SSEPayloadAttributes;
+    dependentRoot: Uint8Array;
+    builders: AlternateBuilder[];
+  };
   [EventType.blobSidecar]: BlobSidecarSSE;
   [EventType.dataColumnSidecar]: DataColumnSidecarSSE;
   [EventType.executionPayload]: {
@@ -422,6 +449,17 @@ export function getTypeByEvent(config: ChainForkConfig): {[K in EventType]: Type
 
     [EventType.contributionAndProof]: ssz.altair.SignedContributionAndProof,
     [EventType.payloadAttributes]: WithVersion((fork) => getPostBellatrixForkTypes(fork).SSEPayloadAttributes),
+    [EventType.payloadAttributesAlternate]: {
+      toJson: ({version, data, dependentRoot, builders}) => ({
+        version,
+        data: getPostGloasForkTypes(version).SSEPayloadAttributes.toJson(data),
+        ...(alternateMetadata.toJson({dependentRoot, builders}) as Record<string, unknown>),
+      }),
+      fromJson: (value) => ({
+        ...WithVersion((fork) => getPostGloasForkTypes(fork).SSEPayloadAttributes).fromJson(value),
+        ...alternateMetadata.fromJson(value),
+      }),
+    },
     [EventType.blobSidecar]: blobSidecarSSE,
     [EventType.dataColumnSidecar]: {
       toJson: (data) => {

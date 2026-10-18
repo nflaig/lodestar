@@ -97,7 +97,12 @@ export class BidPublisher {
   }
 
   /** Sign a retained payload and journal the commitment before the API can expose it. */
-  async prepare(bid: gloas.ExecutionPayloadBid): Promise<gloas.SignedExecutionPayloadBid> {
+  async prepare(
+    bid: gloas.ExecutionPayloadBid,
+    revisionLimit = MAX_BID_REVISIONS_PER_SLOT
+  ): Promise<gloas.SignedExecutionPayloadBid> {
+    if (!Number.isSafeInteger(revisionLimit) || revisionLimit < 1 || revisionLimit > MAX_BID_REVISIONS_PER_SLOT)
+      throw new RangeError("Invalid bid revision limit");
     const {config, builderIndex, hasPayload, ledger, signer} = this.modules;
     const fork = config.getForkName(bid.slot);
     if (!isForkPostGloas(fork)) {
@@ -127,12 +132,12 @@ export class BidPublisher {
       );
     }
 
-    ledger.assertCanRecordRevision(identity);
+    ledger.assertCanRecordRevision(identity, revisionLimit);
     for (const slot of this.pendingRevisions.keys()) {
       if (slot + BID_HISTORY_SLOTS < bid.slot) this.pendingRevisions.delete(slot);
     }
     const pending = this.pendingRevisions.get(bid.slot) ?? 0;
-    if (ledger.getRevisionCount(bid.slot) + pending >= MAX_BID_REVISIONS_PER_SLOT)
+    if (ledger.getRevisionCount(bid.slot) + pending >= revisionLimit)
       throw new BidLedgerError({code: BidLedgerErrorCode.REVISION_LIMIT, ...identity});
     this.pendingRevisions.set(bid.slot, pending + 1);
     let persistenceAttempted = false;

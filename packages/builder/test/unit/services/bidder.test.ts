@@ -4,7 +4,7 @@ import {createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName} from "@lodestar/params";
 import {BuilderStatus, ssz} from "@lodestar/types";
-import {toHex, toRootHex} from "@lodestar/utils";
+import {fromHex, toHex, toRootHex} from "@lodestar/utils";
 import {Bidder, type BidderOptions, PayloadAttributesEvent} from "../../../src/services/bidder.js";
 import {BidLedger} from "../../../src/services/bidLedger.js";
 import {BidPublisher} from "../../../src/services/bidPublisher.js";
@@ -395,6 +395,87 @@ describe("Bidder", () => {
     await secondBuild;
     expect(payloadSource.release).toHaveBeenCalledTimes(2);
     expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+  });
+
+  it("currently keeps only the last of four head/parent FULL/EMPTY construction contexts active", async () => {
+    addProposerPreferences();
+    payloadSource.supportsUpdates = true;
+    const {bidder, bidStore} = createBidder(undefined, false, {updateIntervalMs: 100, updateCutoffBps: 1000});
+    const requests = new Map<string, Parameters<typeof payloadSource.prepare>[0]>();
+    payloadSource.prepare.mockImplementation(async (request) => {
+      const payloadId = String(requests.size + 1);
+      requests.set(payloadId, request);
+      return {sourceId: "el", fork: ForkName.gloas, payloadId};
+    });
+    payloadSource.getPayload.mockImplementation(async (handle) => {
+      const request = requests.get(handle.payloadId);
+      if (!request) throw Error("Missing test request");
+      return {
+        ...mockBuiltPayload({
+          slot,
+          parentHash: fromHex(request.forkchoiceState.headBlockHash),
+          prevRandao,
+          blockHash: Buffer.alloc(32, 20 + Number(handle.payloadId)),
+        }),
+        fork: ForkName.gloas,
+      };
+    });
+    const contexts = [
+      {root: parentBlockRoot, hash: Buffer.alloc(32, 16)},
+      {root: parentBlockRoot, hash: parentBlockHash},
+      {root: Buffer.alloc(32, 15), hash: parentBlockHash},
+      {root: Buffer.alloc(32, 15), hash: Buffer.alloc(32, 17)},
+    ];
+    const builds: Promise<void>[] = [];
+    for (const context of contexts) {
+      const event = payloadAttributesEvent();
+      event.data.parentBlockRoot = context.root;
+      event.data.parentBlockHash = context.hash;
+      builds.push(bidder.onPayloadAttributes(event));
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(payloadSource.prepare).toHaveBeenCalledTimes(4);
+    expect(payloadSource.release).toHaveBeenCalledTimes(3);
+    for (const context of contexts) {
+      expect(bidStore.get(slot, toRootHex(context.hash), toRootHex(context.root))).not.toBeNull();
+    }
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+    controller.abort();
+    await Promise.all(builds);
+    expect(payloadSource.release).toHaveBeenCalledTimes(4);
+    expect(payloadStore.size).toBe(4);
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("currently loses unsealed primary work if all four parent contexts arrive together", async () => {
+    addProposerPreferences();
+    payloadSource.supportsUpdates = true;
+    const {bidder, bidStore} = createBidder(undefined, false, {updateIntervalMs: 100, updateCutoffBps: 1000});
+    const contexts = [
+      {root: parentBlockRoot, hash: Buffer.alloc(32, 16)},
+      {root: parentBlockRoot, hash: parentBlockHash},
+      {root: Buffer.alloc(32, 15), hash: parentBlockHash},
+      {root: Buffer.alloc(32, 15), hash: Buffer.alloc(32, 17)},
+    ];
+    payloadSource.getPayload.mockResolvedValue({
+      ...mockBuiltPayload({slot, parentHash: contexts[3].hash, prevRandao}),
+      fork: ForkName.gloas,
+    });
+    const builds = contexts.map(({root, hash}) => {
+      const event = payloadAttributesEvent();
+      event.data.parentBlockRoot = root;
+      event.data.parentBlockHash = hash;
+      return bidder.onPayloadAttributes(event);
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(payloadSource.prepare).toHaveBeenCalledOnce();
+    expect(payloadSource.prepare.mock.calls[0][0].forkchoiceState.headBlockHash).toBe(toRootHex(contexts[3].hash));
+    for (const context of contexts.slice(0, 3)) {
+      expect(bidStore.get(slot, toRootHex(context.hash), toRootHex(context.root))).toBeNull();
+    }
+    controller.abort();
+    await Promise.all(builds);
+    expect(payloadSource.release).toHaveBeenCalledOnce();
   });
 
   it("does not build without proposer preferences", async () => {
