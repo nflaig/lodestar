@@ -8,6 +8,7 @@ import type {
   SSEPayloadAttributes,
 } from "@lodestar/types";
 import {LodestarError} from "@lodestar/utils";
+import type {OfferEligibility} from "./offerEligibility.js";
 
 export type PayloadId = string;
 
@@ -23,6 +24,18 @@ export type BuildRequest = {
   fork: ForkPostGloas;
   forkchoiceState: ForkchoiceState;
   payloadAttributes: PayloadAttributes;
+  /** One-shot alternate work must use a constructor that rejects renewable leases before allocation. */
+  requireUnleased?: boolean;
+};
+
+/** Disjoint physical reservations. A timeout never proves a constructor slot is free. */
+export type PayloadSourceResources = {
+  capacity: 2;
+  preparing: number;
+  active: number;
+  releasing: number;
+  uncertain: number;
+  alternatesDisabled: boolean;
 };
 
 export type BuildHandle = {
@@ -38,6 +51,8 @@ export type BuiltPayload = {
   executionRequests: ExecutionRequests<ForkPostGloas>;
   blobsBundle: BlobsBundle<ForkPostGloas>;
   executionPayloadValue: bigint;
+  /** Optional volatile authorization for new offers. Retention is independent. */
+  offerEligibility?: OfferEligibility;
 };
 
 export type EnginePayloadResult = {
@@ -66,6 +81,10 @@ export interface PayloadSource {
   readonly id: string;
   /** getPayload may return successive immutable snapshots from the same handle. */
   readonly supportsUpdates?: boolean;
+  readonly supportsBoundedAlternates?: boolean;
+  getResources?(): PayloadSourceResources | undefined;
+  /** Retry only recorded end operations; an anonymous timed-out begin cannot be reclaimed by inference. */
+  reconcileResources?(signal: AbortSignal): Promise<void>;
   prepare(request: BuildRequest, signal: AbortSignal): Promise<BuildHandle>;
   getPayload(handle: BuildHandle, signal: AbortSignal): Promise<BuiltPayload>;
   /** Release construction resources without invalidating previously returned payloads. */

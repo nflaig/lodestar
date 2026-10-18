@@ -16,6 +16,28 @@ import {getApiClientStub, mockApiErrorResponse, mockApiResponse} from "../utils/
 const builderIndex = 7;
 
 describe("BidPublisher", () => {
+  it("reserves primary revision headroom across pending and uncertain alternate writes", async () => {
+    const disk = defer<void>();
+    const retainCommitment = vi.fn(() => disk.promise);
+    const {publisher, ledger} = createPublisher({hasPayload: () => true, retainCommitment});
+    const bid = createBid();
+    const first = publisher.prepare(bid, 2);
+    const second = publisher.prepare({...bid, value: 6}, 2);
+    await expect(publisher.prepare({...bid, value: 7}, 2)).rejects.toMatchObject({
+      type: {code: BidLedgerErrorCode.REVISION_LIMIT},
+    });
+    const pending = Promise.allSettled([first, second]);
+    disk.reject(Error("durable acknowledgement lost"));
+    await pending;
+    expect(ledger.getRevisionCount(bid.slot)).toBe(0);
+    await expect(publisher.prepare({...bid, value: 8}, 2)).rejects.toMatchObject({
+      type: {code: BidLedgerErrorCode.REVISION_LIMIT},
+    });
+    retainCommitment.mockResolvedValue(undefined);
+    await publisher.prepare({...bid, value: 9}, 4);
+    expect(ledger.getRevisionCount(bid.slot)).toBe(1);
+  });
+
   it("keeps a pending durable revision ineligible and reserves the concurrent gossip tuple", async () => {
     const disk = defer<void>();
     const {publisher, ledger, api, signer} = createPublisher({
@@ -49,6 +71,23 @@ describe("BidPublisher", () => {
     disk.resolve();
     await expect(result).rejects.toMatchObject({name: "AbortError"});
     expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+  });
+
+  it("retains a signature but does not expose it after cancellation races durable storage", async () => {
+    const disk = defer<void>();
+    const {publisher, api, ledger} = createPublisher({hasPayload: () => true, retainCommitment: () => disk.promise});
+    const lease = {
+      generation: "0x0",
+      ready: true,
+      validUntil: performance.now() + 10000,
+      validUntilUnixMs: Date.now() + 10000,
+    };
+    const result = publisher.publish(createBid(), new AbortController().signal, {generation: "0x0", lease});
+    lease.generation = "0x1";
+    disk.resolve();
+    await expect(result).rejects.toThrow("BID_OFFER_INELIGIBLE");
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+    expect(ledger.getRevisionCount(createBid().slot)).toBe(1);
   });
 
   it("includes pending writes in the revision limit", async () => {

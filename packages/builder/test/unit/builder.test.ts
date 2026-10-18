@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {routes} from "@lodestar/api";
@@ -10,6 +13,7 @@ import {Builder, BuilderModules} from "../../src/builder.js";
 import {AsyncCommitmentJournal} from "../../src/services/asyncCommitmentJournal.js";
 import {BlockObserver, ObservedBlock} from "../../src/services/blockObserver.js";
 import {BuilderSigner} from "../../src/services/builderSigner.js";
+import {BuilderSigningGuard} from "../../src/services/builderSigningGuard.js";
 import {BuilderStatusTracker} from "../../src/services/builderStatusTracker.js";
 import {GossipStage} from "../../src/services/gossipStages.js";
 import {PayloadStore} from "../../src/services/payloadStore.js";
@@ -89,6 +93,38 @@ describe("Builder", () => {
     };
   });
 
+  it.each([false, true])(
+    "routes interleaved primary and alternate contexts through one standard handler (enabled=%s)",
+    async (alternateBranches) => {
+      modules.opts.bidding = {...modules.opts.bidding, alternateBranches};
+      const alternate = vi.spyOn(modules.bidder, "onAlternatePayloadAttributes").mockImplementation(() => {});
+      const attributes = vi.spyOn(modules.bidder, "onPayloadAttributes").mockResolvedValue();
+      const builder = new Builder(modules);
+      const subscription = api.events.eventstream.mock.calls[0][0];
+      expect(subscription.topics).toEqual(topics);
+      const primaryEvent = {version: ForkName.gloas, data: ssz.gloas.SSEPayloadAttributes.defaultValue()};
+      const message: routes.events.AlternatePayloadAttributesEvent = {
+        ...primaryEvent,
+        version: ForkName.gloas,
+        context: {role: "alternate", dependentRoot: Buffer.alloc(32), builders: []},
+      };
+      for (let i = 0; i < 3; i++) {
+        subscription.onEvent({type: EventType.payloadAttributes, message: primaryEvent});
+        subscription.onEvent({type: EventType.payloadAttributes, message});
+      }
+      expect(attributes.mock.calls.map(([event]) => event)).toEqual([
+        primaryEvent,
+        message,
+        primaryEvent,
+        message,
+        primaryEvent,
+        message,
+      ]);
+      expect(alternate).not.toHaveBeenCalled();
+      await builder.close();
+    }
+  );
+
   afterEach(() => {
     controller.abort();
     vi.restoreAllMocks();
@@ -155,6 +191,51 @@ describe("Builder", () => {
       })
     ).rejects.toThrow("GOSSIP_STAGES_REQUIRE_COMMITMENT_DIRECTORY");
     expect(api.events.eventstream).not.toHaveBeenCalled();
+  });
+
+  it("releases signer ownership when initialization fails before serving offers", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "builder-startup-guard-"));
+    try {
+      await expect(
+        Builder.init({
+          ...modules.opts,
+          commitmentDir: directory,
+          payloadSource: {...modules.opts.payloadSource, supportsUpdates: true},
+          bidding: {...biddingOptions, updateIntervalMs: 25},
+          gossipIdentities: [{keypair: modules.opts.keypair, deadlineBps: 9750}],
+        })
+      ).rejects.toThrow("GOSSIP_STAGE_DUPLICATE_IDENTITY");
+      expect(api.events.eventstream).not.toHaveBeenCalled();
+      const next = await BuilderSigningGuard.acquire(directory);
+      await next.close();
+    } finally {
+      fs.rmSync(directory, {recursive: true, force: true});
+    }
+  });
+
+  it("revokes signing at shutdown but keeps ownership until pending journal work drains", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "builder-drain-guard-"));
+    const guard = await BuilderSigningGuard.acquire(directory);
+    modules.signingGuard = guard;
+    modules.journal = Object.create(AsyncCommitmentJournal.prototype) as AsyncCommitmentJournal;
+    const disk = defer<void>();
+    vi.spyOn(modules.journal, "close").mockReturnValue(disk.promise);
+    const builder = new Builder(modules);
+    const closing = builder.close();
+    try {
+      expect(controller.signal.aborted).toBe(true);
+      expect(() => guard.assertActive()).toThrow("BUILDER_SIGNER_OWNERSHIP_RELEASED");
+      await expect(BuilderSigningGuard.acquire(directory)).rejects.toThrow("BUILDER_SIGNER_OWNERSHIP_UNAVAILABLE");
+      disk.resolve();
+      await closing;
+      const next = await BuilderSigningGuard.acquire(directory);
+      await next.close();
+    } finally {
+      disk.resolve();
+      await closing;
+      await guard.close();
+      fs.rmSync(directory, {recursive: true, force: true});
+    }
   });
 
   it("starts one shared stream after the clock and preserves slot pruning", async () => {

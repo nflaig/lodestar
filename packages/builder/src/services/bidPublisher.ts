@@ -9,6 +9,7 @@ import {BidLedgerError, BidLedgerErrorCode} from "./bidLedger.js";
 import type {BuilderSigner} from "./builderSigner.js";
 import {CommitmentJournalError} from "./commitmentJournalError.js";
 import {BID_HISTORY_SLOTS, MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
+import {type OfferEligibility, isOfferEligible} from "./offerEligibility.js";
 
 export type BidPublisherModules = {
   api: ApiClient;
@@ -54,9 +55,21 @@ export class BidPublisher {
   private readonly pendingGossip = new Set<string>();
   constructor(private readonly modules: BidPublisherModules) {}
 
-  publish(bid: heze.ExecutionPayloadBid, signal: AbortSignal): Promise<heze.SignedExecutionPayloadBid>;
-  publish(bid: gloas.ExecutionPayloadBid, signal: AbortSignal): Promise<gloas.SignedExecutionPayloadBid>;
-  async publish(bid: gloas.ExecutionPayloadBid, signal: AbortSignal): Promise<gloas.SignedExecutionPayloadBid> {
+  publish(
+    bid: heze.ExecutionPayloadBid,
+    signal: AbortSignal,
+    eligibility?: OfferEligibility
+  ): Promise<heze.SignedExecutionPayloadBid>;
+  publish(
+    bid: gloas.ExecutionPayloadBid,
+    signal: AbortSignal,
+    eligibility?: OfferEligibility
+  ): Promise<gloas.SignedExecutionPayloadBid>;
+  async publish(
+    bid: gloas.ExecutionPayloadBid,
+    signal: AbortSignal,
+    eligibility?: OfferEligibility
+  ): Promise<gloas.SignedExecutionPayloadBid> {
     signal.throwIfAborted();
     this.modules.ledger.assertCanRecordBid({
       slot: bid.slot,
@@ -73,8 +86,10 @@ export class BidPublisher {
       });
     this.pendingGossip.add(key);
     try {
+      if (!isOfferEligible(eligibility)) throw Error("BID_OFFER_INELIGIBLE");
       const signed = await this.prepare(bid);
-      await this.gossip(signed, signal);
+      if (!isOfferEligible(eligibility)) throw Error("BID_OFFER_INELIGIBLE");
+      await this.gossip(signed, signal, eligibility);
       return signed;
     } finally {
       this.pendingGossip.delete(key);
@@ -82,7 +97,12 @@ export class BidPublisher {
   }
 
   /** Sign a retained payload and journal the commitment before the API can expose it. */
-  async prepare(bid: gloas.ExecutionPayloadBid): Promise<gloas.SignedExecutionPayloadBid> {
+  async prepare(
+    bid: gloas.ExecutionPayloadBid,
+    revisionLimit = MAX_BID_REVISIONS_PER_SLOT
+  ): Promise<gloas.SignedExecutionPayloadBid> {
+    if (!Number.isSafeInteger(revisionLimit) || revisionLimit < 1 || revisionLimit > MAX_BID_REVISIONS_PER_SLOT)
+      throw new RangeError("Invalid bid revision limit");
     const {config, builderIndex, hasPayload, ledger, signer} = this.modules;
     const fork = config.getForkName(bid.slot);
     if (!isForkPostGloas(fork)) {
@@ -112,12 +132,12 @@ export class BidPublisher {
       );
     }
 
-    ledger.assertCanRecordRevision(identity);
+    ledger.assertCanRecordRevision(identity, revisionLimit);
     for (const slot of this.pendingRevisions.keys()) {
       if (slot + BID_HISTORY_SLOTS < bid.slot) this.pendingRevisions.delete(slot);
     }
     const pending = this.pendingRevisions.get(bid.slot) ?? 0;
-    if (ledger.getRevisionCount(bid.slot) + pending >= MAX_BID_REVISIONS_PER_SLOT)
+    if (ledger.getRevisionCount(bid.slot) + pending >= revisionLimit)
       throw new BidLedgerError({code: BidLedgerErrorCode.REVISION_LIMIT, ...identity});
     this.pendingRevisions.set(bid.slot, pending + 1);
     let persistenceAttempted = false;
@@ -151,8 +171,17 @@ export class BidPublisher {
     }
   }
 
-  async gossip(signedExecutionPayloadBid: gloas.SignedExecutionPayloadBid, signal: AbortSignal): Promise<void> {
+  async gossip(
+    signedExecutionPayloadBid: gloas.SignedExecutionPayloadBid,
+    signal: AbortSignal,
+    eligibility?: OfferEligibility
+  ): Promise<void> {
     signal.throwIfAborted();
+    const assertEligible = (): void => {
+      signal.throwIfAborted();
+      if (!isOfferEligible(eligibility)) throw Error("BID_OFFER_INELIGIBLE");
+    };
+    assertEligible();
     const {api, ledger, config, hasPayload, builderIndex} = this.modules;
     const bid = signedExecutionPayloadBid.message;
     const fork = config.getForkName(bid.slot);
@@ -181,7 +210,10 @@ export class BidPublisher {
       signedBidRoot,
     });
 
-    const response = await api.beacon.publishExecutionPayloadBid({signedExecutionPayloadBid}, {signal});
+    const response = await api.beacon.publishExecutionPayloadBid(
+      {signedExecutionPayloadBid},
+      eligibility ? {signal, beforeRequest: assertEligible} : {signal}
+    );
     response.assertOk();
   }
 }
