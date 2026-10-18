@@ -114,7 +114,7 @@ describe("Identity", () => {
       mockGetStateBuildersResponse(index, {status: "pending", pubkey, balance, version})
     );
 
-    await expect(getBuilderStatus(api, logger, index)).resolves.toEqual({status: "pending", balance});
+    await expect(getBuilderStatus(api, logger, index)).resolves.toEqual({index, status: "pending", balance});
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
@@ -240,6 +240,34 @@ describe("Identity", () => {
     await vi.advanceTimersByTimeAsync(clock.msToSlot(1));
     expect((await promise).index).toEqual(index);
     expect(api.beacon.getStateBuilders).toHaveBeenCalledTimes(2);
+  });
+
+  it("assumes the configured identity before the Gloas fork without querying the beacon node", async () => {
+    const forkClock = new ClockMock();
+    forkClock.currentSlot = SLOTS_PER_EPOCH - 1;
+    const forkConfig = createBeaconConfig({...getConfig(ForkName.fulu), GLOAS_FORK_EPOCH: 1}, Buffer.alloc(32));
+    const assumed = await resolveBuilderIdentity(
+      api,
+      logger,
+      pubkeyString,
+      abortController.signal,
+      forkClock,
+      forkConfig,
+      {
+        index: 0,
+        balanceGwei: 10_000_000_000,
+      }
+    );
+    expect(assumed.index).toEqual(0);
+    expect(assumed.status).toEqual("active");
+    expect(assumed.builder.balance).toEqual(10_000_000_000);
+    expect(assumed.builder.version).toEqual(PAYLOAD_BUILDER_VERSION);
+    expect(toHex(assumed.builder.pubkey)).toEqual(pubkeyString);
+    expect(api.beacon.getStateBuilders).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(
+      "Assuming builder identity until the Gloas fork",
+      expect.objectContaining({index: 0, forkSlot: SLOTS_PER_EPOCH})
+    );
   });
 
   it("resolves once the Gloas fork is reached", async () => {

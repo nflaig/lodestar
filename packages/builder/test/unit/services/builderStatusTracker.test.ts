@@ -73,6 +73,39 @@ describe("BuilderStatusTracker", () => {
     expect(logger.info).toHaveBeenCalledWith("Builder status changed", {from: "active", to: "exited", epoch: 1});
   });
 
+  it("confirms an assumed identity by pubkey and keeps tracking", async () => {
+    const pubkey = "0x" + "11".repeat(48);
+    const tracker = new BuilderStatusTracker(api, logger, 0, metrics, {status: "active", balance: 10}, pubkey);
+    api.beacon.getStateBuilders.mockResolvedValue(
+      mockGetStateBuildersResponse(0, {status: "active", balance: 9, pubkey: Buffer.alloc(48, 0x11)})
+    );
+    await tracker.poll(epoch);
+    expect(api.beacon.getStateBuilders).toHaveBeenCalledWith(expect.objectContaining({builderIds: [pubkey]}));
+    expect(tracker.getStatus()).toEqual({status: "active", balance: 9});
+    expect(logger.info).toHaveBeenCalledWith("Assumed builder identity confirmed by the beacon node", {
+      index: 0,
+      epoch,
+    });
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("stops bidding when the registry assigns the pubkey another index than assumed", async () => {
+    const pubkey = "0x" + "11".repeat(48);
+    const tracker = new BuilderStatusTracker(api, logger, 0, metrics, {status: "active", balance: 10}, pubkey);
+    api.beacon.getStateBuilders.mockResolvedValue(
+      mockGetStateBuildersResponse(1, {status: "active", balance: 10, pubkey: Buffer.alloc(48, 0x11)})
+    );
+    await tracker.poll(epoch);
+    expect(tracker.getStatus()).toEqual({status: undefined, balance: undefined});
+    expect(logger.error).toHaveBeenCalledWith("Builder index differs from the assumed one, not bidding", {
+      assumed: 0,
+      actual: 1,
+      epoch,
+    });
+    await tracker.poll(epoch);
+    expect(api.beacon.getStateBuilders).toHaveBeenCalledOnce();
+  });
+
   it("dismisses beacon api 500", async () => {
     await builderStatusTracker.poll(epoch);
     const {status, balance} = builderStatusTracker.getStatus();
