@@ -3,7 +3,7 @@ import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName} from "@lodestar/params";
-import {ssz} from "@lodestar/types";
+import {gloas, ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
 import {BidLedger} from "../../../src/services/bidLedger.js";
 import {ObservedBlock} from "../../../src/services/blockObserver.js";
@@ -63,7 +63,10 @@ describe("Revealer", () => {
   }
 
   /** Block that selected a bid for a payload, optionally recorded as our bid and retained */
-  function selectedBlock({recordBid = true, retainPayload = true} = {}): ObservedBlock {
+  function selectedBlock({
+    recordBid = true,
+    retainPayload = true,
+  } = {}): ObservedBlock & {block: gloas.SignedBeaconBlock} {
     const payload = mockBuiltPayload({slot});
     const block = ssz.gloas.SignedBeaconBlock.defaultValue();
     block.message.slot = slot;
@@ -204,7 +207,7 @@ describe("Revealer", () => {
   it("does not reveal after the cutoff", async () => {
     const observed = selectedBlock();
     vi.spyOn(clock, "msFromSlot").mockReturnValue(
-      config.getSlotComponentDurationMs(config.PAYLOAD_ATTESTATION_DUE_BPS) + 1
+      config.getSlotComponentDurationMs(config.getForkName(slot), config.PAYLOAD_ATTESTATION_DUE_BPS) + 1
     );
 
     await revealer.onBlock(observed);
@@ -231,7 +234,7 @@ describe("Revealer", () => {
     const observed = selectedBlock();
 
     const revealing = revealer.onBlock(observed);
-    await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(8000) - 1);
+    await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(config.getForkName(slot), 8000) - 1);
     expect(api.beacon.publishExecutionPayloadEnvelope).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(1);

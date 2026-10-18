@@ -20,6 +20,11 @@ import {
 } from "@lodestar/types";
 import {toPrintableUrl} from "@lodestar/utils";
 import {Metrics} from "../../metrics/metrics.js";
+import {
+  DEFAULT_BUILDER_BID_DEADLINE_MS,
+  DEFAULT_BUILDER_BID_DELAY_MS,
+  DEFAULT_BUILDER_BID_REQUESTS,
+} from "./apiClient.js";
 import {ValidatorRegistration, ValidatorRegistrationCache} from "./cache.js";
 import {IExecutionBuilder} from "./interface.js";
 
@@ -29,6 +34,14 @@ export type ExecutionBuilderHttpOpts = {
   timeout?: number;
   faultInspectionWindow?: number;
   allowedFaults?: number;
+  /** Post-gloas only, time builders are given to provide a bid once block production starts, in milliseconds */
+  bidDeadline?: number;
+  /** Post-gloas only, delay from the slot start before the first bid request, in milliseconds */
+  bidDelay?: number;
+  /** Post-gloas only, number of consecutive bid requests per proposal */
+  bidRequests?: number;
+  /** Gloas only, use a WebSocket stream for each bid request round */
+  bidStream?: boolean;
 
   // Only required for merge-mock runs, no need to expose it to cli
   issueLocalFcUWithFeeRecipient?: string;
@@ -40,6 +53,10 @@ export const defaultExecutionBuilderHttpOpts: ExecutionBuilderHttpOpts = {
   enabled: false,
   url: "http://localhost:8661",
   timeout: 12000,
+  bidDeadline: DEFAULT_BUILDER_BID_DEADLINE_MS,
+  bidDelay: DEFAULT_BUILDER_BID_DELAY_MS,
+  bidRequests: DEFAULT_BUILDER_BID_REQUESTS,
+  bidStream: false,
 };
 
 export enum BuilderStatus {

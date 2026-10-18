@@ -2,6 +2,10 @@ import os from "node:os";
 import {describe, expect, it} from "vitest";
 import {ArchiveMode, IBeaconNodeOptions} from "@lodestar/beacon-node";
 import {RecursivePartial} from "@lodestar/utils";
+import {
+  options as builderOptions,
+  parseArgs as parseBuilderArgs,
+} from "../../../src/options/beaconNodeOptions/builder.js";
 import {options as chainOptions} from "../../../src/options/beaconNodeOptions/chain.js";
 import {BeaconNodeArgs, parseBeaconNodeArgs} from "../../../src/options/beaconNodeOptions/index.js";
 import {
@@ -12,6 +16,22 @@ import {
 } from "../../../src/options/beaconNodeOptions/network.js";
 
 describe("options / beaconNodeOptions", () => {
+  it("keeps builder bid streaming disabled by default", () => {
+    expect(builderOptions["builder.bidStream"].default).toBe(false);
+    expect(parseBuilderArgs({builder: false}).bidStream).toBe(false);
+  });
+
+  it.each([false, true])("parses bid streaming=%s independently of the legacy builder switch", (bidStream) => {
+    const parsed = parseBuilderArgs({
+      builder: false,
+      "builder.bidStream": bidStream,
+      "builder.bidDeadline": 500,
+      "builder.bidDelay": 100,
+      "builder.bidRequests": 3,
+    });
+    expect(parsed).toMatchObject({enabled: false, bidStream, bidDeadline: 500, bidDelay: 100, bidRequests: 3});
+  });
+
   it("bounds explicit alternate builder identities", () => {
     const coerce = chainOptions["chain.payloadAttributesAlternateBuilderIndices"].coerce;
     if (!coerce) throw Error("Expected builder index parser");
@@ -48,6 +68,7 @@ describe("options / beaconNodeOptions", () => {
       "chain.blsVerifyAllMainThread": true,
       "chain.disableBlsBatchVerify": true,
       "chain.persistProducedBlocks": true,
+      "chain.persistProducedPayloadEnvelopes": true,
       "chain.persistInvalidSszObjects": true,
       "chain.proposerBoost": false,
       "chain.proposerBoostReorg": false,
@@ -82,6 +103,10 @@ describe("options / beaconNodeOptions", () => {
       builder: false,
       "builder.url": "http://localhost:8661",
       "builder.timeout": 12000,
+      "builder.bidDeadline": 500,
+      "builder.bidDelay": 0,
+      "builder.bidRequests": 1,
+      "builder.bidStream": true,
       "builder.faultInspectionWindow": 32,
       "builder.allowedFaults": 8,
 
@@ -152,6 +177,7 @@ describe("options / beaconNodeOptions", () => {
         blsVerifyAllMainThread: true,
         disableBlsBatchVerify: true,
         persistProducedBlocks: true,
+        persistProducedPayloadEnvelopes: true,
         persistInvalidSszObjects: true,
         proposerBoost: false,
         proposerBoostReorg: false,
@@ -174,7 +200,7 @@ describe("options / beaconNodeOptions", () => {
         archiveMode: ArchiveMode.Frequency,
         graffitiAppend: false,
         nHistoricalStatesFileDataStore: true,
-        nativeStateView: false,
+        nativeStateTransition: false,
         maxBlockStates: 100,
         maxCPStateEpochsInMemory: 100,
         maxCPStateEpochsOnDisk: 1000,
@@ -191,6 +217,10 @@ describe("options / beaconNodeOptions", () => {
         enabled: false,
         url: "http://localhost:8661",
         timeout: 12000,
+        bidDeadline: 500,
+        bidDelay: 0,
+        bidRequests: 1,
+        bidStream: true,
         faultInspectionWindow: 32,
         allowedFaults: 8,
       },

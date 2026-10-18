@@ -15,13 +15,38 @@ import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import {GossipStage, getMinGossipBidValue, validateGossipStages} from "./gossipStages.js";
 import {isOfferEligible} from "./offerEligibility.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
-import type {BuiltPayload} from "./payloadSource.js";
+import type {BuiltPayload, PayloadSourceResources} from "./payloadSource.js";
 import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
 import type {ProposerDutiesTracker} from "./proposerDutiesTracker.js";
 import {ProposerPreferencesTracker} from "./proposerPreferencesTracker.js";
 
 const GWEI_TO_WEI = 1_000_000_000n;
 const MAX_ALTERNATE_ATTEMPTS_PER_SLOT = 4;
+const MAX_ALTERNATE_DIAGNOSTICS_PER_SLOT = 16;
+const MAX_ALTERNATE_RECEIVED_DIAGNOSTICS_PER_SLOT = 4;
+const ALTERNATE_RETENTION_BUDGET_MS = 150;
+const ALTERNATE_JOURNAL_RECHECK_MS = 10;
+const ALTERNATE_JOURNAL_RECHECK_HEADROOM_MS = 100;
+
+type AlternateDiagnosticReason =
+  | "received"
+  | "primary_context_unavailable"
+  | "past_slot"
+  | "duplicate_or_queue_full"
+  | "alternate_in_progress"
+  | "primary_not_ready"
+  | "stopping"
+  | "primary_preferences_unavailable"
+  | "source_resources_unavailable"
+  | "source_disabled"
+  | "attempt_limit"
+  | "build_window_closed"
+  | "source_busy"
+  | "journal_busy"
+  | "gossip_headroom"
+  | "queued_context_changed"
+  | "preferences_unavailable"
+  | "builder_ineligible";
 
 type PrimaryBuild = {
   id: string;
@@ -39,7 +64,9 @@ type AlternateBuild = {
   controller: AbortController;
   signal: AbortSignal;
   deadline: number;
+  getPayloadAt: number;
   retentionStarted: boolean;
+  journalRecheckStarted: boolean;
   preemptedBy?: PrimaryBuild;
 };
 
@@ -102,6 +129,9 @@ export class Bidder {
   private alternateBuild: AlternateBuild | undefined;
   private alternateTask: Promise<void> | undefined;
   private alternateWake: ReturnType<typeof setTimeout> | undefined;
+  private alternateDiagnosticSlot = -Infinity;
+  private readonly alternateDiagnostics = new Set<string>();
+  private alternateReceivedDiagnostics = 0;
 
   constructor(
     private readonly modules: BidderModules,
@@ -220,8 +250,11 @@ export class Bidder {
       primary.feeRecipient = feeRecipient;
       signal.throwIfAborted();
 
+      const preparationFork = config.getForkName(slot - 1);
       const msToDeadline =
-        clock.msToSlot(slot) - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(this.opts.deadlineBps);
+        clock.msToSlot(slot) -
+        config.getSlotDurationMs(preparationFork) +
+        config.getSlotComponentDurationMs(preparationFork, this.opts.deadlineBps);
       logger.verbose("Preparing payload build", {...logCtx, msToDeadline, targetGasLimit});
 
       const job: PayloadBuildJob = {
@@ -268,15 +301,21 @@ export class Bidder {
   onAlternatePayloadAttributes(event: AlternatePayloadAttributesEvent): void {
     if (!this.opts.alternateBranches || event.version !== ForkName.gloas) return;
     const data = event.data as gloas.SSEPayloadAttributes;
+    this.logAlternateDiagnostic("received", data);
     const primary = this.primary;
     if (
       !primary ||
       primary.controller.signal.aborted ||
       data.proposalSlot !== primary.slot ||
-      data.proposerIndex !== primary.data.proposerIndex ||
-      data.proposalSlot <= this.modules.clock.getCurrentSlot()
-    )
+      data.proposerIndex !== primary.data.proposerIndex
+    ) {
+      this.logAlternateDiagnostic("primary_context_unavailable", data);
       return;
+    }
+    if (data.proposalSlot <= this.modules.clock.getCurrentSlot()) {
+      this.logAlternateDiagnostic("past_slot", data);
+      return;
+    }
     const id = `${data.proposalSlot}:${toRootHex(data.parentBlockRoot)}:${toRootHex(data.parentBlockHash)}`;
     if (
       id === primary.id ||
@@ -284,10 +323,59 @@ export class Bidder {
       this.alternateQueue.has(id) ||
       this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
       this.modules.bidStore.get(data.proposalSlot, toRootHex(data.parentBlockHash), toRootHex(data.parentBlockRoot))
-    )
+    ) {
+      this.logAlternateDiagnostic("duplicate_or_queue_full", data);
       return;
+    }
     this.alternateQueue.set(id, {event});
     this.tryAlternate();
+  }
+
+  private logAlternateDiagnostic(
+    reason: AlternateDiagnosticReason,
+    data?: gloas.SSEPayloadAttributes,
+    resources?: PayloadSourceResources
+  ): void {
+    try {
+      const localSlot = this.modules.clock.getCurrentSlot();
+      if (localSlot > this.alternateDiagnosticSlot) {
+        this.alternateDiagnosticSlot = localSlot;
+        this.alternateDiagnostics.clear();
+        this.alternateReceivedDiagnostics = 0;
+      }
+      if (this.alternateDiagnostics.size >= MAX_ALTERNATE_DIAGNOSTICS_PER_SLOT) return;
+      if (reason === "received" && this.alternateReceivedDiagnostics >= MAX_ALTERNATE_RECEIVED_DIAGNOSTICS_PER_SLOT)
+        return;
+      const key =
+        reason === "received" && data
+          ? `${reason}:${data.proposalSlot}:${toRootHex(data.parentBlockRoot)}:${toRootHex(data.parentBlockHash)}`
+          : reason;
+      if (this.alternateDiagnostics.has(key)) return;
+      this.alternateDiagnostics.add(key);
+      if (reason === "received") this.alternateReceivedDiagnostics++;
+      const snapshot = resources ?? this.modules.orchestrator.getResources();
+      this.modules.logger.debug("Alternate parent admission", {
+        code: "BUILDER_ALTERNATE_ADMISSION",
+        reason,
+        localSlot,
+        slot: data?.proposalSlot ?? this.primary?.slot,
+        parentBlockRoot: data && toRootHex(data.parentBlockRoot),
+        parentBlockHash: data && toRootHex(data.parentBlockHash),
+        primarySlot: this.primary?.slot,
+        primaryReady: this.primary?.ready ?? false,
+        activeBuilds: this.activeBuilds.size,
+        queueSize: this.alternateQueue.size,
+        attempts: this.primary ? (this.alternateAttempts.get(this.primary.slot)?.length ?? 0) : 0,
+        capacity: snapshot?.capacity,
+        active: snapshot?.active,
+        preparing: snapshot?.preparing,
+        releasing: snapshot?.releasing,
+        uncertain: snapshot?.uncertain,
+        alternatesDisabled: snapshot?.alternatesDisabled,
+      });
+    } catch {
+      // Diagnostic failures must not change admission or session ownership.
+    }
   }
 
   /** One short-lived alternate owns the spare worker, including its confirmed cleanup. */
@@ -311,8 +399,27 @@ export class Bidder {
       resources.alternatesDisabled ||
       (this.alternateAttempts.get(primary.slot)?.length ?? 0) >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
       clock.msToSlot(primary.slot) <= duration + 50
-    )
+    ) {
+      if (this.opts.alternateBranches && this.alternateQueue.size > 0) {
+        const reason: AlternateDiagnosticReason = this.alternateTask
+          ? "alternate_in_progress"
+          : !primary?.ready
+            ? "primary_not_ready"
+            : primary.controller.signal.aborted || this.modules.signal.aborted
+              ? "stopping"
+              : primary.feeRecipient === undefined || primary.dependentRoot === undefined
+                ? "primary_preferences_unavailable"
+                : !resources
+                  ? "source_resources_unavailable"
+                  : resources.alternatesDisabled
+                    ? "source_disabled"
+                    : (this.alternateAttempts.get(primary.slot)?.length ?? 0) >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT
+                      ? "attempt_limit"
+                      : "build_window_closed";
+        this.logAlternateDiagnostic(reason, this.alternateQueue.values().next().value?.event.data, resources);
+      }
       return;
+    }
     const retry = (): void => {
       this.alternateWake = setTimeout(() => this.tryAlternate(), 50);
     };
@@ -322,17 +429,32 @@ export class Bidder {
       resources.preparing + resources.releasing + resources.uncertain !== 0 ||
       this.modules.canRetainAlternate?.() !== true
     ) {
+      this.logAlternateDiagnostic(
+        this.activeBuilds.size !== 1 ||
+          resources.active !== 1 ||
+          resources.preparing + resources.releasing + resources.uncertain !== 0
+          ? "source_busy"
+          : "journal_busy",
+        this.alternateQueue.values().next().value?.event.data,
+        resources
+      );
       retry();
       return;
     }
     // Leave the writer and event loop free around scheduled primary/staged gossip.
     const slotStart = Date.now() + clock.msToSlot(primary.slot);
+    const preparationFork = config.getForkName(primary.slot - 1);
     if (
       [this.opts.deadlineBps, ...(this.modules.gossipStages ?? []).map((stage) => stage.deadlineBps)].some((bps) => {
-        const remaining = slotStart - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(bps) - Date.now();
+        const remaining =
+          slotStart -
+          config.getSlotDurationMs(preparationFork) +
+          config.getSlotComponentDurationMs(preparationFork, bps) -
+          Date.now();
         return remaining >= -50 && remaining <= duration + 50;
       })
     ) {
+      this.logAlternateDiagnostic("gossip_headroom", this.alternateQueue.values().next().value?.event.data, resources);
       retry();
       return;
     }
@@ -345,8 +467,10 @@ export class Bidder {
         toRootHex(event.context.dependentRoot) !== primary.dependentRoot ||
         (retryFor !== undefined && retryFor !== primary) ||
         this.hasRetainedAlternate(event)
-      )
+      ) {
+        this.logAlternateDiagnostic("queued_context_changed", event.data, resources);
         this.alternateQueue.delete(id);
+      }
     }
     const next = this.alternateQueue.entries().next().value;
     if (!next) return;
@@ -359,7 +483,16 @@ export class Bidder {
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, primary.controller.signal, this.modules.signal]);
     const deadline = Date.now() + duration;
-    const alternate: AlternateBuild = {event, primary, controller, signal, deadline, retentionStarted: false};
+    const alternate: AlternateBuild = {
+      event,
+      primary,
+      controller,
+      signal,
+      deadline,
+      getPayloadAt: deadline - Math.min(ALTERNATE_RETENTION_BUDGET_MS, Math.floor(duration / 2)),
+      retentionStarted: false,
+      journalRecheckStarted: false,
+    };
     this.alternateBuild = alternate;
     const timer = setTimeout(() => controller.abort(), duration);
     let preempted = false;
@@ -402,6 +535,7 @@ export class Bidder {
           !replacement.controller.signal.aborted &&
           !this.modules.signal.aborted &&
           !alternate.retentionStarted &&
+          !alternate.journalRecheckStarted &&
           attempts.filter((attemptedId) => attemptedId === id).length === 1 &&
           attempts.length < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
           clock.getCurrentSlot() < primary.slot &&
@@ -428,14 +562,23 @@ export class Bidder {
   }
 
   private async buildAlternate(id: string, alternate: AlternateBuild): Promise<void> {
-    const {primary, event, deadline, signal} = alternate;
+    const {primary, event, deadline, getPayloadAt, signal} = alternate;
     const {data} = event;
     const dependentRoot = toRootHex(event.context.dependentRoot);
     signal.throwIfAborted();
-    if (this.primary !== primary || dependentRoot !== primary.dependentRoot) return;
+    if (this.primary !== primary || dependentRoot !== primary.dependentRoot) {
+      this.logAlternateDiagnostic("queued_context_changed", data);
+      return;
+    }
     const preferences = this.modules.proposerPreferencesTracker.get(data.proposalSlot, dependentRoot);
-    if (!preferences) return;
-    if (this.getAlternateLimit(event, primary) === null) return;
+    if (!preferences) {
+      this.logAlternateDiagnostic("preferences_unavailable", data);
+      return;
+    }
+    if (this.getAlternateLimit(event, primary) === null) {
+      this.logAlternateDiagnostic("builder_ineligible", data);
+      return;
+    }
     await this.modules.orchestrator.runSnapshot(
       {
         id: `alt:${id}`,
@@ -453,11 +596,58 @@ export class Bidder {
             targetGasLimit: preferences.message.targetGasLimit,
           },
         },
-        getPayloadAt: deadline - 50,
+        getPayloadAt,
       },
       async (payload) => {
         signal.throwIfAborted();
         if (this.primary !== primary || payload.offerEligibility) return;
+        if (this.modules.canRetainAlternate?.() !== true) {
+          alternate.journalRecheckStarted = true;
+          const started = performance.now();
+          let outcome = "headroom";
+          try {
+            if (deadline - Date.now() >= ALTERNATE_JOURNAL_RECHECK_MS + ALTERNATE_JOURNAL_RECHECK_HEADROOM_MS) {
+              await sleep(ALTERNATE_JOURNAL_RECHECK_MS, signal);
+              signal.throwIfAborted();
+              const resources = this.modules.orchestrator.getResources();
+              if (this.primary !== primary || dependentRoot !== primary.dependentRoot) outcome = "context_changed";
+              else if (!primary.ready) outcome = "primary_not_ready";
+              else if (!resources) outcome = "source_resources_unavailable";
+              else if (resources.alternatesDisabled) outcome = "source_disabled";
+              else if (resources.uncertain > 0) outcome = "source_uncertain";
+              else if (deadline - Date.now() < ALTERNATE_JOURNAL_RECHECK_HEADROOM_MS) outcome = "headroom";
+              else outcome = this.modules.canRetainAlternate?.() === true ? "idle" : "busy";
+            }
+          } catch (error) {
+            outcome = signal.aborted ? "aborted" : "error";
+            throw error;
+          } finally {
+            try {
+              this.modules.logger.debug("Alternate parent journal recheck", {
+                code: "BUILDER_ALTERNATE_JOURNAL_RECHECK",
+                slot: data.proposalSlot,
+                parentBlockRoot: toRootHex(data.parentBlockRoot),
+                parentBlockHash: toRootHex(data.parentBlockHash),
+                outcome,
+                elapsedMs: performance.now() - started,
+                remainingMs: deadline - Date.now(),
+              });
+            } catch {
+              // Diagnostic failures must not change admission or session ownership.
+            }
+          }
+          if (outcome !== "idle") {
+            this.modules.logger.debug("Skipping alternate parent bid", {
+              slot: data.proposalSlot,
+              parentBlockRoot: toRootHex(data.parentBlockRoot),
+              parentBlockHash: toRootHex(data.parentBlockHash),
+              reason: outcome === "busy" ? "journal_busy" : `journal_recheck_${outcome}`,
+            });
+            return;
+          }
+        }
+        signal.throwIfAborted();
+        if (this.primary !== primary || dependentRoot !== primary.dependentRoot) return;
         const coverableGwei = this.getAlternateLimit(event, primary);
         if (coverableGwei === null) return;
         await this.bidOnPayload(payload, data, preferences.message.feeRecipient, signal, true, this.modules, -1, {
@@ -498,7 +688,9 @@ export class Bidder {
     const parentBlockHash = toRootHex(data.parentBlockHash);
     const parentBlockRoot = toRootHex(data.parentBlockRoot);
     const until =
-      Date.now() + clock.msToSlot(slot) + config.getSlotComponentDurationMs(this.opts.updateCutoffBps ?? 1000);
+      Date.now() +
+      clock.msToSlot(slot) +
+      config.getSlotComponentDurationMs(config.getForkName(slot), this.opts.updateCutoffBps ?? 1000);
     let best: gloas.SignedExecutionPayloadBid | null = null;
     let publication: Promise<void> | undefined;
     let publicationPending = false;
@@ -511,8 +703,11 @@ export class Bidder {
     );
     const stages = this.modules.gossipStages ?? [];
     const slotStart = Date.now() + clock.msToSlot(slot);
+    const preparationFork = config.getForkName(slot - 1);
     const stageTime = (deadlineBps: number): number =>
-      slotStart - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(deadlineBps);
+      slotStart -
+      config.getSlotDurationMs(preparationFork) +
+      config.getSlotComponentDurationMs(preparationFork, deadlineBps);
     const primaryUntil = stages.length ? stageTime(stages[0].deadlineBps) : until;
     const gossipBest = (): void => {
       if (

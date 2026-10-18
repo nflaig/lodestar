@@ -12,7 +12,11 @@ import {
 import {type BuildRequest, PayloadSourceNotReady} from "@lodestar/builder";
 import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {ErrorAborted, FetchError, defer, toHex, toRootHex} from "@lodestar/utils";
+import {ErrorAborted, FetchError, type Logger, defer, sleep, toHex, toRootHex} from "@lodestar/utils";
+import {
+  PayloadOrchestrator,
+  PayloadOrchestratorErrorCode,
+} from "../../../../../builder/src/services/payloadOrchestrator.js";
 import {SessionPayloadErrorCode, SessionPayloadSource} from "../../../../src/cmds/builder/sessionPayloadSource.js";
 
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
@@ -71,9 +75,10 @@ function payloadResponse(request: BuildRequest, transactions = ["0x01aa", "0x02b
 
 describe("SessionPayloadSource", () => {
   const signal = new AbortController().signal;
-  function setup(boundedAlternates = false) {
+  function setup(boundedAlternates = false, beginReservations = false) {
     const rpc = new JsonRpcHttpClient(["http://127.0.0.1:1"]);
     const fetch = vi.spyOn(rpc, "fetch");
+    const warn = vi.fn<Logger["warn"]>();
     const signals: AbortSignal[] = [];
     const source = new SessionPayloadSource(
       "session",
@@ -81,10 +86,831 @@ describe("SessionPayloadSource", () => {
         signals.push(callSignal);
         return rpc;
       },
-      {boundedAlternates}
+      {boundedAlternates, beginReservations, logger: {warn}}
     );
-    return {source, fetch, signals, request: buildRequest()};
+    return {source, fetch, signals, warn, request: buildRequest()};
   }
+
+  describe("reserved begins", () => {
+    const ticket = (counter = 1) => `begin-${"ab".repeat(16)}-${counter}`;
+    const reservation = (counter = 1) => ({reservationId: ticket(counter), beginReservationVersion: 1});
+    const begun = (counter = 1, alternate = false) => ({
+      sessionId: ticket(counter),
+      beginReservationVersion: 1,
+      orderGenerationVersion: 0,
+      alternateSessionVersion: alternate ? 1 : 0,
+    });
+    const released = {released: true, beginReservationVersion: 1};
+
+    it("allows tracked primary cleanup to finish beyond one second without enabling alternates", async () => {
+      const {source, fetch, request, signals} = setup(false, true);
+      fetch
+        .mockResolvedValueOnce(reservation())
+        .mockResolvedValueOnce(begun())
+        .mockResolvedValueOnce(payloadResponse(request))
+        .mockImplementationOnce(async () => {
+          await sleep(1500, signals.at(-1));
+          return released;
+        });
+      const orchestrator = new PayloadOrchestrator(source, {getPayloadTimeout: 1000}, signal);
+      await orchestrator.run({id: "reserved-primary", request, getPayloadAt: Date.now() + 50});
+      expect(source.supportsBoundedAlternates).toBe(false);
+      expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_cancelBeginV1", params: [ticket()]});
+      expect(source.getResources()).toMatchObject({active: 0, uncertain: 0, releasing: 0, alternatesDisabled: false});
+    });
+
+    it("tracks reservations without enabling alternate work", async () => {
+      const {source, fetch, request} = setup(false, true);
+      expect(source.supportsBoundedAlternates).toBe(false);
+      expect(source.getResources()).toMatchObject({capacity: 2, active: 0, uncertain: 0});
+      await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED},
+      });
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it("disables unsupported alternate reservations without losing primary capacity", async () => {
+      const {source, fetch, request, warn} = setup(true, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      await source.prepare(request, signal);
+      fetch.mockRejectedValueOnce(
+        new ErrorJsonRpcResponse(
+          {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "AlternateLeasesUnsupported"}},
+          "zbuilder_reserveBeginV1"
+        )
+      );
+      await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toBeInstanceOf(
+        ErrorJsonRpcResponse
+      );
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 0, preparing: 0, alternatesDisabled: true});
+      expect(warn).toHaveBeenCalledWith(
+        "Constructor alternate admission disabled",
+        expect.objectContaining({reason: "unsupported_alternate_method", method: "zbuilder_reserveBeginV1"})
+      );
+      await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED},
+      });
+      expect(fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("cancels an alternate whose capabilities are unconfirmed before admitting new work", async () => {
+      const {source, fetch, request, warn} = setup(true, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      await source.prepare(request, signal);
+      fetch.mockResolvedValueOnce(reservation(2)).mockResolvedValueOnce(begun(2)).mockResolvedValueOnce(released);
+      await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.INVALID_SESSION},
+      });
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 0, releasing: 0, alternatesDisabled: true});
+      expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_cancelBeginV1", params: [ticket(2)]});
+      expect(warn).toHaveBeenCalledWith(
+        "Constructor alternate admission disabled",
+        expect.objectContaining({reason: "unconfirmed_alternate_capability", method: "zbuilder_beginReservedV1"})
+      );
+    });
+
+    it("rejects an alternate capability on a primary and releases its reservation", async () => {
+      const {source, fetch, request} = setup(false, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun(1, true)).mockResolvedValueOnce(released);
+      await expect(source.prepare(request, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.INVALID_SESSION},
+      });
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({active: 0, uncertain: 0, releasing: 0, alternatesDisabled: false});
+    });
+
+    it("reserves before begin and releases by ticket without invalidating payload bytes", async () => {
+      const {source, fetch, request} = setup(false, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const handle = await source.prepare(request, signal);
+      expect(fetch).toHaveBeenNthCalledWith(1, {method: "zbuilder_reserveBeginV1", params: [false]}, {timeout: 1000});
+      expect(fetch).toHaveBeenNthCalledWith(
+        2,
+        {
+          method: "zbuilder_beginReservedV1",
+          params: [
+            ticket(),
+            request.forkchoiceState.headBlockHash,
+            serializePayloadAttributes(request.payloadAttributes),
+          ],
+        },
+        {timeout: 20_000}
+      );
+      fetch.mockResolvedValueOnce(payloadResponse(request));
+      const payload = await source.getPayload(handle, signal);
+      const retained = toHex(payload.executionPayload.blockHash);
+      fetch.mockResolvedValueOnce(released);
+      await source.release(handle, signal);
+      expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_cancelBeginV1", params: [ticket()]});
+      expect(toHex(payload.executionPayload.blockHash)).toBe(retained);
+      expect(source.getResources()).toMatchObject({
+        preparing: 0,
+        active: 0,
+        uncertain: 0,
+        releasing: 0,
+        alternatesDisabled: false,
+      });
+    });
+
+    it("does not reserve worker capacity after losing a reserve reply or retry legacy begin", async () => {
+      const {source, fetch, request} = setup(true, true);
+      fetch.mockRejectedValueOnce(new Error("reserve reply lost"));
+      await expect(source.prepare(request, signal)).rejects.toThrow("reserve reply lost");
+      expect(source.getResources()).toMatchObject({preparing: 0, uncertain: 0, alternatesDisabled: false});
+      fetch.mockResolvedValueOnce(reservation(2)).mockResolvedValueOnce(begun(2));
+      await source.prepare(request, signal);
+      expect(fetch.mock.calls.map(([call]) => call.method)).toEqual([
+        "zbuilder_reserveBeginV1",
+        "zbuilder_reserveBeginV1",
+        "zbuilder_beginReservedV1",
+      ]);
+    });
+
+    it("keeps a lost begin counted until cancellation proves release, then admits alternates again", async () => {
+      const {source, fetch, request} = setup(true, true);
+      const cancel = defer<typeof released>();
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      await source.prepare(request, signal);
+      fetch
+        .mockResolvedValueOnce(reservation(2))
+        .mockRejectedValueOnce(new Error("begin reply lost"))
+        .mockImplementationOnce(() => cancel.promise);
+      await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toThrow("begin reply lost");
+      expect(source.getResources()).toMatchObject({
+        preparing: 0,
+        active: 1,
+        releasing: 1,
+        uncertain: 0,
+        alternatesDisabled: false,
+      });
+      await expect(source.prepare(request, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.CAPACITY},
+      });
+      cancel.resolve(released);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({active: 1, releasing: 0, uncertain: 0, alternatesDisabled: false});
+      fetch.mockResolvedValueOnce(reservation(3)).mockResolvedValueOnce(begun(3, true));
+      await source.prepare({...request, requireUnleased: true}, signal);
+      expect(source.getResources()).toMatchObject({active: 2, uncertain: 0});
+    });
+
+    it("does not clear an uncertain ticket on a lost cancel reply", async () => {
+      const {source, fetch, request} = setup(true, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const handle = await source.prepare(request, signal);
+      fetch.mockRejectedValueOnce(new Error("cancel reply lost"));
+      await expect(source.release(handle, signal)).rejects.toThrow("cancel reply lost");
+      expect(source.getResources()).toMatchObject({active: 0, uncertain: 1});
+      fetch.mockResolvedValueOnce(released);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({uncertain: 0, alternatesDisabled: false});
+    });
+
+    it("coalesces cancellation and keeps polling while native work is draining", async () => {
+      const {source, fetch, request} = setup(true, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const handle = await source.prepare(request, signal);
+      const cancel = defer<typeof released>();
+      fetch.mockResolvedValueOnce({...released, released: false}).mockImplementationOnce(() => cancel.promise);
+      const first = source.release(handle, signal);
+      const second = source.release(handle, signal);
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+      expect(source.getResources()).toMatchObject({releasing: 1, active: 0, uncertain: 0});
+      cancel.resolve(released);
+      await Promise.all([first, second]);
+      expect(fetch.mock.calls.slice(2).map(([call]) => call.method)).toEqual([
+        "zbuilder_cancelBeginV1",
+        "zbuilder_cancelBeginV1",
+      ]);
+      expect(source.getResources()).toMatchObject({releasing: 0, uncertain: 0});
+    });
+
+    it.each([
+      null,
+      {},
+      true,
+      {released: "true", beginReservationVersion: 1},
+      {released: true, beginReservationVersion: 2},
+    ])("retains capacity for a malformed cancellation confirmation %j", async (reply) => {
+      const {source, fetch, request} = setup(true, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const handle = await source.prepare(request, signal);
+      fetch.mockResolvedValueOnce(reply);
+      await expect(source.release(handle, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.RELEASE_UNCONFIRMED},
+      });
+      expect(source.getResources()).toMatchObject({uncertain: 1, active: 0});
+    });
+
+    it("does not treat another native instance or UnknownSession as release proof", async () => {
+      const {source, fetch, request} = setup(true, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const handle = await source.prepare(request, signal);
+      for (const message of ["BeginReservationInstanceMismatch", "UnknownSession"]) {
+        fetch.mockRejectedValueOnce(
+          new ErrorJsonRpcResponse({jsonrpc: "2.0", id: 1, error: {code: -32000, message}}, "zbuilder_cancelBeginV1")
+        );
+        await expect(source.release(handle, signal)).rejects.toBeInstanceOf(ErrorJsonRpcResponse);
+        expect(source.getResources()).toMatchObject({uncertain: 1});
+      }
+    });
+
+    it("releases a second uncertain ticket despite a stale first instance", async () => {
+      const {source, fetch, request} = setup(false, true);
+      fetch
+        .mockResolvedValueOnce(reservation())
+        .mockResolvedValueOnce(begun())
+        .mockResolvedValueOnce(reservation(2))
+        .mockResolvedValueOnce(begun(2));
+      const first = await source.prepare(request, signal);
+      const second = await source.prepare(request, signal);
+      const mismatch = new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "BeginReservationInstanceMismatch"}},
+        "zbuilder_cancelBeginV1"
+      );
+      fetch.mockRejectedValue(new Error("lost cancellation response"));
+      await Promise.allSettled([source.release(first, signal), source.release(second, signal)]);
+      expect(source.getResources()).toMatchObject({uncertain: 2});
+      fetch.mockImplementation(async (call) => {
+        if (Array.isArray(call.params) && call.params[0] === first.payloadId) throw mismatch;
+        return released;
+      });
+      await expect(source.reconcileResources(signal)).rejects.toBe(mismatch);
+      expect(fetch.mock.calls.slice(-2).map(([call]) => call.params)).toEqual([[first.payloadId], [second.payloadId]]);
+      expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 1});
+      await expect(source.release(second, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.UNKNOWN_HANDLE},
+      });
+      await expect(source.release(first, signal)).rejects.toBe(mismatch);
+      expect(source.getResources()).toMatchObject({uncertain: 1});
+    });
+
+    it("coalesces both cleanup calls and preserves a hung ticket while releasing its sibling", async () => {
+      const {source, fetch, request, signals} = setup(false, true);
+      fetch
+        .mockResolvedValueOnce(reservation())
+        .mockResolvedValueOnce(begun())
+        .mockResolvedValueOnce(reservation(2))
+        .mockResolvedValueOnce(begun(2));
+      const first = await source.prepare(request, signal);
+      const second = await source.prepare(request, signal);
+      fetch.mockRejectedValue(new Error("lost cancellation response"));
+      await Promise.allSettled([source.release(first, signal), source.release(second, signal)]);
+      const cleanupCalls: string[] = [];
+      fetch.mockImplementation(async (call) => {
+        const payloadId = Array.isArray(call.params) ? call.params[0] : undefined;
+        cleanupCalls.push(String(payloadId));
+        if (payloadId === first.payloadId) await sleep(10_000, signals.at(-1));
+        return released;
+      });
+      const controller = new AbortController();
+      const one = source.reconcileResources(controller.signal);
+      const two = source.reconcileResources(signal);
+      const settled = Promise.allSettled([one, two]);
+      await vi.waitFor(() => expect(source.getResources()).toMatchObject({releasing: 1, uncertain: 0, active: 0}));
+      expect(cleanupCalls).toEqual([first.payloadId, second.payloadId]);
+      controller.abort();
+      expect((await settled).map((result) => result.status)).toEqual(["rejected", "rejected"]);
+      expect(source.getResources()).toMatchObject({releasing: 0, uncertain: 1, active: 0});
+      expect(cleanupCalls).toHaveLength(2);
+    });
+
+    it("paces stale-instance cancellation without delaying a newly releasable ticket", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(false, true);
+        const mismatch = new ErrorJsonRpcResponse(
+          {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "BeginReservationInstanceMismatch"}},
+          "zbuilder_cancelBeginV1"
+        );
+        fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+        const stale = await source.prepare(request, signal);
+        fetch.mockRejectedValueOnce(mismatch);
+        await expect(source.release(stale, signal)).rejects.toBe(mismatch);
+        for (let i = 0; i < 20; i++) await source.reconcileResources(signal);
+        expect(fetch).toHaveBeenCalledTimes(3);
+        expect(source.getResources()).toMatchObject({uncertain: 1});
+
+        fetch.mockResolvedValueOnce(reservation(2)).mockResolvedValueOnce(begun(2));
+        const current = await source.prepare(request, signal);
+        fetch.mockRejectedValueOnce(new Error("lost cancel reply"));
+        await expect(source.release(current, signal)).rejects.toThrow("lost cancel reply");
+        fetch.mockResolvedValueOnce(released);
+        await source.reconcileResources(signal);
+        expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_cancelBeginV1", params: [current.payloadId]});
+        expect(fetch).toHaveBeenCalledTimes(7);
+        expect(source.getResources()).toMatchObject({uncertain: 1, releasing: 0, active: 0});
+
+        fetch.mockRejectedValue(mismatch);
+        for (const [i, delay] of [200, 400, 800, 1000, 1000].entries()) {
+          await vi.advanceTimersByTimeAsync(delay - 1);
+          await source.reconcileResources(signal);
+          expect(fetch).toHaveBeenCalledTimes(7 + i);
+          await vi.advanceTimersByTimeAsync(1);
+          await expect(source.reconcileResources(signal)).rejects.toBe(mismatch);
+          expect(fetch).toHaveBeenCalledTimes(8 + i);
+          expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_cancelBeginV1", params: [stale.payloadId]});
+          expect(source.getResources()).toMatchObject({uncertain: 1, releasing: 0});
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("starts a newly uncertain begin's cleanup while its sibling's reconciliation is still pending", async () => {
+      const {source, fetch, request} = setup(false, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const first = await source.prepare(request, signal);
+      fetch.mockRejectedValueOnce(new Error("lost cancel reply"));
+      await expect(source.release(first, signal)).rejects.toThrow("lost cancel reply");
+      const firstCleanup = defer<typeof released>();
+      const secondBegin = defer<ReturnType<typeof begun>>();
+      fetch.mockImplementation(async (call) => {
+        if (call.method === "zbuilder_reserveBeginV1") return reservation(2);
+        if (call.method === "zbuilder_beginReservedV1") return secondBegin.promise;
+        if (Array.isArray(call.params) && call.params[0] === first.payloadId) return firstCleanup.promise;
+        return released;
+      });
+      const second = source.prepare(request, signal);
+      const rejected = expect(second).rejects.toThrow("begin reply lost");
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(6));
+      secondBegin.reject(new Error("begin reply lost"));
+      await rejected;
+      await vi.waitFor(() => expect(source.getResources()).toMatchObject({preparing: 0, releasing: 1, uncertain: 0}));
+      expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_cancelBeginV1", params: [ticket(2)]});
+      expect(fetch).toHaveBeenCalledTimes(7);
+      firstCleanup.resolve(released);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 0, uncertain: 0});
+    });
+
+    it("adds a newly failed release to pending cleanup on the next primary preparation", async () => {
+      const {source, fetch, request} = setup(false, true);
+      fetch
+        .mockResolvedValueOnce(reservation())
+        .mockResolvedValueOnce(begun())
+        .mockResolvedValueOnce(reservation(2))
+        .mockResolvedValueOnce(begun(2));
+      const first = await source.prepare(request, signal);
+      const second = await source.prepare(request, signal);
+      fetch.mockRejectedValueOnce(new Error("first cancel reply lost"));
+      await expect(source.release(first, signal)).rejects.toThrow("first cancel reply lost");
+      const firstCleanup = defer<typeof released>();
+      fetch.mockImplementationOnce(() => firstCleanup.promise);
+      const cleanup = source.reconcileResources(signal);
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(6));
+
+      fetch.mockRejectedValueOnce(new Error("second cancel reply lost"));
+      await expect(source.release(second, signal)).rejects.toThrow("second cancel reply lost");
+      expect(source.getResources()).toMatchObject({active: 0, releasing: 1, uncertain: 1});
+      fetch.mockResolvedValueOnce(released);
+      await expect(source.prepare(request, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.CAPACITY},
+      });
+      await vi.waitFor(() => expect(source.getResources()).toMatchObject({active: 0, releasing: 1, uncertain: 0}));
+      expect(fetch).toHaveBeenCalledTimes(8);
+      expect(fetch.mock.calls.slice(4).map(([call]) => call.params)).toEqual([
+        [first.payloadId],
+        [first.payloadId],
+        [second.payloadId],
+        [second.payloadId],
+      ]);
+      firstCleanup.resolve(released);
+      await cleanup;
+      expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 0});
+    });
+
+    it("retains both same-slot rejected tickets until each cancellation confirms release", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(false, true);
+        const one = defer<ReturnType<typeof begun>>();
+        const two = defer<ReturnType<typeof begun>>();
+        const cancelled = defer<typeof released>();
+        let reservations = 0;
+        fetch.mockImplementation(async (call) => {
+          if (call.method === "zbuilder_reserveBeginV1") return reservation(++reservations);
+          if (call.method === "zbuilder_beginReservedV1")
+            return Array.isArray(call.params) && call.params[0] === ticket() ? one.promise : two.promise;
+          return Array.isArray(call.params) && call.params[0] === ticket() ? cancelled.promise : released;
+        });
+        const first = source.prepare(request, signal);
+        const second = source.prepare(request, signal);
+        const settled = Promise.allSettled([first, second]);
+        await vi.advanceTimersByTimeAsync(0);
+        const rejected = new ErrorJsonRpcResponse(
+          {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "SlotNotArmed"}},
+          "zbuilder_beginReservedV1"
+        );
+        one.reject(rejected);
+        two.reject(rejected);
+        await settled;
+        await vi.advanceTimersByTimeAsync(400);
+        await expect(source.prepare(request, signal)).rejects.toMatchObject({
+          type: {code: SessionPayloadErrorCode.CAPACITY},
+        });
+        expect(reservations).toBe(2);
+        expect(source.getResources()).toMatchObject({releasing: 1, uncertain: 0});
+        cancelled.resolve(released);
+        await source.reconcileResources(signal);
+        expect(source.getResources()).toMatchObject({releasing: 0, uncertain: 0});
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("distinguishes late native rejection from lost replies without dropping cleanup ownership", async () => {
+      const {source, fetch, request, warn} = setup(false, true);
+      const begin = defer<ReturnType<typeof begun>>();
+      const cancellation = defer<typeof released>();
+      fetch
+        .mockResolvedValueOnce(reservation())
+        .mockImplementationOnce(() => begin.promise)
+        .mockImplementationOnce(() => cancellation.promise);
+      const controller = new AbortController();
+      const preparing = source.prepare(request, controller.signal);
+      const error = new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "SlotNotArmed"}},
+        "zbuilder_beginReservedV1"
+      );
+      const rejected = expect(preparing).rejects.toBe(error);
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+      controller.abort();
+      begin.reject(error);
+      await rejected;
+      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 1, uncertain: 0});
+      expect(warn).toHaveBeenCalledExactlyOnceWith("Constructor begin rejected", {
+        code: "SESSION_PAYLOAD_BEGIN_REJECTED",
+        reason: "SlotNotArmed",
+        method: "zbuilder_beginReservedV1",
+        slot: request.payloadAttributes.slotNumber,
+        callerAborted: true,
+        cleanupPending: true,
+        sessionId: ticket(),
+      });
+      cancellation.resolve(released);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 0, uncertain: 0});
+    });
+
+    it("keeps rejection diagnostics sanitized and cleanup intact if the logger throws", async () => {
+      const {source, fetch, request, warn} = setup(false, true);
+      const response = {
+        jsonrpc: "2.0" as const,
+        id: 1,
+        error: {code: -32000, message: "secret-auth-and-private-transaction", data: {privatePayload: "secret"}},
+      };
+      const error = new ErrorJsonRpcResponse(response, "zbuilder_beginReservedV1");
+      warn.mockImplementation(() => {
+        throw new Error("logger unavailable");
+      });
+      fetch.mockResolvedValueOnce(reservation()).mockRejectedValueOnce(error).mockResolvedValueOnce(released);
+      await expect(source.prepare(request, signal)).rejects.toBe(error);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 0, uncertain: 0});
+      expect(warn.mock.calls).toEqual([
+        [
+          "Constructor begin rejected",
+          {
+            code: "SESSION_PAYLOAD_BEGIN_REJECTED",
+            reason: "OtherJsonRpcRejection",
+            method: "zbuilder_beginReservedV1",
+            slot: request.payloadAttributes.slotNumber,
+            callerAborted: false,
+            cleanupPending: true,
+            sessionId: ticket(),
+          },
+        ],
+      ]);
+    });
+
+    it("cannot lose reserved primary ownership when reading rejection diagnostics fails", async () => {
+      const {source, fetch, request} = setup(false, true);
+      const error = new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "SlotNotArmed"}},
+        "zbuilder_beginReservedV1"
+      );
+      Object.defineProperty(error, "response", {
+        get() {
+          throw new Error("unreadable diagnostic response");
+        },
+      });
+      const cancellation = defer<typeof released>();
+      fetch
+        .mockResolvedValueOnce(reservation())
+        .mockRejectedValueOnce(error)
+        .mockImplementationOnce(() => cancellation.promise);
+      await expect(source.prepare(request, signal)).rejects.toBe(error);
+      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 1, uncertain: 0});
+      cancellation.resolve(released);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 0, uncertain: 0});
+    });
+
+    it("retains uncertain ownership and the original cancellation error when diagnostics are unreadable", async () => {
+      const {source, fetch, request} = setup(false, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const handle = await source.prepare(request, signal);
+      const error = new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "BeginReservationInstanceMismatch"}},
+        "zbuilder_cancelBeginV1"
+      );
+      Object.defineProperty(error, "response", {
+        get() {
+          throw new Error("unreadable diagnostic response");
+        },
+      });
+      fetch.mockRejectedValueOnce(error);
+      await expect(source.release(handle, signal)).rejects.toBe(error);
+      expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 1});
+      fetch.mockResolvedValueOnce(released);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 0});
+      expect(fetch).toHaveBeenCalledTimes(4);
+    });
+
+    it("waits for the rejected ticket's cancellation before reserving its retry", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(false, true);
+        const error = new ErrorJsonRpcResponse(
+          {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "SlotNotArmed"}},
+          "zbuilder_beginReservedV1"
+        );
+        fetch
+          .mockResolvedValueOnce(reservation())
+          .mockRejectedValueOnce(error)
+          .mockRejectedValueOnce(new Error("cancel reply lost"));
+        await expect(source.prepare(request, signal)).rejects.toBe(error);
+        await expect(source.reconcileResources(signal)).rejects.toThrow("cancel reply lost");
+        const cancellation = defer<typeof released>();
+        fetch.mockImplementationOnce(() => cancellation.promise);
+        const retry = source.prepare(request, signal);
+        const blocked = expect(retry).rejects.toMatchObject({type: {code: SessionPayloadErrorCode.CAPACITY}});
+        await vi.advanceTimersByTimeAsync(200);
+        await blocked;
+        expect(fetch.mock.calls.map(([call]) => call.method)).toEqual([
+          "zbuilder_reserveBeginV1",
+          "zbuilder_beginReservedV1",
+          "zbuilder_cancelBeginV1",
+          "zbuilder_cancelBeginV1",
+        ]);
+        cancellation.resolve(released);
+        await source.reconcileResources(signal);
+        fetch.mockResolvedValueOnce(reservation(2)).mockResolvedValueOnce(begun(2));
+        await source.prepare(request, signal);
+        expect(source.getResources()).toMatchObject({active: 1, uncertain: 0});
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("cleans a late successful begin after caller abort without losing its identity", async () => {
+      const {source, fetch, request, signals} = setup(true, true);
+      const begin = defer<ReturnType<typeof begun>>();
+      fetch
+        .mockResolvedValueOnce(reservation())
+        .mockImplementationOnce(() => begin.promise)
+        .mockResolvedValueOnce(released);
+      const controller = new AbortController();
+      const prepared = source.prepare(request, controller.signal);
+      const rejected = expect(prepared).rejects.toBeInstanceOf(ErrorAborted);
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+      controller.abort();
+      expect(signals[1].aborted).toBe(false);
+      expect(source.getResources()).toMatchObject({preparing: 1});
+      begin.resolve(begun());
+      await rejected;
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 0, uncertain: 0, active: 0});
+      expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_cancelBeginV1", params: [ticket()]});
+    });
+
+    it("rejects a reused reservation without cancelling another live session", async () => {
+      const {source, fetch, request} = setup(true, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      await source.prepare(request, signal);
+      fetch.mockResolvedValueOnce(reservation());
+      await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.INVALID_SESSION},
+      });
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 0, preparing: 0});
+      expect(fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("recovers two lost HTTP begin replies without retrying begin or restarting the source", async () => {
+      let next = 0;
+      let dropped = 0;
+      const active = new Set<string>();
+      const reserved = new Set<string>();
+      const methods: string[] = [];
+      const server = createServer(async (req, res) => {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        const call = JSON.parse(body) as {id: number; method: string; params: unknown[]};
+        methods.push(call.method);
+        let result: unknown;
+        if (call.method === "zbuilder_reserveBeginV1") {
+          reserved.add(ticket(++next));
+          result = reservation(next);
+        } else if (call.method === "zbuilder_beginReservedV1") {
+          const id = String(call.params[0]);
+          expect(reserved.delete(id)).toBe(true);
+          active.add(id);
+          if (dropped++ < 2) {
+            res.destroy();
+            return;
+          }
+          result = {...begun(next), sessionId: id};
+        } else if (call.method === "zbuilder_cancelBeginV1") {
+          const id = String(call.params[0]);
+          reserved.delete(id);
+          active.delete(id);
+          result = released;
+        } else throw new Error(`Unexpected method ${call.method}`);
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({jsonrpc: "2.0", id: call.id, result}));
+      });
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Missing listener address");
+        const source = new SessionPayloadSource(
+          "socket",
+          (signal) => new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal, timeout: 1000}),
+          {beginReservations: true}
+        );
+        for (let i = 0; i < 2; i++) {
+          await expect(source.prepare(buildRequest(), signal)).rejects.toBeInstanceOf(FetchError);
+          await source.reconcileResources(signal);
+          expect(source.getResources()).toMatchObject({
+            preparing: 0,
+            active: 0,
+            uncertain: 0,
+            releasing: 0,
+            alternatesDisabled: false,
+          });
+          expect(active.size).toBe(0);
+        }
+        const handle = await source.prepare(buildRequest(), signal);
+        expect(active).toEqual(new Set([handle.payloadId]));
+        await source.release(handle, signal);
+        expect(methods.filter((method) => method === "zbuilder_beginReservedV1")).toHaveLength(3);
+        expect(methods.every((method) => method !== "zbuilder_beginV1" && method !== "zbuilder_endV1")).toBe(true);
+        expect(active.size).toBe(0);
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      }
+    });
+  });
+
+  describe("native begin rejection pacing", () => {
+    const rejected = (message = "SlotNotArmed") =>
+      new ErrorJsonRpcResponse({jsonrpc: "2.0", id: 1, error: {code: -32000, message}}, "zbuilder_beginV1");
+
+    it.each([
+      {reason: "SlotNotArmed", bounded: false},
+      {reason: "SlotNotArmed", bounded: true},
+      {reason: "ConstructionHalted", bounded: true},
+    ])("backs off $reason within a fixed bound (tracked=$bounded)", async ({reason, bounded}) => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(bounded);
+        const error = rejected(reason);
+        fetch.mockRejectedValue(error);
+        await expect(source.prepare(request, signal)).rejects.toBe(error);
+        for (const [i, delay] of [200, 400, 800, 1000, 1000].entries()) {
+          const retry = expect(source.prepare(request, signal)).rejects.toBe(error);
+          await vi.advanceTimersByTimeAsync(delay - 1);
+          expect(fetch).toHaveBeenCalledTimes(i + 1);
+          await vi.advanceTimersByTimeAsync(1);
+          await retry;
+          expect(fetch).toHaveBeenCalledTimes(i + 2);
+        }
+        if (bounded) expect(source.getResources()).toMatchObject({preparing: 0, uncertain: 0, active: 0});
+        else expect(source.getResources()).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("cancels a backoff without sending or reserving another begin", async () => {
+      const {source, fetch, request} = setup(true);
+      fetch.mockRejectedValueOnce(rejected());
+      await expect(source.prepare(request, signal)).rejects.toBeInstanceOf(ErrorJsonRpcResponse);
+      const controller = new AbortController();
+      const preparing = source.prepare(request, controller.signal);
+      const stopped = expect(preparing).rejects.toBeInstanceOf(ErrorAborted);
+      controller.abort();
+      await stopped;
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(source.getResources()).toMatchObject({preparing: 0, uncertain: 0});
+    });
+
+    it("keeps the original orchestrator deadline while waiting for a backoff", async () => {
+      const {source, fetch, request} = setup(true);
+      fetch.mockRejectedValue(rejected());
+      await expect(source.prepare(request, signal)).rejects.toBeInstanceOf(ErrorJsonRpcResponse);
+      const orchestrator = new PayloadOrchestrator(source, {getPayloadTimeout: 1000}, signal);
+      await expect(
+        orchestrator.run({id: "arming-deadline", request, getPayloadAt: Date.now() + 30})
+      ).rejects.toMatchObject({
+        type: {code: PayloadOrchestratorErrorCode.PREPARE_TIMEOUT},
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(source.getResources()).toMatchObject({preparing: 0, uncertain: 0});
+    });
+
+    it("admits a new slot immediately and ignores a late older slot rejection for its backoff", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(true);
+        const old = defer<{sessionId: string}>();
+        fetch.mockImplementationOnce(() => old.promise);
+        const previous = expect(source.prepare(request, signal)).rejects.toBeInstanceOf(ErrorJsonRpcResponse);
+        const next = {...request, payloadAttributes: {...request.payloadAttributes, slotNumber: 13}};
+        fetch.mockResolvedValueOnce({sessionId: "next-slot"});
+        const nextPrepared = source.prepare(next, signal);
+        expect(fetch).toHaveBeenCalledTimes(2);
+        const handle = await nextPrepared;
+        old.reject(rejected());
+        await previous;
+        fetch.mockResolvedValueOnce(true);
+        await source.release(handle, signal);
+        fetch.mockResolvedValueOnce({sessionId: "next-slot-retry"});
+        const retry = source.prepare(next, signal);
+        expect(fetch).toHaveBeenCalledTimes(4);
+        await retry;
+        expect(performance.now()).toBe(0);
+        expect(source.getResources()).toMatchObject({preparing: 0, uncertain: 0, active: 1});
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("resets the backoff after successful preparation", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(true);
+        fetch.mockRejectedValueOnce(rejected());
+        await expect(source.prepare(request, signal)).rejects.toBeInstanceOf(ErrorJsonRpcResponse);
+        fetch.mockResolvedValueOnce({sessionId: "ready"});
+        const retry = source.prepare(request, signal);
+        await vi.advanceTimersByTimeAsync(200);
+        const handle = await retry;
+        fetch.mockResolvedValueOnce(true);
+        await source.release(handle, signal);
+        fetch.mockRejectedValueOnce(rejected());
+        await expect(source.prepare(request, signal)).rejects.toBeInstanceOf(ErrorJsonRpcResponse);
+        fetch.mockResolvedValueOnce({sessionId: "ready-again"});
+        const next = source.prepare(request, signal);
+        await vi.advanceTimersByTimeAsync(199);
+        expect(fetch).toHaveBeenCalledTimes(4);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(fetch).toHaveBeenCalledTimes(5);
+        await next;
+        expect(source.getResources()).toMatchObject({active: 1, uncertain: 0});
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("rate limits each sanitized rejection reason without creating an alternate retry loop", async () => {
+      const {source, fetch, request, warn} = setup(true);
+      const clock = vi.spyOn(performance, "now").mockReturnValue(1000);
+      try {
+        fetch.mockResolvedValueOnce({sessionId: "primary"});
+        await source.prepare(request, signal);
+        fetch.mockRejectedValue(rejected());
+        for (let i = 0; i < 32; i++)
+          await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toBeInstanceOf(
+            ErrorJsonRpcResponse
+          );
+        expect(fetch).toHaveBeenCalledTimes(33);
+        expect(warn).toHaveBeenCalledTimes(1);
+        fetch.mockRejectedValueOnce(rejected("SessionLimit"));
+        await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toBeInstanceOf(
+          ErrorJsonRpcResponse
+        );
+        expect(warn).toHaveBeenCalledTimes(2);
+        clock.mockReturnValue(2000);
+        await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toBeInstanceOf(
+          ErrorJsonRpcResponse
+        );
+        expect(warn).toHaveBeenCalledTimes(3);
+        expect(source.getResources()).toMatchObject({active: 1, preparing: 0, uncertain: 0, alternatesDisabled: false});
+        fetch.mockResolvedValueOnce({sessionId: "next-primary"});
+        const primary = source.prepare(request, signal);
+        expect(fetch).toHaveBeenCalledTimes(36);
+        await primary;
+      } finally {
+        clock.mockRestore();
+      }
+    });
+  });
 
   it("changes generations even when value drops and the block hash repeats", async () => {
     const {source, fetch, request} = setup();
@@ -533,7 +1359,7 @@ describe("SessionPayloadSource", () => {
       expect(source.getResources()).toMatchObject({active: 1, uncertain: 0, releasing: 0});
     });
 
-    it("serializes concurrent reconciliation over both known handles", async () => {
+    it("coalesces reconciliation while cleaning both known handles concurrently", async () => {
       const {source, fetch, request} = setup(true);
       fetch.mockResolvedValueOnce({sessionId: "first"}).mockResolvedValueOnce({sessionId: "second"});
       const first = await source.prepare(request, signal);
@@ -566,15 +1392,16 @@ describe("SessionPayloadSource", () => {
         .mockResolvedValueOnce({sessionId: "new-primary"});
       await expect(source.prepare(request, signal)).rejects.toMatchObject(errorCode(SessionPayloadErrorCode.CAPACITY));
       await firstStarted.promise;
-      const duplicate = source.reconcileResources(signal);
-      expect(order).toEqual(["first"]);
-      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 1, uncertain: 1});
-      firstEnded.resolve();
       await secondStarted.promise;
+      const duplicate = source.reconcileResources(signal);
+      expect(order).toEqual(["first", "second"]);
+      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 2, uncertain: 0});
+      firstEnded.resolve();
+      await vi.waitFor(() => expect(source.getResources()).toMatchObject({releasing: 1}));
       expect(order).toEqual(["first", "second"]);
       expect(source.getResources()).toMatchObject({preparing: 0, releasing: 1, uncertain: 0});
       // The first acknowledgement frees one worker even while the second
-      // cleanup is still in progress. No cleanup RPC runs concurrently.
+      // cleanup is still in progress. Each handle has only one cleanup RPC.
       await expect(source.prepare(request, signal)).resolves.toMatchObject({payloadId: "new-primary"});
       expect(source.getResources()).toMatchObject({active: 1, releasing: 1, uncertain: 0});
       secondEnded.resolve();
@@ -610,7 +1437,7 @@ describe("SessionPayloadSource", () => {
       const aborted = expect(waiting).rejects.toBeInstanceOf(ErrorAborted);
       controller.abort();
       await aborted;
-      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 1, uncertain: 1});
+      expect(source.getResources()).toMatchObject({preparing: 0, releasing: 1, uncertain: 0});
       ended.resolve();
       await reconciliation;
       expect(fetch.mock.calls.map(([call]) => call.method)).toEqual([
@@ -630,7 +1457,7 @@ describe("SessionPayloadSource", () => {
       });
     });
 
-    it("keeps reconciliation serialized when an aborted end delivers its acknowledgement late", async () => {
+    it("coalesces a late end acknowledgement without clearing its failed sibling", async () => {
       const {source, fetch, request} = setup(true);
       fetch.mockResolvedValueOnce({sessionId: "first"}).mockResolvedValueOnce({sessionId: "second"});
       const first = await source.prepare(request, signal);
@@ -644,11 +1471,13 @@ describe("SessionPayloadSource", () => {
       );
       const started = defer<void>();
       const acknowledged = defer<void>();
-      fetch.mockImplementationOnce(async () => {
-        started.resolve();
-        await acknowledged.promise;
-        return true;
-      });
+      fetch
+        .mockImplementationOnce(async () => {
+          started.resolve();
+          await acknowledged.promise;
+          return true;
+        })
+        .mockResolvedValueOnce(false);
       const controller = new AbortController();
       const cleanup = source.reconcileResources(controller.signal);
       const aborted = expect(cleanup).rejects.toBeInstanceOf(ErrorAborted);
@@ -657,11 +1486,11 @@ describe("SessionPayloadSource", () => {
       await aborted;
       const joining = source.reconcileResources(signal);
       const joiningFailed = expect(joining).rejects.toThrow();
-      expect(fetch).toHaveBeenCalledTimes(5);
+      expect(fetch).toHaveBeenCalledTimes(6);
       expect(source.getResources()).toMatchObject({active: 0, releasing: 1, uncertain: 1});
       acknowledged.resolve();
       await joiningFailed;
-      expect(fetch).toHaveBeenCalledTimes(5);
+      expect(fetch).toHaveBeenCalledTimes(6);
       expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 1});
       fetch.mockResolvedValueOnce(true);
       await source.reconcileResources(signal);
@@ -940,6 +1769,7 @@ describe("SessionPayloadSource", () => {
       const request = buildRequest();
       const controller = new AbortController();
       const methods: string[] = [];
+      const warn = vi.fn<Logger["warn"]>();
       const server = createServer(async (req, res) => {
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -971,7 +1801,7 @@ describe("SessionPayloadSource", () => {
         const source = new SessionPayloadSource(
           "socket",
           (signal) => new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal, timeout: 1000}),
-          {boundedAlternates: true}
+          {boundedAlternates: true, logger: {warn}}
         );
         await source.prepare(request, signal);
         await expect(source.prepare({...request, requireUnleased: true}, controller.signal)).rejects.toThrow();
@@ -983,10 +1813,91 @@ describe("SessionPayloadSource", () => {
         });
         await source.reconcileResources(signal);
         expect(methods).toEqual(["zbuilder_beginV1", "zbuilder_beginAlternateV1"]);
+        expect(warn).toHaveBeenCalledWith(
+          "Constructor alternate admission disabled",
+          expect.objectContaining({
+            reason: fault === "lost-response" ? "ambiguous_begin" : "unsupported_alternate_method",
+            callerAborted: fault === "lost-response",
+            preparing: 0,
+            uncertain: fault === "lost-response" ? 1 : 0,
+          })
+        );
+        expect(warn).toHaveBeenCalledTimes(fault === "lost-response" ? 1 : 2);
+        if (fault === "unsupported")
+          expect(warn).toHaveBeenCalledWith(
+            "Constructor begin rejected",
+            expect.objectContaining({reason: "UnknownSession", cleanupPending: false})
+          );
       } finally {
         server.closeAllConnections();
         await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
       }
+    });
+
+    it.each([false, true])(
+      "logs a late ambiguous begin after caller cancellation (alternate=%s)",
+      async (alternate) => {
+        const {source, fetch, request, warn} = setup(true);
+        if (alternate) {
+          fetch.mockResolvedValueOnce({sessionId: "primary"});
+          await source.prepare(request, signal);
+        }
+        const controller = new AbortController();
+        const begin = defer<{sessionId: string}>();
+        fetch.mockImplementationOnce(() => begin.promise);
+        const failure = new Error("https://private:secret@example.invalid/rpc?token=private-order");
+        const pending = source.prepare({...request, requireUnleased: alternate}, controller.signal);
+        const rejected = expect(pending).rejects.toBe(failure);
+        controller.abort();
+        expect(warn).not.toHaveBeenCalled();
+        begin.reject(failure);
+        await rejected;
+        expect(warn).toHaveBeenCalledExactlyOnceWith("Constructor alternate admission disabled", {
+          code: "SESSION_PAYLOAD_ALTERNATES_DISABLED",
+          reason: "ambiguous_begin",
+          method: alternate ? "zbuilder_beginAlternateV1" : "zbuilder_beginV1",
+          slot: request.payloadAttributes.slotNumber,
+          parentBlockHash: request.forkchoiceState.headBlockHash,
+          parentBlockRoot: toHex(request.payloadAttributes.parentBeaconBlockRoot),
+          callerAborted: true,
+          orphaned: 1,
+          capacity: 2,
+          preparing: 0,
+          active: alternate ? 1 : 0,
+          releasing: 0,
+          uncertain: 1,
+          alternatesDisabled: true,
+        });
+        await source.reconcileResources(signal);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(source.getResources()).toMatchObject({uncertain: 1, alternatesDisabled: true});
+      }
+    );
+
+    it("preserves the original begin error and reservation when the warning logger throws", async () => {
+      const {source, fetch, request, warn} = setup(true);
+      const failure = new Error("response lost");
+      warn.mockImplementation(() => {
+        throw new Error("logger unavailable");
+      });
+      fetch.mockRejectedValueOnce(failure);
+      await expect(source.prepare(request, signal)).rejects.toBe(failure);
+      expect(source.getResources()).toMatchObject({preparing: 0, uncertain: 1, alternatesDisabled: true});
+    });
+
+    it("still releases an unconfirmed alternate capability when the warning logger throws", async () => {
+      const {source, fetch, request, warn} = setup(true);
+      fetch.mockResolvedValueOnce({sessionId: "primary"});
+      await source.prepare(request, signal);
+      warn.mockImplementation(() => {
+        throw new Error("logger unavailable");
+      });
+      fetch.mockResolvedValueOnce({sessionId: "alternate"}).mockResolvedValueOnce(true);
+      await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toMatchObject(
+        errorCode(SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED)
+      );
+      expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_endV1", params: ["alternate"]});
+      expect(source.getResources()).toMatchObject({active: 1, releasing: 0, uncertain: 0, alternatesDisabled: true});
     });
 
     it("retains an unknown begin outcome and never infers recovery from a session listing", async () => {

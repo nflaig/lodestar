@@ -592,6 +592,9 @@ export class Builder {
         onEvent: (event) => {
           void this.onEvent(event);
         },
+        onOpen: () => {
+          void this.proposerPreferencesRecovery.refresh(this.clock.getCurrentSlot());
+        },
         onError: (error) => {
           if (!signal.aborted) this.logger.error("Failed to receive builder event", {topics: topics.join(",")}, error);
         },

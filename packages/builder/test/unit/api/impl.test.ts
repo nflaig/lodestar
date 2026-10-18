@@ -7,7 +7,7 @@ import {ZERO_HASH, computeDomain, computeSigningRoot} from "@lodestar/state-tran
 import {gloas, ssz} from "@lodestar/types";
 import * as utils from "@lodestar/utils";
 import {BuilderBidStreamApi, getBuilderBidStreamApi} from "../../../src/api/bidStream.js";
-import {BuilderApi, getBuilderApi} from "../../../src/api/impl.js";
+import {BuilderApi, bidResponseBudgets, bidWaitBudget, getBuilderApi} from "../../../src/api/impl.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {ProposerDutiesTracker} from "../../../src/services/proposerDutiesTracker.js";
 import {getApiClientStub, mockApiResponse} from "../utils/apiStub.js";
@@ -26,6 +26,19 @@ const proposerPubkey = proposerKey.toPublicKey().toBytes();
 const otherKey = SecretKey.fromBytes(Buffer.alloc(32, 3));
 
 describe("builder api", () => {
+  it.each([
+    [ForkName.gloas, 12_000],
+    [ForkName.heze, 6_000],
+  ] as const)("bounds bid waiting by the requested %s slot duration", (fork, expectedMs) => {
+    const forkConfig = createBeaconConfig(
+      {...getConfig(fork), SLOT_DURATION_MS: 12_000, SLOT_DURATION_MS_HEZE: 6_000},
+      Buffer.alloc(32)
+    );
+    const clock = new ClockMock();
+    clock.currentSlot = slot;
+    expect(bidWaitBudget(clock, forkConfig, slot, 0, 60_000)).toBe(expectedMs);
+  });
+
   let api: ReturnType<typeof getApiClientStub>;
   let clock: ClockMock;
   let bidStore: BidStore;
@@ -121,6 +134,63 @@ describe("builder api", () => {
   }
 
   describe("retained bid stream", () => {
+    describe("fixed response bounds", () => {
+      beforeEach(() => {
+        vi.useFakeTimers({toFake: ["Date", "performance", "setTimeout", "clearTimeout"]});
+        vi.setSystemTime(1_700_000_000_000);
+      });
+
+      afterEach(() => {
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+      });
+
+      it.each([
+        {transit: 200, timeout: 500, wait: 50, hard: 250},
+        {transit: 202, timeout: 500, wait: 46, hard: 248},
+        {transit: 182, timeout: 500, wait: 86, hard: 268},
+        {transit: 0, timeout: 500, wait: 450, hard: 450},
+        {transit: -1, timeout: 500, wait: 0, hard: 0},
+        {transit: 500, timeout: 500, wait: 0, hard: 0},
+      ])("captures original bounds for $transit ms inbound age", async ({transit, timeout, wait, hard}) => {
+        const arrivedAt = Date.now();
+        const stream = await streamApi.open(bidRequest({dateMilliseconds: arrivedAt - transit, timeoutMs: timeout}));
+        expect(stream.deadline).toBe(wait);
+        expect(stream.hardDeadline).toEqual({monotonic: hard, unixMs: arrivedAt + hard});
+        expect(stream.deadline).toBeLessThanOrEqual(stream.hardDeadline?.monotonic ?? 0);
+        expect(hard).toBeLessThanOrEqual(timeout);
+      });
+
+      it("never refreshes either bound after authentication or a wall-clock rollback", async () => {
+        const arrivedAt = Date.now();
+        const response = await api.validator.getProposerDutiesV2({epoch: 0});
+        api.validator.getProposerDutiesV2.mockImplementationOnce(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          vi.setSystemTime(arrivedAt - 10_000);
+          return response;
+        });
+        const pending = streamApi.open(bidRequest({dateMilliseconds: arrivedAt - 200}));
+        await vi.advanceTimersByTimeAsync(100);
+        const stream = await pending;
+        expect(stream.deadline).toBe(50);
+        expect(stream.hardDeadline).toEqual({monotonic: 250, unixMs: arrivedAt + 250});
+        expect(performance.now()).toBe(100);
+      });
+
+      it("snapshots the slot boundary once, with both deadlines capped at its end", async () => {
+        const arrivedAt = Date.now();
+        const remaining = vi.spyOn(clock, "msToSlot").mockReturnValue(-11_980);
+        const stream = await streamApi.open(bidRequest({dateMilliseconds: arrivedAt - 200}));
+        expect(stream.deadline).toBe(20);
+        expect(stream.hardDeadline).toEqual({monotonic: 20, unixMs: arrivedAt + 20});
+        expect(remaining).toHaveBeenCalledOnce();
+      });
+
+      it.each([slot - 1, slot + 2])("grants no adaptive allowance to slot %i outside the accepted window", (target) => {
+        expect(bidResponseBudgets(clock, config, target, 100, 500)).toEqual({waitMs: 0, hardStopMs: 0});
+      });
+    });
+
     it("authenticates the exact request context and observes later retained revisions", async () => {
       const started = performance.now();
       const stream = await streamApi.open(bidRequest({dateMilliseconds: Date.now(), timeoutMs: 500}));
@@ -558,6 +628,30 @@ describe("builder api", () => {
   });
 
   describe("submitSignedBeaconBlock", () => {
+    it("rejects post-Gloas blocks before accessing fork-specific fields or publishing", async () => {
+      const hezeApi = getBuilderApi(
+        {
+          config: createBeaconConfig(getConfig(ForkName.heze), Buffer.alloc(32)),
+          logger: getMockedLogger(),
+          clock,
+          api,
+          bidStore,
+          proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
+          builderIndex,
+          metrics: null,
+        },
+        {authData}
+      );
+      const block = ssz.heze.SignedBeaconBlock.defaultValue();
+      block.message.slot = slot;
+      await expect(hezeApi.submitSignedBeaconBlock({signedBlock: {data: block}})).rejects.toMatchObject({
+        statusCode: 400,
+        message: "Signed beacon block submission requires Gloas",
+      });
+      expect(api.beacon.publishBlockV2).not.toHaveBeenCalled();
+      expect(api.validator.getProposerDutiesV2).not.toHaveBeenCalled();
+    });
+
     it("serves B but still accepts a proposer selecting an earlier A", async () => {
       const first = (await builderApi.getExecutionPayloadBid(bidRequest())).data;
       const oldBlock = signBlock();

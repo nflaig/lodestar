@@ -75,7 +75,8 @@ export class Revealer {
     }
 
     const msFromSlot = clock.msFromSlot(slot);
-    const cutoffMs = config.getSlotComponentDurationMs(this.opts.cutoffBps);
+    const fork = config.getForkName(slot);
+    const cutoffMs = config.getSlotComponentDurationMs(fork, this.opts.cutoffBps);
     if (msFromSlot > cutoffMs) {
       logger.warn("Block with our bid arrived after reveal cutoff, not revealing", {...logCtx, msFromSlot, cutoffMs});
       metrics?.reveals.total.inc({result: RevealResult.late});
@@ -98,7 +99,7 @@ export class Revealer {
     if (this.opts.adversarialDelayExecutionPayload) {
       const delayBps =
         this.opts.adversarialDelayExecutionPayloadBps ?? defaultOptions.reveal.adversarialDelayExecutionPayloadBps;
-      const delayMs = Math.max(config.getSlotComponentDurationMs(delayBps) - msFromSlot, 0);
+      const delayMs = Math.max(config.getSlotComponentDurationMs(fork, delayBps) - msFromSlot, 0);
       logger.warn("ADVERSARIAL: Delaying execution payload reveal", {...logCtx, delayBps, delayMs});
       await sleep(delayMs, this.modules.signal);
     }

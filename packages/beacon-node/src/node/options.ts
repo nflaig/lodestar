@@ -3,12 +3,20 @@ import {ArchiveMode, DEFAULT_ARCHIVE_MODE, IChainOptions, defaultChainOptions} f
 import {ValidatorMonitorOpts, defaultValidatorMonitorOpts} from "../chain/validatorMonitor.js";
 import {DatabaseOptions, defaultDbOptions} from "../db/options.js";
 import {
+  BUILDER_BID_LAG_BUFFER_MS,
+  DEFAULT_BUILDER_BID_DEADLINE_MS,
+  DEFAULT_BUILDER_BID_DELAY_MS,
+  DEFAULT_BUILDER_BID_REQUESTS,
+} from "../execution/builder/apiClient.js";
+import {
+  EngineApiMode,
   ExecutionBuilderOpts,
   ExecutionEngineOpts,
   defaultExecutionBuilderHttpOpts,
   defaultExecutionBuilderOpts,
   defaultExecutionEngineHttpOpts,
   defaultExecutionEngineOpts,
+  engineApiModes,
 } from "../execution/index.js";
 import {MetricsOptions, defaultMetricsOptions} from "../metrics/options.js";
 import {MonitoringOptions, defaultMonitoringOptions} from "../monitoring/options.js";
@@ -18,8 +26,19 @@ import {SyncOptions, defaultSyncOptions} from "../sync/options.js";
 // Re-export so the CLI doesn't need to depend on lodestar-api
 export {allNamespaces} from "../api/rest/index.js";
 
-// Re-export to use as default values in CLI args
-export {defaultExecutionEngineHttpOpts, defaultExecutionBuilderHttpOpts, ArchiveMode, DEFAULT_ARCHIVE_MODE};
+// Re-export to use as default values and for validation in CLI args
+export {
+  defaultExecutionEngineHttpOpts,
+  defaultExecutionBuilderHttpOpts,
+  BUILDER_BID_LAG_BUFFER_MS,
+  DEFAULT_BUILDER_BID_DEADLINE_MS,
+  DEFAULT_BUILDER_BID_DELAY_MS,
+  DEFAULT_BUILDER_BID_REQUESTS,
+  engineApiModes,
+  ArchiveMode,
+  DEFAULT_ARCHIVE_MODE,
+};
+export type {EngineApiMode};
 
 export interface IBeaconNodeOptions {
   api: ApiOptions;
