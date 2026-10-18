@@ -1,23 +1,19 @@
-import {pubkeyCache} from "@chainsafe/lodestar-z/pubkeys";
-import {ApiClient, ApiError, HttpStatusCode, WireFormat, routes} from "@lodestar/api";
+import {ApiClient, ApiError, HttpStatusCode, routes} from "@lodestar/api";
 import {BeaconConfig} from "@lodestar/config";
-import {MAX_PENDING_DEPOSITS_PER_EPOCH, PAYLOAD_BUILDER_VERSION} from "@lodestar/params";
-import {
-  IClock,
-  computeStartSlotAtEpoch,
-  createBeaconStateView,
-  getValidatorCountFromStateBytes,
-  isStatePostGloas,
-} from "@lodestar/state-transition";
-import {BuilderStatus, Slot, getBuilderStatus as getStatusOfBuilder} from "@lodestar/types";
-import {ErrorAborted, Logger, TimeoutError, isErrorAborted, isFetchError, sleep, toHex} from "@lodestar/utils";
+import {FAR_FUTURE_EPOCH, PAYLOAD_BUILDER_VERSION} from "@lodestar/params";
+import {IClock, computeStartSlotAtEpoch} from "@lodestar/state-transition";
+import {BuilderIndex, BuilderStatus, ssz} from "@lodestar/types";
+import {ErrorAborted, Logger, TimeoutError, fromHex, isFetchError, sleep, toHex} from "@lodestar/utils";
 
 /**
- * Point within the last slot before the Gloas fork at which the builder registry of the fork is
- * computed, in basis points. Late enough for the block of that slot to be the head and early
- * enough to bid for the first Gloas slot.
+ * Identity of a builder deposited before the Gloas fork, asserted by the operator. The fork upgrade onboards
+ * the deposit and the beacon node only knows the builder once the first Gloas block is the head, which is too
+ * late to bid for that block. The status tracker verifies the assumption against the registry after the fork.
  */
-const FORK_REGISTRY_LOOKUP_BPS = 5000;
+export type AssumedBuilderIdentity = {
+  index: BuilderIndex;
+  balanceGwei: number;
+};
 
 export async function resolveBuilderIdentity(
   api: ApiClient,
@@ -25,9 +21,10 @@ export async function resolveBuilderIdentity(
   id: routes.beacon.BuilderId,
   signal: AbortSignal,
   clock: IClock,
-  config: BeaconConfig
+  config: BeaconConfig,
+  assumed?: AssumedBuilderIdentity
 ): Promise<routes.beacon.BuilderResponse> {
-  const builderEntry = await waitForBuilder(api, logger, id, signal, clock, config);
+  const builderEntry = await waitForBuilder(api, logger, id, signal, clock, config, assumed);
 
   if (builderEntry.builder.version !== PAYLOAD_BUILDER_VERSION) {
     throw Error(`Builder version mismatch: got ${builderEntry.builder.version}, expected ${PAYLOAD_BUILDER_VERSION}`);
@@ -48,11 +45,12 @@ export async function getBuilderStatus(
   api: ApiClient,
   logger: Logger,
   id: routes.beacon.BuilderId
-): Promise<{status: BuilderStatus; balance: number} | null> {
+): Promise<{index: BuilderIndex; status: BuilderStatus; balance: number} | null> {
   try {
     const builderEntry = await fetchBuilder(api, logger, id);
     if (builderEntry) {
       return {
+        index: builderEntry.index,
         status: builderEntry.status,
         balance: builderEntry.builder.balance,
       };
@@ -76,41 +74,30 @@ async function waitForBuilder(
   id: routes.beacon.BuilderId,
   signal: AbortSignal,
   clock: IClock,
-  config: BeaconConfig
+  config: BeaconConfig,
+  assumed?: AssumedBuilderIdentity
 ): Promise<routes.beacon.BuilderResponse> {
   const gloasForkEpoch = config.GLOAS_FORK_EPOCH;
   while (!signal.aborted) {
     const currentEpoch = clock.getCurrentEpoch();
     if (currentEpoch < gloasForkEpoch) {
-      const currentSlot = clock.getCurrentSlot();
       const forkSlot = computeStartSlotAtEpoch(gloasForkEpoch);
-      if (currentSlot < forkSlot - 1) {
-        // Builders only exist post-gloas, the beacon node returns an error for pre-gloas state
-        logger.info("Waiting for Gloas fork before resolving builder identity", {
-          gloasForkEpoch,
-          currentEpoch,
-          slot: currentSlot,
+      if (assumed !== undefined) {
+        logger.info("Assuming builder identity until the Gloas fork", {
+          id,
+          index: assumed.index,
+          balanceGwei: assumed.balanceGwei,
+          forkSlot,
         });
-        await sleep(clock.msToSlot(Math.min(computeStartSlotAtEpoch(currentEpoch + 1), forkSlot - 1)), signal);
-        continue;
+        return assumedBuilderResponse(id, assumed);
       }
-
-      // Builders deposited before the fork are onboarded by the fork upgrade, the beacon node only knows
-      // them once the first Gloas block is the head. Compute the registry of the fork from the head state
-      // of the last slot before it, to be able to bid for the first Gloas slot.
-      await sleep(config.getSlotComponentDurationMs(FORK_REGISTRY_LOOKUP_BPS) - clock.msFromSlot(currentSlot), signal);
-      let builder: routes.beacon.BuilderResponse | null = null;
-      try {
-        builder = await fetchBuilderAtFork(api, config, forkSlot, id);
-      } catch (e) {
-        if (isErrorAborted(e)) throw e;
-        logger.warn("Unable to compute the builder registry of the Gloas fork", {forkSlot}, e as Error);
-      }
-      if (builder?.status === "active") {
-        return builder;
-      }
-      logger.info("Builder is not active at the Gloas fork", {id, status: builder?.status ?? "unknown", forkSlot});
-      await sleep(clock.msToSlot(forkSlot), signal);
+      // Builders only exist post-gloas, the beacon node returns an error for pre-gloas state
+      logger.info("Waiting for Gloas fork before resolving builder identity", {
+        gloasForkEpoch,
+        currentEpoch,
+        slot: clock.getCurrentSlot(),
+      });
+      await sleep(clock.msToSlot(Math.min(computeStartSlotAtEpoch(currentEpoch + 1), forkSlot)), signal);
       continue;
     }
 
@@ -186,33 +173,18 @@ async function fetchBuilder(
   }
 }
 
-async function fetchBuilderAtFork(
-  api: ApiClient,
-  config: BeaconConfig,
-  forkSlot: Slot,
-  id: routes.beacon.BuilderId
-): Promise<routes.beacon.BuilderResponse | null> {
-  const stateBytes = (await api.debug.getStateV2({stateId: "head"}, {responseWireFormat: WireFormat.ssz})).ssz();
-  const validatorCount = getValidatorCountFromStateBytes(config, stateBytes);
-  if (validatorCount === null) {
-    throw Error("Cannot read validator count from head state");
+function assumedBuilderResponse(
+  id: routes.beacon.BuilderId,
+  assumed: AssumedBuilderIdentity
+): routes.beacon.BuilderResponse {
+  const builder = ssz.gloas.Builder.defaultValue();
+  if (typeof id === "string") {
+    builder.pubkey = fromHex(id);
   }
-  // The view syncs pubkeys during construction, capacity must be reserved first
-  pubkeyCache.ensureCapacity(validatorCount + MAX_PENDING_DEPOSITS_PER_EPOCH);
-  const forkState = createBeaconStateView({useNative: false, config, stateBytes}).processSlots(forkSlot);
-  if (!isStatePostGloas(forkState)) {
-    throw Error(`Expected gloas state at fork slot, got fork=${forkState.forkName}`);
-  }
-
-  const finalizedEpoch = forkState.finalizedCheckpoint.epoch;
-  const buildersLength = forkState.getBuildersLength();
-  for (let index = 0; index < buildersLength; index++) {
-    const builder = forkState.getBuilder(index);
-    if (typeof id === "number" ? id === index : id === toHex(builder.pubkey)) {
-      return {index, status: getStatusOfBuilder(builder, finalizedEpoch), builder};
-    }
-  }
-  return null;
+  builder.version = PAYLOAD_BUILDER_VERSION;
+  builder.balance = assumed.balanceGwei;
+  builder.withdrawableEpoch = FAR_FUTURE_EPOCH;
+  return {index: assumed.index, status: "active", builder};
 }
 
 function msToNextEpochPoll(clock: IClock): number {
