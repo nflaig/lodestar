@@ -66,7 +66,17 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   const updateCutoffBps = args["bidding.updateCutoffBps"];
   const maxRevisionsPerSlot = args["bidding.maxRevisionsPerSlot"];
   const alternateBranches = args["bidding.alternateBranches"] ?? false;
+  const beginReservations = args["payload.beginReservations"] ?? false;
+  if (beginReservations && !constructorUrl) {
+    throw new YargsError("--payload.beginReservations requires --payload.constructorUrl");
+  }
   const alternateBuildDurationMs = args["bidding.alternateBuildDurationMs"] ?? 500;
+  if (
+    args["builderApi.bidStreamAdaptiveTiming"] === true &&
+    (args.builderApi !== true || args["builderApi.bidStream"] !== true)
+  ) {
+    throw new YargsError("--builderApi.bidStreamAdaptiveTiming requires --builderApi and --builderApi.bidStream");
+  }
   if (
     !Number.isSafeInteger(updateIntervalMs) ||
     (updateIntervalMs !== 0 && (updateIntervalMs < 25 || !constructorUrl))
@@ -177,7 +187,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
           signal,
           timeout: args["execution.timeout"],
         }),
-      {boundedAlternates: alternateBranches}
+      {boundedAlternates: alternateBranches, beginReservations, logger}
     );
     logger.info("Session payload source", {
       url: toPrintableUrl(constructorUrl),
@@ -236,7 +246,12 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   let builder: Builder | null = null;
   if (builderApiOpts !== undefined) {
     const builderApiServer = new BuilderRestApiServer(
-      {address: args["builderApi.address"], port: args["builderApi.port"], bidStream: args["builderApi.bidStream"]},
+      {
+        address: args["builderApi.address"],
+        port: args["builderApi.port"],
+        bidStream: args["builderApi.bidStream"],
+        bidStreamAdaptiveTiming: args["builderApi.bidStreamAdaptiveTiming"],
+      },
       {
         config,
         logger,

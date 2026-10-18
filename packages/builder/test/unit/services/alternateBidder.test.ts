@@ -24,6 +24,10 @@ const dependentRoot = Buffer.alloc(32, 7);
 const key = SecretKey.fromBytes(Buffer.alloc(32, 1));
 const pubkey = key.toPublicKey().toBytes();
 
+function hasReason(context: unknown, reason: string): boolean {
+  return typeof context === "object" && context !== null && "reason" in context && context.reason === reason;
+}
+
 function attributes(root: number, hash: number): AlternatePayloadAttributesEvent {
   const data = ssz.gloas.SSEPayloadAttributes.defaultValue();
   data.proposalSlot = 1;
@@ -122,6 +126,7 @@ describe("alternate parent bidder", () => {
       .fn<(bid: gloas.SignedExecutionPayloadBid) => Promise<void>>()
       .mockResolvedValue(undefined);
     const logger = getMockedLogger();
+    const getBuilderStatus = vi.fn(() => ({status: "active" as const, balance: 10_000_000_000}));
     const modules = createBiddingModules({
       api,
       config,
@@ -137,6 +142,7 @@ describe("alternate parent bidder", () => {
       }),
       canRetainAlternate,
       retainCommitment,
+      getBuilderStatus,
       updateOptions: {updateIntervalMs: 100, alternateBranches: true, ...options},
     });
     const start = (event: PayloadAttributesEvent) => {
@@ -151,6 +157,7 @@ describe("alternate parent bidder", () => {
     return {
       ...modules,
       api,
+      clock,
       payloadSource,
       payloadStore,
       sessions,
@@ -160,8 +167,251 @@ describe("alternate parent bidder", () => {
       retainCommitment,
       logger,
       proposerPreferencesTracker,
+      getBuilderStatus,
     };
   }
+
+  describe("bounded journal recheck", () => {
+    function startBusyAlternate(options: Partial<BidderOptions> = {}) {
+      const m = setup(options);
+      const primary = attributes(4, 5);
+      const alternate = attributes(4, 6);
+      m.payloadSource.getPayload.mockImplementation(async (handle) => {
+        const session = m.sessions.get(handle.payloadId);
+        if (!session) throw Error("Missing session");
+        if (session.request.requireUnleased) m.canRetainAlternate.mockReturnValue(false);
+        return session.payload;
+      });
+      m.start(primary);
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      return {...m, primary, alternate};
+    }
+
+    function retainedAlternates(m: ReturnType<typeof startBusyAlternate>) {
+      return m.retainCommitment.mock.calls.filter(
+        ([bid]) => toRootHex(bid.message.parentBlockHash) === toRootHex(m.alternate.data.parentBlockHash)
+      );
+    }
+
+    it("uses the copied snapshot after one idle recheck without another build or retrieval", async () => {
+      const m = startBusyAlternate();
+      await vi.advanceTimersByTimeAsync(350);
+      expect(m.sessions.size).toBe(2);
+      expect(m.offer(m.alternate)).toBeNull();
+      const primary = m.sessions.get("1");
+      if (!primary) throw Error("Missing primary");
+      primary.payload = {
+        ...primary.payload,
+        executionPayloadValue: 2_000_000_000_000_000_000n,
+        executionPayload: {...primary.payload.executionPayload, blockHash: Buffer.alloc(32, 19)},
+      };
+      m.canRetainAlternate.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(9);
+      expect(m.offer(m.alternate)).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(m.offer(m.alternate)).not.toBeNull();
+      expect(retainedAlternates(m)).toHaveLength(1);
+      expect(m.payloadSource.prepare.mock.calls.filter(([r]) => r.requireUnleased)).toHaveLength(1);
+      expect(m.payloadSource.getPayload.mock.calls.filter(([h]) => h.payloadId === "2")).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(40);
+      expect(m.offer(m.primary)?.message.value).toBe(1_800_000_000);
+      expect(m.sessions.size).toBe(1);
+      expect(m.logger.debug).toHaveBeenCalledWith(
+        "Alternate parent journal recheck",
+        expect.objectContaining({code: "BUILDER_ALTERNATE_JOURNAL_RECHECK", outcome: "idle"})
+      );
+    });
+
+    it("skips after one recheck if the journal remains busy and never restarts that build", async () => {
+      const m = startBusyAlternate();
+      await vi.advanceTimersByTimeAsync(360);
+      expect(m.offer(m.alternate)).toBeNull();
+      expect(retainedAlternates(m)).toHaveLength(0);
+      expect(m.sessions.size).toBe(1);
+      m.canRetainAlternate.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(m.payloadSource.prepare.mock.calls.filter(([r]) => r.requireUnleased)).toHaveLength(1);
+      expect(m.logger.debug).toHaveBeenCalledWith(
+        "Alternate parent journal recheck",
+        expect.objectContaining({outcome: "busy"})
+      );
+    });
+
+    it.each([100, 99])("requires at least 100ms remaining after the wait (%ims)", async (remainingMs) => {
+      const m = startBusyAlternate();
+      await vi.advanceTimersByTimeAsync(350);
+      m.canRetainAlternate.mockReturnValue(true);
+      vi.setSystemTime(500 - remainingMs - 10);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(retainedAlternates(m)).toHaveLength(remainingMs === 100 ? 1 : 0);
+      expect(m.logger.debug).toHaveBeenCalledWith(
+        "Alternate parent journal recheck",
+        expect.objectContaining({outcome: remainingMs === 100 ? "idle" : "headroom", remainingMs})
+      );
+    });
+
+    it("rejects the alternate if the same primary becomes unready while waiting", async () => {
+      const m = startBusyAlternate({updateIntervalMs: 27});
+      await vi.advanceTimersByTimeAsync(350);
+      const primary = m.sessions.get("1");
+      if (!primary) throw Error("Missing primary");
+      primary.payload = {
+        ...primary.payload,
+        offerEligibility: {
+          generation: "0x0",
+          lease: {generation: "0x0", ready: false, validUntil: 0, validUntilUnixMs: 0},
+        },
+      };
+      m.canRetainAlternate.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(retainedAlternates(m)).toHaveLength(0);
+      expect(m.offer(m.alternate)).toBeNull();
+      expect(m.logger.debug).toHaveBeenCalledWith(
+        "Alternate parent journal recheck",
+        expect.objectContaining({outcome: "primary_not_ready"})
+      );
+    });
+
+    it("does not let a recheck diagnostic failure change admission", async () => {
+      const m = startBusyAlternate();
+      m.logger.debug.mockImplementation((message) => {
+        if (message === "Alternate parent journal recheck") throw Error("logger unavailable");
+      });
+      await vi.advanceTimersByTimeAsync(350);
+      m.canRetainAlternate.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(retainedAlternates(m)).toHaveLength(1);
+      expect(m.offer(m.alternate)).not.toBeNull();
+    });
+
+    it.each(["alternatesDisabled", "uncertain"] as const)("rechecks source %s after waiting", async (field) => {
+      const m = startBusyAlternate();
+      await vi.advanceTimersByTimeAsync(350);
+      const resources = m.payloadSource.getResources();
+      if (!resources) throw Error("Missing resources");
+      m.payloadSource.getResources.mockReturnValue({...resources, [field]: field === "uncertain" ? 1 : true});
+      m.canRetainAlternate.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(retainedAlternates(m)).toHaveLength(0);
+      expect(m.offer(m.alternate)).toBeNull();
+      expect(m.logger.debug).toHaveBeenCalledWith(
+        "Alternate parent journal recheck",
+        expect.objectContaining({outcome: field === "uncertain" ? "source_uncertain" : "source_disabled"})
+      );
+    });
+
+    it("does not rebuild a copied recheck snapshot after an eligible primary replaces it", async () => {
+      const m = startBusyAlternate();
+      await vi.advanceTimersByTimeAsync(350);
+      m.canRetainAlternate.mockReturnValue(true);
+      const replacement = attributes(8, 9);
+      m.start(replacement);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(m.offer(replacement)).not.toBeNull();
+      expect(m.offer(m.alternate)).toBeNull();
+      expect(retainedAlternates(m)).toHaveLength(0);
+      expect(m.payloadSource.prepare.mock.calls.filter(([r]) => r.requireUnleased)).toHaveLength(1);
+      expect(m.payloadSource.getPayload.mock.calls.filter(([h]) => h.payloadId === "2")).toHaveLength(1);
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it.each([15, 16])("preserves the 250ms deadline with %ims retrieval before a busy recheck", async (retrievalMs) => {
+      const m = startBusyAlternate({alternateBuildDurationMs: 250});
+      const getPayload = m.payloadSource.getPayload.getMockImplementation();
+      if (!getPayload) throw Error("Missing payload implementation");
+      m.payloadSource.getPayload.mockImplementation(async (...args) => {
+        const payload = await getPayload(...args);
+        if (args[0].payloadId === "2") await new Promise<void>((resolve) => setTimeout(resolve, retrievalMs));
+        return payload;
+      });
+      await vi.advanceTimersByTimeAsync(125 + retrievalMs);
+      m.canRetainAlternate.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(retainedAlternates(m)).toHaveLength(retrievalMs === 15 ? 1 : 0);
+      expect(m.payloadSource.getPayload.mock.calls.filter(([h]) => h.payloadId === "2")).toHaveLength(1);
+      expect(m.logger.debug).toHaveBeenCalledWith(
+        "Alternate parent journal recheck",
+        expect.objectContaining({outcome: retrievalMs === 15 ? "idle" : "headroom"})
+      );
+    });
+
+    it.each(["abort", "primary change", "deadline", "insufficient headroom"] as const)(
+      "does not sign when %s occurs during the recheck wait",
+      async (reason) => {
+        const m = startBusyAlternate();
+        await vi.advanceTimersByTimeAsync(350);
+        m.canRetainAlternate.mockReturnValue(true);
+        if (reason === "abort") controller.abort();
+        else if (reason === "primary change") {
+          const replacement = attributes(8, 9);
+          replacement.data.proposerIndex = 4;
+          m.start(replacement);
+        } else vi.setSystemTime(reason === "deadline" ? 600 : 405);
+        await vi.advanceTimersByTimeAsync(10);
+        expect(m.offer(m.alternate)).toBeNull();
+        expect(retainedAlternates(m)).toHaveLength(0);
+        expect(m.payloadSource.prepare.mock.calls.filter(([r]) => r.requireUnleased)).toHaveLength(1);
+        expect(m.logger.debug).toHaveBeenCalledWith(
+          "Alternate parent journal recheck",
+          expect.objectContaining({outcome: reason === "abort" || reason === "primary change" ? "aborted" : "headroom"})
+        );
+      }
+    );
+
+    it.each(["branch capacity", "head balance", "new liability"] as const)(
+      "uses fresh %s after the recheck wait",
+      async (change) => {
+        const m = startBusyAlternate();
+        if (change === "new liability") m.alternate.context.builders[0].availableGwei = 1_000_000_000;
+        await vi.advanceTimersByTimeAsync(350);
+        m.canRetainAlternate.mockReturnValue(true);
+        if (change === "branch capacity") m.alternate.context.builders[0].availableGwei = 400_000_000;
+        else if (change === "head balance")
+          m.getBuilderStatus.mockReturnValue({status: "active", balance: 1_300_000_000});
+        else {
+          const recorded = m.ledger.getBidsForSlot(1)[0];
+          expect(m.ledger.recordWin(recorded, toRootHex(Buffer.alloc(32, 88)))).not.toBeNull();
+        }
+        await vi.advanceTimersByTimeAsync(10);
+        expect(m.offer(m.alternate)).toBeNull();
+        expect(retainedAlternates(m)).toHaveLength(0);
+        expect(m.logger.info).toHaveBeenCalledWith(
+          "Bid policy declined to bid",
+          expect.objectContaining({
+            parentBlockHash: toRootHex(m.alternate.data.parentBlockHash),
+            coverableGwei:
+              change === "branch capacity" ? 400_000_000 : change === "head balance" ? 300_000_000 : 100_000_000,
+          })
+        );
+      }
+    );
+
+    it("rejects an inactive branch changed while waiting before it signs", async () => {
+      const m = startBusyAlternate();
+      await vi.advanceTimersByTimeAsync(350);
+      m.canRetainAlternate.mockReturnValue(true);
+      m.alternate.context.builders[0].active = false;
+      await vi.advanceTimersByTimeAsync(10);
+      expect(retainedAlternates(m)).toHaveLength(0);
+      expect(m.offer(m.alternate)).toBeNull();
+    });
+
+    it("checks revision capacity after waiting instead of reserving ahead of primary updates", async () => {
+      const m = startBusyAlternate({maxRevisionsPerSlot: 4});
+      await vi.advanceTimersByTimeAsync(350);
+      m.canRetainAlternate.mockReturnValue(true);
+      const recorded = m.ledger.getBidsForSlot(1)[0];
+      m.ledger.recordRevision({
+        ...recorded,
+        blockHash: toRootHex(Buffer.alloc(32, 87)),
+        signedBidRoot: toRootHex(Buffer.alloc(32, 86)),
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(m.ledger.getRevisionCount(1)).toBe(2);
+      expect(retainedAlternates(m)).toHaveLength(0);
+      expect(m.offer(m.alternate)).toBeNull();
+    });
+  });
 
   it("retains four head/parent FULL/EMPTY tuples while the primary keeps improving and alone gossips", async () => {
     const m = setup();
@@ -195,6 +445,70 @@ describe("alternate parent bidder", () => {
     }
     expect(m.payloadSource.prepare).toHaveBeenCalledTimes(4);
   });
+
+  it.each([250, 500, 1000])(
+    "finishes a 100ms alternate journal write within the existing %ims budget",
+    async (duration) => {
+      const m = setup({alternateBuildDurationMs: duration});
+      const primary = attributes(4, 5);
+      const alternate = attributes(4, 6);
+      let retainedAt: number | undefined;
+      m.retainCommitment.mockImplementation(async (bid) => {
+        if (toRootHex(bid.message.parentBlockHash) === toRootHex(alternate.data.parentBlockHash)) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 100));
+          retainedAt = Date.now();
+        }
+      });
+      m.start(primary);
+      const startedAt = Date.now();
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(duration);
+
+      expect(retainedAt).toBeDefined();
+      expect(retainedAt).toBeLessThan(startedAt + duration);
+      expect(m.offer(alternate)).not.toBeNull();
+      expect(m.offer(primary)).not.toBeNull();
+      expect(m.sessions.size).toBe(1);
+      expect(m.payloadSource.release.mock.calls.map(([handle]) => handle.payloadId)).not.toContain("1");
+    }
+  );
+
+  it.each([20, 30])(
+    "includes %ims of retrieval in the shortest alternate retention deadline",
+    async (retrievalTime) => {
+      const m = setup({alternateBuildDurationMs: 250});
+      const alternate = attributes(4, 6);
+      const retained: gloas.SignedExecutionPayloadBid[] = [];
+      m.payloadSource.getPayload.mockImplementation(async (handle) => {
+        if (handle.payloadId === "2") await new Promise<void>((resolve) => setTimeout(resolve, retrievalTime));
+        const session = m.sessions.get(handle.payloadId);
+        if (!session) throw Error("Missing session");
+        return session.payload;
+      });
+      m.retainCommitment.mockImplementation(async (bid) => {
+        if (toRootHex(bid.message.parentBlockHash) === toRootHex(alternate.data.parentBlockHash)) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 100));
+          retained.push(bid);
+        }
+      });
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(retained).toHaveLength(1);
+      expect(m.bidStore.has(retained[0])).toBe(true);
+      expect(m.payloadStore.has(toRootHex(retained[0].message.blockHash))).toBe(true);
+      expect(m.bidStore.canOffer(retained[0])).toBe(retrievalTime === 20);
+      expect(m.offer(alternate) !== null).toBe(retrievalTime === 20);
+      if (retrievalTime === 30)
+        expect(m.logger.debug).toHaveBeenCalledWith("Skipping alternate parent bid", {
+          slot: 1,
+          parentBlockRoot: toRootHex(alternate.data.parentBlockRoot),
+          parentBlockHash: toRootHex(alternate.data.parentBlockHash),
+          reason: "deadline_after_retention",
+        });
+    }
+  );
 
   it.each([false, true])(
     "keeps the primary alive across standard-topic alternate/repeated-primary interleaving (enabled=%s)",
@@ -275,6 +589,103 @@ describe("alternate parent bidder", () => {
     m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
     await vi.advanceTimersByTimeAsync(1000);
     expect(m.payloadSource.prepare).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs source blocking reasons once per slot despite repeated resource polls", async () => {
+    const m = setup();
+    const resources: PayloadSourceResources = {
+      capacity: 2,
+      active: 1,
+      preparing: 0,
+      releasing: 0,
+      uncertain: 1,
+      alternatesDisabled: false,
+    };
+    Object.assign(resources, {code: "private-code", reason: "private-reason", endpoint: "http://private:secret@rpc"});
+    m.payloadSource.getResources.mockReturnValue(resources);
+    const alternate = attributes(4, 6);
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(alternate);
+    await vi.advanceTimersByTimeAsync(2000);
+    const diagnostics = () => m.logger.debug.mock.calls.filter(([message]) => message === "Alternate parent admission");
+    expect(m.payloadSource.getResources.mock.calls.length).toBeGreaterThan(30);
+    expect(diagnostics().filter(([, context]) => hasReason(context, "source_busy"))).toHaveLength(1);
+    expect(m.logger.debug).toHaveBeenCalledWith("Alternate parent admission", {
+      code: "BUILDER_ALTERNATE_ADMISSION",
+      reason: "source_busy",
+      localSlot: 0,
+      slot: 1,
+      parentBlockRoot: toRootHex(alternate.data.parentBlockRoot),
+      parentBlockHash: toRootHex(alternate.data.parentBlockHash),
+      primarySlot: 1,
+      primaryReady: true,
+      activeBuilds: 1,
+      queueSize: 1,
+      attempts: 0,
+      capacity: 2,
+      active: 1,
+      preparing: 0,
+      releasing: 0,
+      uncertain: 1,
+      alternatesDisabled: false,
+    });
+    resources.alternatesDisabled = true;
+    await vi.advanceTimersByTimeAsync(2000);
+    for (let i = 0; i < 100; i++) m.bidder.onAlternatePayloadAttributes(alternate);
+    expect(diagnostics().filter(([, context]) => hasReason(context, "source_disabled"))).toHaveLength(1);
+    expect(diagnostics().filter(([, context]) => hasReason(context, "received"))).toHaveLength(1);
+    expect(diagnostics().length).toBeLessThanOrEqual(16);
+    expect(m.payloadSource.prepare).toHaveBeenCalledTimes(1);
+    expect(m.offer(alternate)).toBeNull();
+    expect(m.offer(attributes(4, 5))).not.toBeNull();
+  });
+
+  it("bounds receipt diagnostics by local slot regardless of event slot or tuple churn", () => {
+    const m = setup();
+    const flood = () => {
+      for (let i = 0; i < 200; i++) {
+        const event = attributes(i, 6);
+        event.data.proposalSlot = 1000 + i;
+        m.bidder.onAlternatePayloadAttributes(event);
+      }
+    };
+    const diagnostics = () => m.logger.debug.mock.calls.filter(([message]) => message === "Alternate parent admission");
+    flood();
+    expect(diagnostics().filter(([, context]) => hasReason(context, "received"))).toHaveLength(4);
+    expect(diagnostics().filter(([, context]) => hasReason(context, "primary_context_unavailable"))).toHaveLength(1);
+    expect(diagnostics().length).toBeLessThanOrEqual(16);
+    vi.setSystemTime(12_000);
+    flood();
+    expect(diagnostics().filter(([, context]) => hasReason(context, "received"))).toHaveLength(8);
+    expect(diagnostics().length).toBeLessThanOrEqual(32);
+    const count = diagnostics().length;
+    vi.setSystemTime(0);
+    flood();
+    expect(diagnostics()).toHaveLength(count);
+    expect(m.payloadSource.prepare).not.toHaveBeenCalled();
+  });
+
+  it("does not alter primary or alternate construction when admission diagnostics throw", async () => {
+    const m = setup();
+    m.logger.debug.mockImplementation((message) => {
+      if (message === "Alternate parent admission") throw new Error("logger unavailable");
+    });
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(m.payloadSource.prepare).toHaveBeenCalledTimes(2);
+    expect(m.sessions.size).toBe(1);
+    expect(m.offer(attributes(4, 5))).not.toBeNull();
+    expect(m.offer(attributes(4, 6))).not.toBeNull();
+  });
+
+  it("does not expose a diagnostic clock failure when no primary exists", () => {
+    const m = setup();
+    vi.spyOn(m.clock, "getCurrentSlot").mockImplementation(() => {
+      throw new Error("clock unavailable");
+    });
+    expect(() => m.bidder.onAlternatePayloadAttributes(attributes(4, 6))).not.toThrow();
+    expect(m.payloadSource.prepare).not.toHaveBeenCalled();
   });
 
   it("waits around gossip and does not allocate new work too late to finish before the slot", async () => {

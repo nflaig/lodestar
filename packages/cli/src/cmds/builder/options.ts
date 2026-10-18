@@ -30,6 +30,7 @@ export type IBuilderCliArgs = LogArgs & {
   "payload.transactionsFile"?: string;
   "payload.testingUrl"?: string;
   "payload.constructorUrl"?: string;
+  "payload.beginReservations"?: boolean;
   "payload.outputDir"?: string;
   "payload.dryRun"?: boolean;
 
@@ -59,6 +60,7 @@ export type IBuilderCliArgs = LogArgs & {
   "builderApi.publicUrl"?: string;
   "builderApi.authData"?: string;
   "builderApi.bidStream"?: boolean;
+  "builderApi.bidStreamAdaptiveTiming"?: boolean;
 
   metrics?: boolean;
   "metrics.port"?: number;
@@ -176,6 +178,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
   "payload.constructorUrl": {
     description: "Private zbuilder session RPC URL for incrementally constructed, validated payloads",
     type: "string",
+    group: "payload",
+  },
+
+  "payload.beginReservations": {
+    description: "Use server-issued constructor reservations to recover safely from lost session-begin replies",
+    type: "boolean",
+    default: false,
     group: "payload",
   },
 
@@ -369,6 +378,14 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
 
   "builderApi.bidStream": {
     description: "Enable the experimental authenticated Gloas WebSocket bid stream alongside the HTTP builder API",
+    type: "boolean",
+    default: false,
+    group: "builderApi",
+  },
+
+  "builderApi.bidStreamAdaptiveTiming": {
+    description:
+      "Adapt bid-stream send deadlines to measured RTT; requires bid streaming and verified end-to-end pong forwarding",
     type: "boolean",
     default: false,
     group: "builderApi",

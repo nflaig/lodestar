@@ -31,6 +31,32 @@ describe("cmds / builder / args handler", () => {
     await expect(runBuilderHandler({})).rejects.toThrow("Gloas must be scheduled via GLOAS_FORK_EPOCH");
   });
 
+  it("keeps adaptive stream timing disabled by default", () => {
+    expect(builderOptions["builderApi.bidStreamAdaptiveTiming"].default).toBe(false);
+  });
+
+  it.each([
+    {executionFeeRecipient: ZERO_ADDRESS},
+    {builderApi: true, "builderApi.bidStream": false},
+    {builderApi: false, "builderApi.bidStream": true},
+  ])("rejects adaptive timing without both API and streaming before loading keys", async (args) => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "builderApi.bidStreamAdaptiveTiming": true, ...args})
+    ).rejects.toThrow("--builderApi.bidStreamAdaptiveTiming requires --builderApi and --builderApi.bidStream");
+  });
+
+  it("accepts adaptive timing with API and streaming before unrelated validation", async () => {
+    await expect(
+      runBuilderHandler({
+        "params.GLOAS_FORK_EPOCH": "0",
+        builderApi: true,
+        "builderApi.bidStream": true,
+        "builderApi.bidStreamAdaptiveTiming": true,
+        executionFeeRecipient: ZERO_ADDRESS,
+      })
+    ).rejects.toThrow("Cannot put zero address as an executionFeeRecipient");
+  });
+
   it("Should reject zero executionFeeRecipient", async () => {
     // Rejecting with the fee recipient error rather than the Gloas error also proves the
     // fork guard read the epoch merged in from CLI args, not from the default config
@@ -61,6 +87,12 @@ describe("cmds / builder / args handler", () => {
     await expect(
       runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.maxRevisionsPerSlot": limit})
     ).rejects.toThrow("--bidding.maxRevisionsPerSlot must be between 1 and 256");
+  });
+
+  it("requires a constructor for recoverable begins", async () => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "payload.beginReservations": true})
+    ).rejects.toThrow("--payload.beginReservations requires --payload.constructorUrl");
   });
 
   it("rejects alternate branches without a session source and updates", async () => {

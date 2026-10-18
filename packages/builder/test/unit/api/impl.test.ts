@@ -7,7 +7,7 @@ import {ZERO_HASH, computeDomain, computeSigningRoot} from "@lodestar/state-tran
 import {gloas, ssz} from "@lodestar/types";
 import * as utils from "@lodestar/utils";
 import {BuilderBidStreamApi, getBuilderBidStreamApi} from "../../../src/api/bidStream.js";
-import {BuilderApi, bidWaitBudget, getBuilderApi} from "../../../src/api/impl.js";
+import {BuilderApi, bidResponseBudgets, bidWaitBudget, getBuilderApi} from "../../../src/api/impl.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {ProposerDutiesTracker} from "../../../src/services/proposerDutiesTracker.js";
 import {getApiClientStub, mockApiResponse} from "../utils/apiStub.js";
@@ -134,6 +134,63 @@ describe("builder api", () => {
   }
 
   describe("retained bid stream", () => {
+    describe("fixed response bounds", () => {
+      beforeEach(() => {
+        vi.useFakeTimers({toFake: ["Date", "performance", "setTimeout", "clearTimeout"]});
+        vi.setSystemTime(1_700_000_000_000);
+      });
+
+      afterEach(() => {
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+      });
+
+      it.each([
+        {transit: 200, timeout: 500, wait: 50, hard: 250},
+        {transit: 202, timeout: 500, wait: 46, hard: 248},
+        {transit: 182, timeout: 500, wait: 86, hard: 268},
+        {transit: 0, timeout: 500, wait: 450, hard: 450},
+        {transit: -1, timeout: 500, wait: 0, hard: 0},
+        {transit: 500, timeout: 500, wait: 0, hard: 0},
+      ])("captures original bounds for $transit ms inbound age", async ({transit, timeout, wait, hard}) => {
+        const arrivedAt = Date.now();
+        const stream = await streamApi.open(bidRequest({dateMilliseconds: arrivedAt - transit, timeoutMs: timeout}));
+        expect(stream.deadline).toBe(wait);
+        expect(stream.hardDeadline).toEqual({monotonic: hard, unixMs: arrivedAt + hard});
+        expect(stream.deadline).toBeLessThanOrEqual(stream.hardDeadline?.monotonic ?? 0);
+        expect(hard).toBeLessThanOrEqual(timeout);
+      });
+
+      it("never refreshes either bound after authentication or a wall-clock rollback", async () => {
+        const arrivedAt = Date.now();
+        const response = await api.validator.getProposerDutiesV2({epoch: 0});
+        api.validator.getProposerDutiesV2.mockImplementationOnce(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          vi.setSystemTime(arrivedAt - 10_000);
+          return response;
+        });
+        const pending = streamApi.open(bidRequest({dateMilliseconds: arrivedAt - 200}));
+        await vi.advanceTimersByTimeAsync(100);
+        const stream = await pending;
+        expect(stream.deadline).toBe(50);
+        expect(stream.hardDeadline).toEqual({monotonic: 250, unixMs: arrivedAt + 250});
+        expect(performance.now()).toBe(100);
+      });
+
+      it("snapshots the slot boundary once, with both deadlines capped at its end", async () => {
+        const arrivedAt = Date.now();
+        const remaining = vi.spyOn(clock, "msToSlot").mockReturnValue(-11_980);
+        const stream = await streamApi.open(bidRequest({dateMilliseconds: arrivedAt - 200}));
+        expect(stream.deadline).toBe(20);
+        expect(stream.hardDeadline).toEqual({monotonic: 20, unixMs: arrivedAt + 20});
+        expect(remaining).toHaveBeenCalledOnce();
+      });
+
+      it.each([slot - 1, slot + 2])("grants no adaptive allowance to slot %i outside the accepted window", (target) => {
+        expect(bidResponseBudgets(clock, config, target, 100, 500)).toEqual({waitMs: 0, hardStopMs: 0});
+      });
+    });
+
     it("authenticates the exact request context and observes later retained revisions", async () => {
       const started = performance.now();
       const stream = await streamApi.open(bidRequest({dateMilliseconds: Date.now(), timeoutMs: 500}));

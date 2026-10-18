@@ -43,7 +43,7 @@ class InteropServer extends BuilderRestApiServer {
 }
 
 // Opt in with the locally installed, pinned v0.12.0-rc1 release binary. All peers and keys are fixtures.
-describe.skipIf(!binary)("Commit-Boost Gloas bid stream interoperability", () => {
+describe.skipIf(!binary).each([false, true])("Commit-Boost Gloas stream, adaptive timing %s", (adaptiveTiming) => {
   let server: InteropServer | undefined;
   let child: ChildProcess | undefined;
   let directory: string | undefined;
@@ -117,7 +117,12 @@ describe.skipIf(!binary)("Commit-Boost Gloas bid stream interoperability", () =>
     httpBid = vi.fn(builderApi.getExecutionPayloadBid);
     streamOpen = vi.fn(streamApi.open);
     server = new InteropServer(
-      {address: "127.0.0.1", port: 0, bidStream: streamEnabled},
+      {
+        address: "127.0.0.1",
+        port: 0,
+        bidStream: streamEnabled,
+        bidStreamAdaptiveTiming: streamEnabled && adaptiveTiming,
+      },
       {
         config,
         logger: modules.logger,
