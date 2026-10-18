@@ -86,8 +86,8 @@ export async function getStateResponseWithRegen(
     typeof stateId === "string"
       ? await chain.getStateByStateRoot(stateId, {allowRegen: true})
       : typeof stateId === "number"
-        ? stateId > chain.clock.currentSlot
-          ? null // Don't try to serve future slots
+        ? stateId > chain.clock.currentSlot + 1
+          ? null // The next slot is the only future one served: its state before any block is what a builder needs ahead of a fork
           : stateId >= chain.forkChoice.getFinalizedBlock().slot
             ? await chain.getStateBySlot(stateId, {allowRegen: true})
             : await chain.getHistoricalStateBySlot(stateId)

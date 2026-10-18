@@ -99,6 +99,29 @@ describe("beacon state api utils", () => {
     });
   });
 
+  describe("getStateResponseWithRegen next slot", () => {
+    const currentSlot = 10 * SLOTS_PER_EPOCH - 1;
+    const servedResponse = {state: {}, executionOptimistic: false, finalized: false};
+    const getStateBySlot = vi.fn(() => Promise.resolve(servedResponse));
+    const chain = {
+      clock: {currentSlot},
+      forkChoice: {getFinalizedBlock: () => ({slot: 0})},
+      getStateBySlot,
+      getHistoricalStateBySlot: () => Promise.resolve(servedResponse),
+    } as unknown as IBeaconChain;
+    const sync = {state: SyncState.Synced} as unknown as IBeaconSync;
+
+    it("serves the state of the next slot, which at an epoch boundary is the state of the next epoch", async () => {
+      await expect(getStateResponseWithRegen(chain, sync, currentSlot + 1)).resolves.toBe(servedResponse);
+      expect(getStateBySlot).toHaveBeenCalledWith(currentSlot + 1, {allowRegen: true});
+    });
+
+    it("does not serve slots further ahead", async () => {
+      await expect(getStateResponseWithRegen(chain, sync, currentSlot + 2)).rejects.toThrow("State not found");
+      expect(getStateBySlot).not.toHaveBeenCalledWith(currentSlot + 2, expect.anything());
+    });
+  });
+
   describe("getStateResponseWithRegen head", () => {
     const head = {slot: 15902, stateRoot: "0xaa", executionStatus: ExecutionStatus.Valid};
     const headPostState = {epoch: 496, slot: 15902};
