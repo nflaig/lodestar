@@ -290,14 +290,13 @@ export class PrepareNextSlotScheduler {
         const finalizedBlockHash = getFinalizedExecutionBlockHash(this.chain.forkChoice);
 
         let payloadAttributes: PayloadAttributes | undefined;
-        let primaryAttributes: SSEPayloadAttributes | undefined;
         // If emitPayloadAttributes is true emit a SSE payloadAttributes event for
         // every slot. Without the flag, only emit the event if we are proposing in the next slot.
         if (
           (feeRecipient || this.chain.opts.emitPayloadAttributes === true) &&
           this.chain.emitter.listenerCount(routes.events.EventType.payloadAttributes)
         ) {
-          primaryAttributes = this.emitPayloadAttributes(fork as ForkPostBellatrix, {
+          const primaryAttributes = this.emitPayloadAttributes(fork as ForkPostBellatrix, {
             prepareSlot,
             parentBlock: updatedHead,
             parentBlockHash,
@@ -305,6 +304,13 @@ export class PrepareNextSlotScheduler {
             safeBlockHash,
             finalizedBlockHash,
             feeRecipient,
+          });
+          this.alternates?.request({
+            clockSlot,
+            headRoot,
+            primaryParent: updatedHead,
+            primary: primaryAttributes,
+            preparedState,
           });
           payloadAttributes = primaryAttributes.payloadAttributes;
         }
@@ -336,15 +342,6 @@ export class PrepareNextSlotScheduler {
           });
         }
 
-        if (primaryAttributes !== undefined) {
-          this.alternates?.request({
-            clockSlot,
-            headRoot,
-            primaryParent: updatedHead,
-            primary: primaryAttributes,
-            preparedState,
-          });
-        }
         this.computeStateHashTreeRoot(preparedState, isEpochTransition);
       } else {
         // Pre-bellatrix only reaches here at an epoch transition to precompute the next epoch state

@@ -55,11 +55,21 @@ describe("Gloas payload attribute alternatives", () => {
   const blocks = new Map<string, ProtoBlock>();
   const states = new Map<string, IBeaconStateViewGloas>();
 
+  function header(slot: number, number: number, parentRoot: string): gloas.BeaconState["latestBlockHeader"] {
+    return {
+      ...ssz.phase0.BeaconBlockHeader.defaultValue(),
+      slot,
+      parentRoot: fromHex(parentRoot),
+      stateRoot: fromHex(root(number + 100)),
+      bodyRoot: ssz.phase0.BeaconBlockBody.hashTreeRoot(ssz.phase0.BeaconBlockBody.defaultValue()),
+    };
+  }
+
   function block(slot: number, number: number, parentRoot: string, status = PayloadStatus.EMPTY): ProtoBlock {
     return {
       ...zeroProtoBlock,
       slot,
-      blockRoot: root(number),
+      blockRoot: toRootHex(ssz.phase0.BeaconBlockHeader.hashTreeRoot(header(slot, number, parentRoot))),
       parentRoot,
       stateRoot: root(number + 100),
       payloadStatus: status,
@@ -76,7 +86,7 @@ describe("Gloas payload attribute alternatives", () => {
         slot: block.slot,
         validators,
         inactivityScores: Array.from({length: validators.length}, () => 0),
-        latestBlockHeader: {...ssz.phase0.BeaconBlockHeader.defaultValue(), slot: block.slot},
+        latestBlockHeader: header(block.slot, number, block.parentRoot),
         latestExecutionPayloadBid: {
           ...ssz.gloas.ExecutionPayloadBid.defaultValue(),
           parentBlockHash: fromHex(root(number + 10)),
@@ -239,6 +249,50 @@ describe("Gloas payload attribute alternatives", () => {
     ]);
   });
 
+  it.each(["primary", "post-state", "checkpoint"] as const)(
+    "rejects a %s state from another beacon parent even when the EL parent hash matches",
+    async (source) => {
+      if (source === "checkpoint") setup(SLOTS_PER_EPOCH - 1);
+      const wrongState = state(head, 3, {
+        latestExecutionPayloadBid: parentState.latestExecutionPayloadBid,
+        latestBlockHash: parentState.latestBlockHash,
+      });
+      const wrongPrepared = prepare(wrongState);
+      expect(toRootHex(wrongPrepared.getBlockRootAtSlot(clockSlot))).toBe(head.blockRoot);
+      expect(wrongPrepared.latestExecutionPayloadBid.parentBlockHash).toEqual(
+        parentState.latestExecutionPayloadBid.parentBlockHash
+      );
+      if (source === "primary") {
+        request(parent, wrongPrepared, true);
+      } else {
+        if (source === "post-state") states.set(parent.stateRoot, wrongState);
+        else chain.regen.getCheckpointStateSync.mockReturnValue(wrongPrepared);
+        request();
+      }
+      await flush();
+      expect(listener.mock.calls.some(([event]) => toRootHex(event.data.parentBlockRoot) === parent.blockRoot)).toBe(
+        false
+      );
+      expect(chain.getParentExecutionRequests.mock.calls.some(([, blockRoot]) => blockRoot === parent.blockRoot)).toBe(
+        false
+      );
+    }
+  );
+
+  it("rejects FULL when its variant refers to a different state", async () => {
+    put({...block(parent.slot, 2, parent.parentRoot, PayloadStatus.FULL), stateRoot: root(255)});
+    request();
+    await flush();
+    expect(listener.mock.calls.map(([event]) => toRootHex(event.data.parentBlockHash))).toEqual([root(23), root(12)]);
+  });
+
+  it("does not emit FULL if its request source violates the non-null contract", async () => {
+    chain.getParentExecutionRequests.mockResolvedValue(null as unknown as gloas.ExecutionRequests);
+    request();
+    await flush();
+    expect(listener.mock.calls.map(([event]) => toRootHex(event.data.parentBlockHash))).toEqual([root(12)]);
+  });
+
   it("binds eligibility to the prepared branch including FULL deposits and pending liabilities", async () => {
     setup(2 * SLOTS_PER_EPOCH);
     const builder = {
@@ -376,6 +430,9 @@ describe("Gloas payload attribute alternatives", () => {
     options.emitPayloadAttributes = false;
     request();
     options.emitPayloadAttributes = true;
+    options.fastConfirmation = true;
+    request();
+    options.fastConfirmation = false;
     chain.emitter.off(alternateTopic, listener);
     request();
     chain.emitter.on(alternateTopic, listener);
@@ -453,6 +510,27 @@ describe("Gloas payload attribute alternatives", () => {
     release?.(ssz.gloas.ExecutionRequests.defaultValue());
     await flush();
     expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("preserves an unreached variant after a primary change without refunding state preparation", async () => {
+    const preparedParent = prepare(parentState);
+    vi.spyOn(parentState, "processSlots").mockImplementationOnce(() => {
+      request(head, preparedHead, true);
+      return preparedParent;
+    });
+    request();
+    await flush();
+    expect(listener.mock.calls.map(([event]) => toRootHex(event.data.parentBlockHash))).toEqual([
+      root(23),
+      root(13),
+      root(22),
+    ]);
+    expect(chain.getParentExecutionRequests).toHaveBeenCalledTimes(2);
+    expect(parentState.processSlots).toHaveBeenCalledTimes(2);
+    request();
+    await flush();
+    expect(listener).toHaveBeenCalledTimes(3);
+    expect(parentState.processSlots).toHaveBeenCalledTimes(2);
   });
 
   it("drops a FULL variant removed while its execution requests were loading", async () => {

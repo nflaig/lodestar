@@ -76,6 +76,7 @@ export class PayloadAttributesAlternates {
       !this.signal.aborted &&
       this.chain.opts.emitPayloadAttributes === true &&
       this.chain.opts.emitPayloadAttributesAlternates === true &&
+      this.chain.opts.fastConfirmation !== true &&
       this.builderIndices.length > 0 &&
       this.chain.clock.currentSlot === trigger.clockSlot &&
       trigger.primary.proposalSlot === trigger.clockSlot + 1 &&
@@ -175,8 +176,9 @@ export class PayloadAttributesAlternates {
       const remaining = MAX_ALTERNATE_ATTEMPTS_PER_SLOT - this.attempted.size;
       if (remaining <= 0) return;
       const bounded = candidates.slice(0, remaining);
-      for (const block of bounded) this.attempted.add(this.key(root, block.executionPayloadBlockHash));
       const branch = bounded[0];
+      // Charge state preparation before doing it; untouched variants remain eligible after a stale trigger.
+      this.attempted.add(this.key(root, branch.executionPayloadBlockHash));
       if (
         getShufflingDependentRoot(this.chain.forkChoice, epoch, computeEpochAtSlot(branch.slot), branch) !==
         dependentRoot
@@ -187,13 +189,16 @@ export class PayloadAttributesAlternates {
         state === null ||
         !isStatePostGloas(state) ||
         state.slot !== slot ||
+        toRootHex(state.getBlockRootAtSlot(slot - 1)) !== branch.blockRoot ||
         state.getBeaconProposer(slot) !== trigger.primary.proposerIndex
       )
         continue;
       for (const block of bounded) {
         await sleep(0, this.signal);
         if (!this.isCurrent(trigger)) return;
+        this.attempted.add(this.key(root, block.executionPayloadBlockHash));
         try {
+          if (block.stateRoot !== branch.stateRoot || block.slot !== branch.slot) continue;
           const full = block.payloadStatus === PayloadStatus.FULL;
           const hash = full
             ? state.latestExecutionPayloadBid.blockHash
@@ -201,6 +206,7 @@ export class PayloadAttributesAlternates {
           if (toRootHex(hash) !== block.executionPayloadBlockHash) continue;
           const requests = full ? await this.chain.getParentExecutionRequests(block.slot, root) : null;
           if (!this.isCurrent(trigger)) return;
+          if (full && requests === null) continue;
           const currentVariant = this.chain.forkChoice.getBlockHex(root, block.payloadStatus);
           if (
             currentVariant?.executionPayloadBlockHash !== block.executionPayloadBlockHash ||

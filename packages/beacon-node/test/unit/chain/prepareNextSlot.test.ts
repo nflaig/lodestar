@@ -365,6 +365,7 @@ describe("PrepareNextSlot scheduler", () => {
         gloasConfig,
         true
       );
+      state.blockRoots.set(slot - 1, fromHex(headRoot));
       const stateView = new BeaconStateView(createCachedBeaconState(state, {config: gloasConfig, pubkeyCache}));
       if (!isStatePostGloas(stateView)) {
         throw new Error("Expected Gloas state");
@@ -566,6 +567,45 @@ describe("PrepareNextSlot scheduler", () => {
         expect(executionEngineStub.notifyForkchoiceUpdate).not.toHaveBeenCalled();
       }
     );
+
+    it("starts alternate work after the primary event without waiting for the regular FCU", async () => {
+      earlyController.abort();
+      earlyController = new AbortController();
+      earlyScheduler = createEarlyScheduler({
+        ...earlyOpts,
+        emitPayloadAttributesAlternates: true,
+        payloadAttributesAlternateBuilderIndices: [0],
+      });
+      const alternate = vi.fn();
+      chainStub.emitter.on(routes.events.EventType.payloadAttributesAlternate, alternate);
+      forkChoiceStub.getBlockHex.mockImplementation((root, status) => (root === headRoot ? makeHead(status) : null));
+      forkChoiceStub.getDependentRoot.mockReturnValue(headRoot);
+      chainStub.getHeadState.mockReturnValue(prepareState);
+      chainStub.recomputeForkChoiceHead.mockImplementation(() => forkChoiceStub.getHead());
+      chainStub.predictProposerHead.mockImplementation(() => forkChoiceStub.getHead());
+      beaconProposerCacheStub.get.mockReturnValue(`0x${"11".repeat(20)}`);
+      (executionEngineStub as unknown as {payloadIdCache: PayloadIdCache}).payloadIdCache = new PayloadIdCache();
+      let finish: ((payloadId: string) => void) | undefined;
+      executionEngineStub.notifyForkchoiceUpdate.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          })
+      );
+      let completed = false;
+      const regular = earlyScheduler.prepareForNextSlot(clockSlot).then(() => {
+        completed = true;
+      });
+      await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(6667) + 20);
+      expect(finish).toBeDefined();
+      expect(completed).toBe(false);
+      expect(payloadAttributesSpy).toHaveBeenCalledOnce();
+      expect(alternate).toHaveBeenCalledOnce();
+      expect(payloadAttributesSpy.mock.invocationCallOrder[0]).toBeLessThan(alternate.mock.invocationCallOrder[0]);
+      finish?.("0x1234");
+      await regular;
+      expect(loggerStub.error).not.toHaveBeenCalled();
+    });
 
     it("should emit each tuple once for duplicate and coalesced import events", async () => {
       emitBlockImported();
