@@ -128,13 +128,21 @@ support `zbuilder_beginAlternateV1(parentHash, payloadAttributes, extraData?)`, 
 renewable order-generation leases before allocating a session. Older constructors
 cannot silently accept this request as ordinary session work.
 
-The separate `payload_attributes_alternate` event covers the current beacon head and
-its direct parent, each with available FULL and EMPTY variants. EMPTY excludes the
+The existing `payload_attributes` event carries alternate tuples in an optional
+`context` object containing `role: "alternate"`, `dependent_root`, and `builders`.
+Ordinary events have no context and keep their existing wire format. No additional
+event topic or subscription is required. Alternate tuples cover the current beacon
+head and its direct parent, each with available FULL and EMPTY variants. EMPTY excludes the
 parent execution payload; the new block can still contain transactions. Each context
 uses its own prepared state, withdrawals and execution requests. The event includes
 the proposer dependent root and branch-specific identity/collateral metadata for at
 most 16 configured builder indices. A differing proposer or dependent root, a missing
 cached state, or missing/ineligible builder metadata causes that alternate to be skipped.
+Enable beacon emission only on a dedicated builder endpoint whose subscribers all
+understand the context extension. An older subscriber can ignore unknown metadata
+and treat every alternate as its new primary. Upgrade the publisher first, then
+enable alternate emission on the beacon node.
+
 Keep `chain.fastConfirmation` disabled (the default). Alternate events are suppressed
 with fast confirmation because its safe execution hash can be ahead of an alternate parent.
 

@@ -1,7 +1,7 @@
 import {routes} from "@lodestar/api";
 import {ChainForkConfig} from "@lodestar/config";
 import {ExecutionStatus, PayloadStatus, ProtoBlock, isGloasBlock} from "@lodestar/fork-choice";
-import {MIN_DEPOSIT_AMOUNT, SLOTS_PER_EPOCH, isForkPostGloas} from "@lodestar/params";
+import {ForkName, MIN_DEPOSIT_AMOUNT, SLOTS_PER_EPOCH} from "@lodestar/params";
 import {
   IBeaconStateView,
   IBeaconStateViewGloas,
@@ -80,9 +80,9 @@ export class PayloadAttributesAlternates {
       this.builderIndices.length > 0 &&
       this.chain.clock.currentSlot === trigger.clockSlot &&
       trigger.primary.proposalSlot === trigger.clockSlot + 1 &&
-      isForkPostGloas(this.config.getForkName(trigger.primary.proposalSlot)) &&
+      this.config.getForkName(trigger.primary.proposalSlot) === ForkName.gloas &&
       this.chain.forkChoice.getHead().blockRoot === trigger.headRoot &&
-      this.chain.emitter.listenerCount(routes.events.EventType.payloadAttributesAlternate) > 0
+      this.chain.emitter.listenerCount(routes.events.EventType.payloadAttributes) > 0
     );
   }
 
@@ -148,7 +148,7 @@ export class PayloadAttributesAlternates {
   private async emit(trigger: AlternateTrigger): Promise<void> {
     const slot = trigger.primary.proposalSlot;
     const fork = this.config.getForkName(slot);
-    if (!isForkPostGloas(fork)) return;
+    if (fork !== ForkName.gloas) return;
     const epoch = computeEpochAtSlot(slot);
     const head = this.chain.forkChoice.getHead();
     const dependentRoot = getShufflingDependentRoot(
@@ -224,11 +224,14 @@ export class PayloadAttributesAlternates {
             feeRecipient: trigger.primary.payloadAttributes.suggestedFeeRecipient,
           }) as gloas.SSEPayloadAttributes;
           if (data.proposerIndex !== trigger.primary.proposerIndex) continue;
-          this.chain.emitter.emit(routes.events.EventType.payloadAttributesAlternate, {
+          this.chain.emitter.emit(routes.events.EventType.payloadAttributes, {
             version: fork,
             data,
-            dependentRoot: fromHex(dependentRoot),
-            builders: this.getBuilders(prepared),
+            context: {
+              role: "alternate",
+              dependentRoot: fromHex(dependentRoot),
+              builders: this.getBuilders(prepared),
+            },
           });
         } catch (error) {
           if (!isErrorAborted(error))

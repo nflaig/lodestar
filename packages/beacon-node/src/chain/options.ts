@@ -80,7 +80,7 @@ export type BlockProcessOpts = {
    * execution payload import. Requires `emitPayloadAttributes`. The regular emission before the slot still runs.
    */
   emitPayloadAttributesEarly?: boolean;
-  /** Emit bounded Gloas head/parent FULL/EMPTY alternatives after authoritative payload attributes. */
+  /** Emit bounded alternate contexts on payload_attributes; every subscriber must understand context.role. */
   emitPayloadAttributesAlternates?: boolean;
   /** Builder indices whose collateral is reported for each prepared alternate, at most 16. */
   payloadAttributesAlternateBuilderIndices?: number[];

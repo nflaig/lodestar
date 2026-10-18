@@ -125,7 +125,7 @@ export const options: CliCommandOptions<ChainArgs> = {
     type: "boolean",
     defaultDescription: String(defaultOptions.chain.emitPayloadAttributesAlternates),
     description:
-      "Post-Gloas, emit bounded payload_attributes_alternate events for available FULL/EMPTY contexts of the head and its direct parent. Requires --emitPayloadAttributes; does not start extra execution-layer builds.",
+      "Gloas only: add bounded alternate contexts to payload_attributes events. Requires --emitPayloadAttributes and a dedicated endpoint whose subscribers understand context.role; does not start extra execution-layer builds.",
     hidden: true,
     group: "chain",
   },

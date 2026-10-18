@@ -397,6 +397,14 @@ describe("PrepareNextSlot scheduler", () => {
       await vi.advanceTimersByTimeAsync(0);
     }
 
+    function subscribeAlternates(alternate: Mock): void {
+      chainStub.emitter.off(routes.events.EventType.payloadAttributes, payloadAttributesSpy);
+      chainStub.emitter.on(routes.events.EventType.payloadAttributes, (event) => {
+        if (event.context?.role === "alternate") alternate(event);
+        else payloadAttributesSpy(event);
+      });
+    }
+
     function makeHeadFullOnRecompute(): void {
       chainStub.recomputeForkChoiceHead.mockImplementation(() => {
         const fullHead = makeHead(PayloadStatus.FULL);
@@ -525,7 +533,7 @@ describe("PrepareNextSlot scheduler", () => {
           payloadAttributesAlternateBuilderIndices: [0],
         });
         const alternate = vi.fn();
-        chainStub.emitter.on(routes.events.EventType.payloadAttributesAlternate, alternate);
+        subscribeAlternates(alternate);
         const headSlot = mode === "missed-slot fallback" ? clockSlot - 1 : clockSlot;
         forkChoiceStub.getHead.mockReturnValue({...makeHead(PayloadStatus.EMPTY), slot: headSlot});
         forkChoiceStub.getBlockHex.mockImplementation((root, status) =>
@@ -577,7 +585,7 @@ describe("PrepareNextSlot scheduler", () => {
         payloadAttributesAlternateBuilderIndices: [0],
       });
       const alternate = vi.fn();
-      chainStub.emitter.on(routes.events.EventType.payloadAttributesAlternate, alternate);
+      subscribeAlternates(alternate);
       forkChoiceStub.getBlockHex.mockImplementation((root, status) => (root === headRoot ? makeHead(status) : null));
       forkChoiceStub.getDependentRoot.mockReturnValue(headRoot);
       chainStub.getHeadState.mockReturnValue(prepareState);

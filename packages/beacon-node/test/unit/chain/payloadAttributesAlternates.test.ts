@@ -31,7 +31,7 @@ import {generateValidators} from "../../utils/validator.js";
 const root = (byte: number): string => `0x${byte.toString(16).padStart(2, "0").repeat(32)}`;
 const config = createBeaconConfig(getConfig(ForkName.gloas), new Uint8Array(32));
 const primaryTopic = routes.events.EventType.payloadAttributes;
-const alternateTopic = routes.events.EventType.payloadAttributesAlternate;
+const alternateTopic = routes.events.EventType.payloadAttributes;
 const validators = generateValidators(SLOTS_PER_EPOCH, {
   activationEpoch: 0,
   effectiveBalance: MAX_EFFECTIVE_BALANCE,
@@ -194,7 +194,9 @@ describe("Gloas payload attribute alternatives", () => {
 
   it("emits three distinct alternatives with branch-specific FULL/EMPTY withdrawals and requests", async () => {
     const primaryListener = vi.fn();
-    chain.emitter.on(primaryTopic, primaryListener);
+    chain.emitter.on(primaryTopic, (event) => {
+      if (event.context === undefined) primaryListener(event);
+    });
     const parentPrepared = prepare(parentState);
     const processParent = vi.spyOn(parentState, "processSlots").mockReturnValue(parentPrepared);
     const applyParent = vi.spyOn(parentPrepared, "withParentPayloadApplied");
@@ -233,6 +235,7 @@ describe("Gloas payload attribute alternatives", () => {
     expect(data.every((d) => d.proposerIndex === preparedHead.getBeaconProposer(clockSlot + 1))).toBe(true);
     expect(data.every((d) => d.payloadAttributes.slotNumber === clockSlot + 1)).toBe(true);
     expect(primaryListener).not.toHaveBeenCalled();
+    expect(listener.mock.calls.every(([event]) => event.context.role === "alternate")).toBe(true);
     expect(chain.executionEngine.notifyForkchoiceUpdate).not.toHaveBeenCalled();
     expect(chain.regen.getBlockSlotState).not.toHaveBeenCalled();
   });
@@ -334,8 +337,10 @@ describe("Gloas payload attribute alternatives", () => {
     request();
     await flush();
     expect(listener).toHaveBeenCalledTimes(3);
-    expect(listener.mock.calls.map(([e]) => e.dependentRoot)).toEqual(Array.from({length: 3}, () => fromHex(root(9))));
-    const entries = listener.mock.calls.map(([e]) => e.builders[0]);
+    expect(listener.mock.calls.map(([e]) => e.context.dependentRoot)).toEqual(
+      Array.from({length: 3}, () => fromHex(root(9)))
+    );
+    const entries = listener.mock.calls.map(([e]) => e.context.builders[0]);
     expect(entries.map((b) => b.availableGwei)).toEqual([4123, 3000, 3000]);
     const applied = applyHead.mock.results[0].value;
     expect(applied.canBuilderCoverBid(0, 4123)).toBe(true);
@@ -372,11 +377,9 @@ describe("Gloas payload attribute alternatives", () => {
     );
     request();
     await flush();
-    expect(listener.mock.calls.map(([e]) => e.builders.map((b: routes.events.AlternateBuilder) => b.active))).toEqual([
-      [],
-      [true],
-      [false],
-    ]);
+    expect(
+      listener.mock.calls.map(([e]) => e.context.builders.map((b: routes.events.AlternateBuilder) => b.active))
+    ).toEqual([[], [true], [false]]);
     expect(parentState.getBuilder(0).withdrawableEpoch).toBe(FAR_FUTURE_EPOCH);
   });
 
@@ -388,7 +391,7 @@ describe("Gloas payload attribute alternatives", () => {
     vi.spyOn(applied, "getBuilder").mockImplementation(() => entry);
     request();
     await flush();
-    expect(listener.mock.calls[0][0].builders).toEqual([]);
+    expect(listener.mock.calls[0][0].context.builders).toEqual([]);
     setup(clockSlot + 1);
     const next = preparedHead.withParentPayloadApplied(ssz.gloas.ExecutionRequests.defaultValue());
     vi.spyOn(preparedHead, "withParentPayloadApplied").mockReturnValue(next);
@@ -396,7 +399,7 @@ describe("Gloas payload attribute alternatives", () => {
     vi.spyOn(next, "getBuilder").mockReturnValue({...entry, balance: MIN_DEPOSIT_AMOUNT - 1});
     request();
     await flush();
-    expect(listener.mock.calls[3][0].builders[0].availableGwei).toBe(0);
+    expect(listener.mock.calls[3][0].context.builders[0].availableGwei).toBe(0);
   });
 
   it("does no branch work without configured identities and rejects unbounded or ambiguous lists", async () => {
@@ -423,7 +426,7 @@ describe("Gloas payload attribute alternatives", () => {
     expect(chain.getParentExecutionRequests).toHaveBeenCalledWith(3, parent.blockRoot);
   });
 
-  it("does no work with flag off, primary disabled, no subscriber or pre-Gloas", async () => {
+  it("does no work with flag off, primary disabled, no subscriber or a non-Gloas fork", async () => {
     options.emitPayloadAttributesAlternates = false;
     request();
     options.emitPayloadAttributesAlternates = true;
@@ -436,7 +439,9 @@ describe("Gloas payload attribute alternatives", () => {
     chain.emitter.off(alternateTopic, listener);
     request();
     chain.emitter.on(alternateTopic, listener);
-    vi.spyOn(config, "getForkName").mockReturnValueOnce(ForkName.fulu);
+    const fork = vi.spyOn(config, "getForkName").mockReturnValueOnce(ForkName.fulu);
+    request();
+    fork.mockReturnValueOnce(ForkName.heze);
     request();
     await flush();
     expect(listener).not.toHaveBeenCalled();
