@@ -34,8 +34,7 @@ type PrimaryBuild = {
 };
 
 export type PayloadAttributesEvent = routes.events.EventData[routes.events.EventType.payloadAttributes];
-export type AlternatePayloadAttributesEvent =
-  routes.events.EventData[routes.events.EventType.payloadAttributesAlternate];
+export type AlternatePayloadAttributesEvent = routes.events.AlternatePayloadAttributesEvent;
 
 export type BidderOptions = {
   dryRun?: boolean;
@@ -123,6 +122,10 @@ export class Bidder {
   }
 
   async onPayloadAttributes(event: PayloadAttributesEvent): Promise<void> {
+    if (event.context !== undefined) {
+      if (event.context.role === "alternate") this.onAlternatePayloadAttributes(event);
+      return;
+    }
     const {clock, config, ledger, logger, metrics, orchestrator, proposerPreferencesTracker} = this.modules;
     if (!isForkPostGloas(event.version)) {
       return;
@@ -344,7 +347,7 @@ export class Bidder {
     signal: AbortSignal
   ): Promise<void> {
     const {data} = event;
-    const dependentRoot = toRootHex(event.dependentRoot);
+    const dependentRoot = toRootHex(event.context.dependentRoot);
     signal.throwIfAborted();
     if (this.primary !== primary || dependentRoot !== primary.dependentRoot) return;
     const preferences = this.modules.proposerPreferencesTracker.get(data.proposalSlot, dependentRoot);

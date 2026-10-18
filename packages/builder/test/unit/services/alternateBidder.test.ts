@@ -35,8 +35,11 @@ function attributes(root: number, hash: number): AlternatePayloadAttributesEvent
   return {
     version: ForkName.gloas,
     data,
-    dependentRoot,
-    builders: [{index: 1, pubkey, version: 0, active: true, availableGwei: 9_000_000_000}],
+    context: {
+      role: "alternate",
+      dependentRoot,
+      builders: [{index: 1, pubkey, version: 0, active: true, availableGwei: 9_000_000_000}],
+    },
   };
 }
 
@@ -136,7 +139,7 @@ describe("alternate parent bidder", () => {
       updateOptions: {updateIntervalMs: 100, alternateBranches: true, ...options},
     });
     const start = (event: PayloadAttributesEvent) => {
-      pending.push(modules.bidder.onPayloadAttributes(event));
+      pending.push(modules.bidder.onPayloadAttributes({version: event.version, data: event.data}));
     };
     const offer = (event: AlternatePayloadAttributesEvent) =>
       modules.bidStore.get(
@@ -190,6 +193,30 @@ describe("alternate parent bidder", () => {
     }
     expect(m.payloadSource.prepare).toHaveBeenCalledTimes(4);
   });
+
+  it.each([false, true])(
+    "keeps the primary alive across standard-topic alternate/repeated-primary interleaving (enabled=%s)",
+    async (alternateBranches) => {
+      const m = setup({alternateBranches});
+      const primary = attributes(4, 5);
+      const alternate = attributes(4, 6);
+      m.start(primary);
+      await vi.advanceTimersByTimeAsync(100);
+      const primarySession = m.sessions.get("1");
+      expect(primarySession).toBeDefined();
+      for (let i = 0; i < 3; i++) {
+        await m.bidder.onPayloadAttributes(alternate);
+        m.start(primary);
+        await vi.advanceTimersByTimeAsync(200);
+      }
+      expect(m.sessions.get("1")).toBe(primarySession);
+      expect(m.payloadSource.release.mock.calls.map(([handle]) => handle.payloadId)).not.toContain("1");
+      expect(m.payloadSource.prepare).toHaveBeenCalledTimes(alternateBranches ? 2 : 1);
+      expect(m.offer(primary)).not.toBeNull();
+      expect(m.offer(alternate) !== null).toBe(alternateBranches);
+      expect(m.logger.error).not.toHaveBeenCalled();
+    }
+  );
 
   it("waits for an unleased primary snapshot before allocating an alternate", async () => {
     const m = setup();
@@ -281,10 +308,10 @@ describe("alternate parent bidder", () => {
     const m = setup();
     m.start(attributes(4, 5));
     const alternate = attributes(4, 6);
-    alternate.builders[0].availableGwei = 100_000_000;
+    alternate.context.builders[0].availableGwei = 100_000_000;
     m.bidder.onAlternatePayloadAttributes(alternate);
     const unknown = attributes(3, 7);
-    unknown.builders[0].pubkey = Buffer.alloc(48, 2);
+    unknown.context.builders[0].pubkey = Buffer.alloc(48, 2);
     m.bidder.onAlternatePayloadAttributes(unknown);
     await vi.advanceTimersByTimeAsync(1100);
     expect(m.offer(alternate)).toBeNull();

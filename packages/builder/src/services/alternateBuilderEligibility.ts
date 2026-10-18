@@ -3,8 +3,7 @@ import {PAYLOAD_BUILDER_VERSION, isForkPostGloas} from "@lodestar/params";
 import type {BLSPubkey, BuilderIndex, RootHex, Slot, ValidatorIndex} from "@lodestar/types";
 import {byteArrayEquals, toRootHex} from "@lodestar/utils";
 
-export type AlternatePayloadAttributesEvent =
-  routes.events.EventData[routes.events.EventType.payloadAttributesAlternate];
+export type AlternatePayloadAttributesEvent = routes.events.AlternatePayloadAttributesEvent;
 
 type AlternateBuilderContext = {
   slot: Slot;
@@ -23,7 +22,9 @@ export function getAlternateBuilderBidLimit(
   event: AlternatePayloadAttributesEvent,
   expected: AlternateBuilderContext
 ): number | null {
-  const {data, dependentRoot, builders} = event;
+  if (event.context?.role !== "alternate") return null;
+  const {data} = event;
+  const {dependentRoot, builders} = event.context;
   if (
     !isForkPostGloas(event.version) ||
     !dependentRoot ||

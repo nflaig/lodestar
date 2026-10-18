@@ -21,8 +21,13 @@ function fixture() {
   const event: AlternatePayloadAttributesEvent = {
     version: ForkName.gloas,
     data,
-    dependentRoot,
-    builders: [{index: 7, pubkey: builderPubkey, version: PAYLOAD_BUILDER_VERSION, active: true, availableGwei: 1000}],
+    context: {
+      role: "alternate",
+      dependentRoot,
+      builders: [
+        {index: 7, pubkey: builderPubkey, version: PAYLOAD_BUILDER_VERSION, active: true, availableGwei: 1000},
+      ],
+    },
   };
   const expected = {
     slot: data.proposalSlot,
@@ -43,21 +48,21 @@ describe("getAlternateBuilderBidLimit", () => {
     expect(getAlternateBuilderBidLimit(event, expected)).toBe(800);
     expected.unsettledGwei = 1500;
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
-    expect(event.builders[0].availableGwei).toBe(1000);
+    expect(event.context.builders[0].availableGwei).toBe(1000);
   });
 
   it("skips zero capacity even if the head or another builder has more collateral", () => {
     const {event, expected} = fixture();
-    event.builders[0].availableGwei = 0;
-    event.builders.push({...event.builders[0], index: 8, availableGwei: 1_000_000});
+    event.context.builders[0].availableGwei = 0;
+    event.context.builders.push({...event.context.builders[0], index: 8, availableGwei: 1_000_000});
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
   });
 
   it("skips zero-valued alternate offers when liabilities exactly consume branch capacity", () => {
     const {event, expected} = fixture();
-    expected.unsettledGwei = event.builders[0].availableGwei;
+    expected.unsettledGwei = event.context.builders[0].availableGwei;
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
-    event.builders[0].availableGwei = 0;
+    event.context.builders[0].availableGwei = 0;
     expected.unsettledGwei = 0;
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
   });
@@ -84,7 +89,7 @@ describe("getAlternateBuilderBidLimit", () => {
     "rejects branch identity with %s",
     (failure) => {
       const {event, expected} = fixture();
-      const builder = event.builders[0];
+      const builder = event.context.builders[0];
       if (failure === "inactive") builder.active = false;
       if (failure === "wrongVersion") builder.version = PAYLOAD_BUILDER_VERSION + 1;
       if (failure === "wrongPubkey") builder.pubkey = Buffer.alloc(48, 9);
@@ -97,7 +102,7 @@ describe("getAlternateBuilderBidLimit", () => {
     "rejects unsafe branch availability %s",
     (availableGwei) => {
       const {event, expected} = fixture();
-      event.builders[0].availableGwei = availableGwei;
+      event.context.builders[0].availableGwei = availableGwei;
       expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
     }
   );
@@ -112,37 +117,37 @@ describe("getAlternateBuilderBidLimit", () => {
 
   it("accepts the largest exactly representable nonnegative balance", () => {
     const {event, expected} = fixture();
-    event.builders[0].availableGwei = Number.MAX_SAFE_INTEGER;
+    event.context.builders[0].availableGwei = Number.MAX_SAFE_INTEGER;
     expect(getAlternateBuilderBidLimit(event, expected)).toBe(Number.MAX_SAFE_INTEGER - expected.unsettledGwei);
   });
 
   it("rejects ambiguous duplicate indices regardless of their ordering", () => {
     const {event, expected} = fixture();
-    event.builders.push({...event.builders[0], availableGwei: 99_999});
+    event.context.builders.push({...event.context.builders[0], availableGwei: 99_999});
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
-    event.builders.reverse();
+    event.context.builders.reverse();
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
   });
 
   it("bounds metadata to sixteen configured identities and requires our identity", () => {
     const {event, expected} = fixture();
-    const builder = event.builders[0];
-    event.builders = Array.from({length: 16}, (_, index) => ({...builder, index}));
+    const builder = event.context.builders[0];
+    event.context.builders = Array.from({length: 16}, (_, index) => ({...builder, index}));
     expect(getAlternateBuilderBidLimit(event, expected)).toBe(800);
-    event.builders.push({...builder, index: 16});
+    event.context.builders.push({...builder, index: 16});
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
-    event.builders = [];
+    event.context.builders = [];
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
   });
 
   it("rejects malformed fixed byte fields even if the caller repeats the value", () => {
     const {event, expected} = fixture();
-    event.dependentRoot = Buffer.alloc(31, 3);
-    expected.dependentRoot = toHex(event.dependentRoot);
+    event.context.dependentRoot = Buffer.alloc(31, 3);
+    expected.dependentRoot = toHex(event.context.dependentRoot);
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
-    event.dependentRoot = Buffer.alloc(32, 3);
-    expected.dependentRoot = toRootHex(event.dependentRoot);
-    event.builders[0].pubkey = Buffer.alloc(47, 4);
+    event.context.dependentRoot = Buffer.alloc(32, 3);
+    expected.dependentRoot = toRootHex(event.context.dependentRoot);
+    event.context.builders[0].pubkey = Buffer.alloc(47, 4);
     expected.builderPubkey = Buffer.alloc(47, 4);
     expect(getAlternateBuilderBidLimit(event, expected)).toBeNull();
   });

@@ -133,7 +133,6 @@ export class Builder {
   private readonly signingGuard?: BuilderSigningGuard;
   private readonly preferencesCache?: ProposerPreferencesCache;
   private readonly gossipIdentities: GossipIdentity[];
-  private readonly alternateBranches: boolean;
 
   constructor({
     opts,
@@ -176,7 +175,6 @@ export class Builder {
     this.signingGuard = signingGuard;
     this.preferencesCache = preferencesCache;
     this.gossipIdentities = gossipIdentities;
-    this.alternateBranches = opts.bidding.alternateBranches ?? false;
 
     this.executionFeeRecipient = opts.executionFeeRecipient;
 
@@ -586,7 +584,6 @@ export class Builder {
       routes.events.EventType.proposerPreferences,
       routes.events.EventType.payloadAttributes,
     ];
-    if (this.alternateBranches) topics.push(routes.events.EventType.payloadAttributesAlternate);
     this.logger.verbose("Subscribing to builder events", {topics: topics.join(",")});
     api.events
       .eventstream({
@@ -631,9 +628,6 @@ export class Builder {
           break;
         case routes.events.EventType.payloadAttributes:
           await this.bidder.onPayloadAttributes(event.message);
-          break;
-        case routes.events.EventType.payloadAttributesAlternate:
-          this.bidder.onAlternatePayloadAttributes(event.message);
           break;
       }
     } catch (error) {

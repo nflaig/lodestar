@@ -93,24 +93,37 @@ describe("Builder", () => {
     };
   });
 
-  it("subscribes to alternate contexts only when enabled and dispatches them separately", async () => {
-    modules.opts.bidding = {...modules.opts.bidding, alternateBranches: true};
-    const alternate = vi.spyOn(modules.bidder, "onAlternatePayloadAttributes").mockImplementation(() => {});
-    const primary = vi.spyOn(modules.bidder, "onPayloadAttributes").mockResolvedValue();
-    const builder = new Builder(modules);
-    const subscription = api.events.eventstream.mock.calls[0][0];
-    expect(subscription.topics).toEqual([...topics, EventType.payloadAttributesAlternate]);
-    const message: routes.events.EventData[routes.events.EventType.payloadAttributesAlternate] = {
-      version: ForkName.gloas,
-      data: ssz.gloas.SSEPayloadAttributes.defaultValue(),
-      dependentRoot: Buffer.alloc(32),
-      builders: [],
-    };
-    subscription.onEvent({type: EventType.payloadAttributesAlternate, message});
-    expect(alternate).toHaveBeenCalledExactlyOnceWith(message);
-    expect(primary).not.toHaveBeenCalled();
-    await builder.close();
-  });
+  it.each([false, true])(
+    "routes interleaved primary and alternate contexts through one standard handler (enabled=%s)",
+    async (alternateBranches) => {
+      modules.opts.bidding = {...modules.opts.bidding, alternateBranches};
+      const alternate = vi.spyOn(modules.bidder, "onAlternatePayloadAttributes").mockImplementation(() => {});
+      const attributes = vi.spyOn(modules.bidder, "onPayloadAttributes").mockResolvedValue();
+      const builder = new Builder(modules);
+      const subscription = api.events.eventstream.mock.calls[0][0];
+      expect(subscription.topics).toEqual(topics);
+      const primaryEvent = {version: ForkName.gloas, data: ssz.gloas.SSEPayloadAttributes.defaultValue()};
+      const message: routes.events.AlternatePayloadAttributesEvent = {
+        ...primaryEvent,
+        version: ForkName.gloas,
+        context: {role: "alternate", dependentRoot: Buffer.alloc(32), builders: []},
+      };
+      for (let i = 0; i < 3; i++) {
+        subscription.onEvent({type: EventType.payloadAttributes, message: primaryEvent});
+        subscription.onEvent({type: EventType.payloadAttributes, message});
+      }
+      expect(attributes.mock.calls.map(([event]) => event)).toEqual([
+        primaryEvent,
+        message,
+        primaryEvent,
+        message,
+        primaryEvent,
+        message,
+      ]);
+      expect(alternate).not.toHaveBeenCalled();
+      await builder.close();
+    }
+  );
 
   afterEach(() => {
     controller.abort();
