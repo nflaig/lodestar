@@ -463,7 +463,15 @@ export class BeaconChain implements IBeaconChain {
       {forkChoice, logger, metrics}
     );
 
-    this.builderApiClient = new BuilderApiClient(builderApiClientOpts ?? {}, config, clock, bls, metrics, logger);
+    this.builderApiClient = new BuilderApiClient(
+      builderApiClientOpts ?? {},
+      config,
+      clock,
+      bls,
+      metrics,
+      logger,
+      signal
+    );
 
     this.seenPayloadEnvelopeInputCache = new SeenPayloadEnvelopeInput({
       config,
