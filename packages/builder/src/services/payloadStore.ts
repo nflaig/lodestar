@@ -3,6 +3,7 @@ import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB, ForkPostGloas} from "@lodes
 import {BlobsBundle, ExecutionPayload, Root, RootHex, Slot, gloas, ssz} from "@lodestar/types";
 import {LodestarError} from "@lodestar/utils";
 import {MAX_RETAINED_PAYLOADS, PAYLOAD_RETENTION_SLOTS} from "./commitmentLimits.js";
+import type {OfferEligibility} from "./offerEligibility.js";
 
 // NOTE: BuiltPayload will migrate to payloadSource.ts when the payload source lands; the store
 // holds it here for now.
@@ -13,6 +14,7 @@ export type BuiltPayload = {
   blobsBundle: BlobsBundle<ForkPostGloas>;
   /** Value of the payload to the fee recipient in wei, as reported by the execution client */
   executionPayloadValue: bigint;
+  offerEligibility?: OfferEligibility;
 };
 
 export type StoredPayload = {
@@ -48,7 +50,7 @@ export class PayloadStore {
     private readonly maxPayloads = MAX_RETAINED_PAYLOADS
   ) {}
 
-  add(payload: StoredPayload, admission: "offer" | "recovery" = "offer"): void {
+  add(payload: StoredPayload, admission: "offer" | "recovery" | "alternate" = "offer"): void {
     if (this.byBlockHash.has(payload.blockHash)) return;
     const {executionPayload, executionRequests, blobsBundle} = payload.payload;
     const existing = this.blobsBySlot.get(payload.slot);
@@ -85,12 +87,13 @@ export class PayloadStore {
       blobsBundle.blobs.length * BLOB_BYTES;
     const additionalBytes = bytes + added.size * BLOB_BYTES;
     const slotBytes = this.bytesBySlot.get(payload.slot) ?? 0;
-    const maxSlotBytes = Math.floor(this.maxBytes / (PAYLOAD_RETENTION_SLOTS + 2));
+    const fraction = admission === "alternate" ? 2 : 1;
+    const maxSlotBytes = Math.floor(this.maxBytes / ((PAYLOAD_RETENTION_SLOTS + 2) * fraction));
     // Recovery must retain commitments made before the per-slot admission budget existed.
     if (
-      this.retainedBytes + additionalBytes > this.maxBytes ||
-      this.byBlockHash.size >= this.maxPayloads ||
-      (admission === "offer" && slotBytes + additionalBytes > maxSlotBytes)
+      this.retainedBytes + additionalBytes > Math.floor(this.maxBytes / fraction) ||
+      this.byBlockHash.size >= Math.floor(this.maxPayloads / fraction) ||
+      (admission !== "recovery" && slotBytes + additionalBytes > maxSlotBytes)
     ) {
       // Never evict a previously advertised payload to make room for a newer offer.
       throw new PayloadStoreCapacityError({

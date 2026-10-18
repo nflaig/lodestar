@@ -3,7 +3,7 @@ import {ApiClient} from "@lodestar/api";
 import {ChainForkConfig} from "@lodestar/config";
 import {IClock} from "@lodestar/state-transition";
 import {BuilderIndex, BuilderStatus, gloas} from "@lodestar/types";
-import {Logger} from "@lodestar/utils";
+import {Logger, fromHex} from "@lodestar/utils";
 import {Bidder, type BidderOptions} from "../../../src/services/bidder.js";
 import {BidLedger} from "../../../src/services/bidLedger.js";
 import {ProportionalBidPolicy} from "../../../src/services/bidPolicy.js";
@@ -32,6 +32,8 @@ export function getPayloadSourceStub() {
   return {
     id: "el",
     supportsUpdates: false,
+    supportsBoundedAlternates: false,
+    getResources: vi.fn<NonNullable<PayloadSource["getResources"]>>(),
     release: vi.fn<NonNullable<PayloadSource["release"]>>().mockResolvedValue(undefined),
     prepare: vi.fn<PayloadSource["prepare"]>(),
     getPayload: vi.fn<PayloadSource["getPayload"]>(),
@@ -55,6 +57,7 @@ export function createBiddingModules({
   updateOptions,
   gossipStages,
   retainCommitment,
+  canRetainAlternate,
 }: {
   api: ApiClient;
   config: ChainForkConfig;
@@ -71,7 +74,8 @@ export function createBiddingModules({
   dryRun?: boolean;
   gossipStages?: GossipStage[];
   retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => Promise<void>;
-  updateOptions?: Pick<BidderOptions, "updateIntervalMs" | "updateCutoffBps" | "maxRevisionsPerSlot">;
+  updateOptions?: Partial<BidderOptions>;
+  canRetainAlternate?: () => boolean;
 }): {ledger: BidLedger; bidStore: BidStore; bidder: Bidder; revealer: Revealer; bidPublisher: BidPublisher} {
   const ledger = new BidLedger();
   const bidStore = new BidStore();
@@ -103,6 +107,8 @@ export function createBiddingModules({
       bidStore,
       proposerPreferencesTracker,
       getBuilderStatus,
+      builderPubkey: fromHex(builderSigner.getPubkeyHex()),
+      canRetainAlternate,
       builderIndex: index,
       executionFeeRecipient: Buffer.alloc(20, 9),
       metrics: null,

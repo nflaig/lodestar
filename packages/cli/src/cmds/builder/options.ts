@@ -44,6 +44,8 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.updateIntervalMs": number;
   "bidding.updateCutoffBps": number;
   "bidding.maxRevisionsPerSlot": number;
+  "bidding.alternateBranches": boolean;
+  "bidding.alternateBuildDurationMs": number;
   "bidding.minOperatingBalanceGwei": number;
   "reveal.cutoffBps"?: number;
 
@@ -56,6 +58,7 @@ export type IBuilderCliArgs = LogArgs & {
   "builderApi.address"?: string;
   "builderApi.publicUrl"?: string;
   "builderApi.authData"?: string;
+  "builderApi.bidStream"?: boolean;
 
   metrics?: boolean;
   "metrics.port"?: number;
@@ -223,6 +226,18 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     default: defaultOptions.bidding.maxRevisionsPerSlot,
     group: "bidding",
   },
+  "bidding.alternateBranches": {
+    type: "boolean",
+    description: "Build bounded alternate parent snapshots for API and streaming bids",
+    default: defaultOptions.bidding.alternateBranches,
+    group: "bidding",
+  },
+  "bidding.alternateBuildDurationMs": {
+    type: "number",
+    description: "Maximum construction time per alternate parent snapshot, in milliseconds",
+    default: defaultOptions.bidding.alternateBuildDurationMs,
+    group: "bidding",
+  },
 
   "bidding.shareBps": {
     description: "Share of the payload value offered to the proposer, in basis points",
@@ -349,6 +364,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     type: "string",
     description:
       "URL proposers reach the builder API at. Proposers must sign their requests with its hostname as auth data unless `--builderApi.authData` is set",
+    group: "builderApi",
+  },
+
+  "builderApi.bidStream": {
+    description: "Enable the experimental authenticated Gloas WebSocket bid stream alongside the HTTP builder API",
+    type: "boolean",
+    default: false,
     group: "builderApi",
   },
 

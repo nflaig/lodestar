@@ -2,6 +2,7 @@ import {afterEach, describe, expect, it, vi} from "vitest";
 import {ApiError} from "@lodestar/api/server";
 import {BuilderApi} from "@lodestar/builder";
 import {config} from "@lodestar/config/default";
+import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
 import {LogLevel, toHex} from "@lodestar/utils";
 import {BuilderRestApiServer, getBuilderApiBeforeInit} from "../../../../src/cmds/builder/apiServer.js";
@@ -10,6 +11,13 @@ import {testLogger} from "../../../utils.js";
 class TestBuilderRestApiServer extends BuilderRestApiServer {
   inject: BuilderRestApiServer["server"]["inject"] = (...args: Parameters<BuilderRestApiServer["server"]["inject"]>) =>
     this.server.inject(...args);
+
+  beforeSerialization(callback: () => void): void {
+    this.server.addHook("preSerialization", async (_req, _reply, payload) => {
+      callback();
+      return payload;
+    });
+  }
 }
 
 describe("cmds / builder / api server", () => {
@@ -50,6 +58,30 @@ describe("cmds / builder / api server", () => {
     expect(res.statusCode).toBe(404);
   });
 
+  it("does not send a bid whose permission expires during response serialization", async () => {
+    let allowed = true;
+    const builder = getServer({
+      getExecutionPayloadBid: async (_args, context) => {
+        context?.setResponseGuard?.(() => allowed);
+        return {data: ssz.gloas.SignedExecutionPayloadBid.defaultValue(), meta: {version: ForkName.gloas}};
+      },
+    });
+    builder.beforeSerialization(() => {
+      allowed = false;
+    });
+    const root = toHex(Buffer.alloc(32));
+    const proposer = toHex(Buffer.alloc(48));
+    const res = await builder.inject({
+      method: "POST",
+      url: `/eth/v1/builder/execution_payload_bid/5/${root}/${root}/${proposer}`,
+      headers: {"Eth-Consensus-Version": "gloas", "Date-Milliseconds": String(Date.now()), "X-Timeout-Ms": "500"},
+      payload: ssz.gloas.SignedBuilderRequestAuth.toJson(ssz.gloas.SignedBuilderRequestAuth.defaultValue()) as object,
+    });
+    expect(res.statusCode).toBe(204);
+    expect(res.body).toBe("");
+    expect(res.headers["cache-control"]).toBe("no-store");
+  });
+
   it("logs a bid request with the details of the caller", async () => {
     const logger = testLogger();
     const info = vi.spyOn(logger, LogLevel.info);
@@ -84,6 +116,7 @@ describe("cmds / builder / api server", () => {
     });
 
     expect(res.statusCode).toBe(204);
+    expect(res.headers["cache-control"]).toBe("no-store");
     expect(info).toHaveBeenCalledWith(
       "Builder API request",
       expect.objectContaining({

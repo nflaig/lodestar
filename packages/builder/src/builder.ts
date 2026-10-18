@@ -4,7 +4,8 @@ import {ChainForkConfig, assertEqualParams, createBeaconConfig} from "@lodestar/
 import {ForkName, SLOTS_PER_EPOCH} from "@lodestar/params";
 import {Clock, ClockOptions, IClock} from "@lodestar/state-transition";
 import {BuilderIndex, ExecutionAddress} from "@lodestar/types";
-import {Logger, isErrorAborted, toHex, toRootHex} from "@lodestar/utils";
+import {Logger, fromHex, isErrorAborted, toHex, toRootHex} from "@lodestar/utils";
+import {BuilderBidStreamApi, getBuilderBidStreamApi} from "./api/bidStream.js";
 import {BuilderApi, BuilderApiOptions, getBuilderApi} from "./api/impl.js";
 import {defaultOptions} from "./defaults.js";
 import {waitForGenesis} from "./genesis.js";
@@ -20,6 +21,7 @@ import {BidSelector} from "./services/bidSelector.js";
 import {BidStore} from "./services/bidStore.js";
 import {BlockObserver} from "./services/blockObserver.js";
 import {BuilderSigner, Keypair} from "./services/builderSigner.js";
+import {BuilderSigningGuard} from "./services/builderSigningGuard.js";
 import {BuilderStatusTracker} from "./services/builderStatusTracker.js";
 import {CommitmentJournal} from "./services/commitmentJournal.js";
 import {EnvelopePublisher} from "./services/envelopePublisher.js";
@@ -57,7 +59,9 @@ export type BuilderModules = {
   bidder: Bidder;
   revealer: Revealer;
   builderApi: BuilderApi | null;
+  builderBidStreamApi?: BuilderBidStreamApi | null;
   journal?: AsyncCommitmentJournal;
+  signingGuard?: BuilderSigningGuard;
   preferencesCache?: ProposerPreferencesCache;
   gossipIdentities?: GossipIdentity[];
 };
@@ -111,6 +115,7 @@ export class Builder {
   readonly builderSigner: BuilderSigner;
   readonly proposerPreferencesTracker: ProposerPreferencesTracker;
   readonly builderApi: BuilderApi | null;
+  readonly builderBidStreamApi: BuilderBidStreamApi | null;
   private readonly proposerPreferencesRecovery: ProposerPreferencesRecovery;
   private readonly blockObserver: BlockObserver;
   private readonly builderStatusTracker: BuilderStatusTracker;
@@ -125,6 +130,7 @@ export class Builder {
   private readonly bidder: Bidder;
   private readonly revealer: Revealer;
   private readonly journal?: AsyncCommitmentJournal;
+  private readonly signingGuard?: BuilderSigningGuard;
   private readonly preferencesCache?: ProposerPreferencesCache;
   private readonly gossipIdentities: GossipIdentity[];
 
@@ -143,7 +149,9 @@ export class Builder {
     bidder,
     revealer,
     builderApi,
+    builderBidStreamApi = null,
     journal,
+    signingGuard,
     preferencesCache,
     gossipIdentities = [],
   }: BuilderModules) {
@@ -162,7 +170,9 @@ export class Builder {
     this.bidder = bidder;
     this.revealer = revealer;
     this.builderApi = builderApi;
+    this.builderBidStreamApi = builderBidStreamApi;
     this.journal = journal;
+    this.signingGuard = signingGuard;
     this.preferencesCache = preferencesCache;
     this.gossipIdentities = gossipIdentities;
 
@@ -191,6 +201,23 @@ export class Builder {
   }
 
   static async init(opts: BuilderOptions): Promise<Builder> {
+    const signingGuard = opts.commitmentDir ? await BuilderSigningGuard.acquire(opts.commitmentDir) : undefined;
+    const startupJournals: AsyncCommitmentJournal[] = [];
+    try {
+      return await Builder.initOwned(opts, signingGuard, startupJournals);
+    } catch (error) {
+      signingGuard?.revoke();
+      await Promise.allSettled(startupJournals.map((journal) => journal.close()));
+      await signingGuard?.close();
+      throw error;
+    }
+  }
+
+  private static async initOwned(
+    opts: BuilderOptions,
+    signingGuard: BuilderSigningGuard | undefined,
+    startupJournals: AsyncCommitmentJournal[]
+  ): Promise<Builder> {
     const {api, logger} = opts;
     const additional = opts.gossipIdentities ?? [];
     if (additional.length > MAX_ADDITIONAL_GOSSIP_IDENTITIES) throw Error("GOSSIP_STAGE_LIMIT");
@@ -221,7 +248,8 @@ export class Builder {
     logger.info("Verified connected beacon node and builder have the same config");
 
     const config = createBeaconConfig(opts.config, genesis.genesisValidatorsRoot);
-    const builderSigner = new BuilderSigner(config, opts.keypair);
+    const assertCanSign = signingGuard ? () => signingGuard.assertActive() : undefined;
+    const builderSigner = new BuilderSigner(config, opts.keypair, assertCanSign);
 
     await waitForNodeReady(api, logger, opts.abortController.signal);
     await logNodeVersion(api, logger);
@@ -285,6 +313,7 @@ export class Builder {
       const recoveredPreferences = await preferencesCache.load(proposerPreferencesTracker, clock.getCurrentSlot());
       logger.info("Restored cached proposer preferences", {recovered: recoveredPreferences});
       journal = await AsyncCommitmentJournal.start({directory: opts.commitmentDir, identity});
+      startupJournals.push(journal);
       logger.info("Recovered builder commitments", {recovered});
     }
     const signal = opts.abortController.signal;
@@ -311,29 +340,24 @@ export class Builder {
       {...opts.reveal, cutoffBps: opts.reveal.cutoffBps ?? config.PAYLOAD_ATTESTATION_DUE_BPS}
     );
 
-    const builderApi =
-      opts.builderApi !== undefined
-        ? getBuilderApi(
-            {
-              config,
-              logger,
-              clock,
-              api,
-              bidStore,
-              proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
-              builderIndex: index,
-              metrics: opts.metrics,
-              signal,
-            },
-            opts.builderApi
-          )
-        : null;
+    const builderApiModules = {
+      config,
+      logger,
+      clock,
+      api,
+      bidStore,
+      proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
+      builderIndex: index,
+      metrics: opts.metrics,
+      signal,
+    };
+    const builderApi = opts.builderApi ? getBuilderApi(builderApiModules, opts.builderApi) : null;
+    const builderBidStreamApi = opts.builderApi ? getBuilderBidStreamApi(builderApiModules, opts.builderApi) : null;
 
     const gossipIdentities: GossipIdentity[] = [];
-    const startupJournals = journal ? [journal] : [];
     try {
       for (const entry of additional) {
-        const signer = new BuilderSigner(config, entry.keypair);
+        const signer = new BuilderSigner(config, entry.keypair, assertCanSign);
         const identity = await resolveGossipBuilderIdentity(api, signer.getPubkeyHex(), signal);
         if ([index, ...gossipIdentities.map(({stage}) => stage.builderIndex)].includes(identity.index))
           throw Error("GOSSIP_STAGE_DUPLICATE_IDENTITY");
@@ -461,6 +485,9 @@ export class Builder {
           }),
           bidStore,
           proposerPreferencesTracker,
+          proposerDutiesTracker: builderApiModules.proposerDutiesTracker,
+          canRetainAlternate: () => journal?.canRetainAlternate() === true,
+          builderPubkey: fromHex(builderSigner.getPubkeyHex()),
           getBuilderStatus: () => builderStatusTracker.getStatus(),
           builderIndex: index,
           executionFeeRecipient: opts.executionFeeRecipient,
@@ -487,7 +514,9 @@ export class Builder {
         bidder,
         revealer,
         builderApi,
+        builderBidStreamApi,
         journal,
+        signingGuard,
       });
     } catch (error) {
       await Promise.allSettled(startupJournals.map((item) => item.close()));
@@ -613,11 +642,13 @@ export class Builder {
   }
 
   async close(): Promise<void> {
+    this.signingGuard?.revoke();
     this.controller.abort();
     await Promise.all([
       this.preferencesCache?.close(this.proposerPreferencesTracker, this.clock.getCurrentSlot()),
       this.journal?.close(),
       ...this.gossipIdentities.map((identity) => identity.journal?.close()),
     ]);
+    await this.signingGuard?.close();
   }
 }
