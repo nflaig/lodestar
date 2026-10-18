@@ -18,7 +18,7 @@ import {
 } from "@lodestar/builder";
 import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB, ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {ErrorAborted, LodestarError, isFetchError, toHex, withTimeout} from "@lodestar/utils";
+import {ErrorAborted, LodestarError, type Logger, isFetchError, toHex, withTimeout} from "@lodestar/utils";
 
 type Rpc = Pick<JsonRpcHttpClient, "fetch">;
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
@@ -47,6 +47,12 @@ type SessionEntry = {
   release?: Promise<void>;
 };
 
+type AlternateDisabledReason =
+  | "ambiguous_begin"
+  | "invalid_begin_handle"
+  | "unsupported_alternate_method"
+  | "unconfirmed_alternate_capability";
+
 /** Private constructor RPC; the constructor validates seals before publishing a ready snapshot. */
 export class SessionPayloadSource implements PayloadSource {
   readonly supportsUpdates = true;
@@ -59,7 +65,7 @@ export class SessionPayloadSource implements PayloadSource {
   constructor(
     readonly id: string,
     private readonly rpc: (signal: AbortSignal) => Rpc,
-    private readonly options: {boundedAlternates?: boolean} = {}
+    private readonly options: {boundedAlternates?: boolean; logger?: {warn: Logger["warn"]}} = {}
   ) {}
 
   get supportsBoundedAlternates(): boolean {
@@ -78,6 +84,32 @@ export class SessionPayloadSource implements PayloadSource {
     };
     for (const entry of this.requests.values()) result[entry.state]++;
     return result;
+  }
+
+  private warnAlternatesDisabled(request: BuildRequest, signal: AbortSignal, reason: AlternateDisabledReason): void {
+    try {
+      const logger = this.options.logger;
+      if (!logger) return;
+      const resources = this.getResources();
+      logger.warn("Constructor alternate admission disabled", {
+        code: "SESSION_PAYLOAD_ALTERNATES_DISABLED",
+        reason,
+        method: request.requireUnleased ? "zbuilder_beginAlternateV1" : "zbuilder_beginV1",
+        slot: request.payloadAttributes.slotNumber,
+        parentBlockHash: request.forkchoiceState.headBlockHash,
+        parentBlockRoot: toHex(request.payloadAttributes.parentBeaconBlockRoot),
+        callerAborted: signal.aborted,
+        orphaned: this.orphaned,
+        capacity: resources?.capacity,
+        active: resources?.active,
+        preparing: resources?.preparing,
+        releasing: resources?.releasing,
+        uncertain: resources?.uncertain,
+        alternatesDisabled: resources?.alternatesDisabled,
+      });
+    } catch {
+      // Diagnostic failures must not change admission or session ownership.
+    }
   }
 
   async reconcileResources(signal: AbortSignal): Promise<void> {
@@ -140,6 +172,7 @@ export class SessionPayloadSource implements PayloadSource {
     const beginRpc = this.rpc(bounded ? AbortSignal.timeout(BEGIN_RPC_TIMEOUT_MS) : signal);
     if (bounded) this.preparing++;
     let result: {sessionId: string; orderGenerationVersion?: number; alternateSessionVersion?: number};
+    let disabledReason: AlternateDisabledReason | undefined;
     try {
       // Cancelling the build must not discard a late allocation handle. Keep
       // one bounded request alive, then end any handle the caller no longer owns.
@@ -155,6 +188,7 @@ export class SessionPayloadSource implements PayloadSource {
         if (!definite) {
           this.orphaned++;
           this.alternatesDisabled = true;
+          disabledReason = "ambiguous_begin";
         } else if (
           alternate &&
           rejection &&
@@ -164,11 +198,13 @@ export class SessionPayloadSource implements PayloadSource {
             ))
         ) {
           this.alternatesDisabled = true;
+          disabledReason = "unsupported_alternate_method";
         }
       }
       throw error;
     } finally {
       if (bounded) this.preparing--;
+      if (disabledReason !== undefined) this.warnAlternatesDisabled(request, signal, disabledReason);
     }
     if (
       typeof result?.sessionId !== "string" ||
@@ -179,6 +215,7 @@ export class SessionPayloadSource implements PayloadSource {
       if (bounded) {
         this.orphaned++;
         this.alternatesDisabled = true;
+        this.warnAlternatesDisabled(request, signal, "invalid_begin_handle");
       }
       throw new SessionPayloadError({
         code: SessionPayloadErrorCode.INVALID_SESSION,
@@ -201,6 +238,7 @@ export class SessionPayloadSource implements PayloadSource {
     }
     if (alternate && (result.orderGenerationVersion !== 0 || result.alternateSessionVersion !== 1)) {
       this.alternatesDisabled = true;
+      this.warnAlternatesDisabled(request, signal, "unconfirmed_alternate_capability");
       await this.release(handle, AbortSignal.timeout(6000)).catch(() => {});
       throw new SessionPayloadError({
         code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED,

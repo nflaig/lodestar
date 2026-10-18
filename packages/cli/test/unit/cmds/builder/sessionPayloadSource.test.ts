@@ -12,7 +12,7 @@ import {
 import {type BuildRequest, PayloadSourceNotReady} from "@lodestar/builder";
 import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {ErrorAborted, FetchError, defer, toHex, toRootHex} from "@lodestar/utils";
+import {ErrorAborted, FetchError, type Logger, defer, toHex, toRootHex} from "@lodestar/utils";
 import {SessionPayloadErrorCode, SessionPayloadSource} from "../../../../src/cmds/builder/sessionPayloadSource.js";
 
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
@@ -74,6 +74,7 @@ describe("SessionPayloadSource", () => {
   function setup(boundedAlternates = false) {
     const rpc = new JsonRpcHttpClient(["http://127.0.0.1:1"]);
     const fetch = vi.spyOn(rpc, "fetch");
+    const warn = vi.fn<Logger["warn"]>();
     const signals: AbortSignal[] = [];
     const source = new SessionPayloadSource(
       "session",
@@ -81,9 +82,9 @@ describe("SessionPayloadSource", () => {
         signals.push(callSignal);
         return rpc;
       },
-      {boundedAlternates}
+      {boundedAlternates, logger: {warn}}
     );
-    return {source, fetch, signals, request: buildRequest()};
+    return {source, fetch, signals, warn, request: buildRequest()};
   }
 
   it("changes generations even when value drops and the block hash repeats", async () => {
@@ -940,6 +941,7 @@ describe("SessionPayloadSource", () => {
       const request = buildRequest();
       const controller = new AbortController();
       const methods: string[] = [];
+      const warn = vi.fn<Logger["warn"]>();
       const server = createServer(async (req, res) => {
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -971,7 +973,7 @@ describe("SessionPayloadSource", () => {
         const source = new SessionPayloadSource(
           "socket",
           (signal) => new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal, timeout: 1000}),
-          {boundedAlternates: true}
+          {boundedAlternates: true, logger: {warn}}
         );
         await source.prepare(request, signal);
         await expect(source.prepare({...request, requireUnleased: true}, controller.signal)).rejects.toThrow();
@@ -983,10 +985,85 @@ describe("SessionPayloadSource", () => {
         });
         await source.reconcileResources(signal);
         expect(methods).toEqual(["zbuilder_beginV1", "zbuilder_beginAlternateV1"]);
+        expect(warn).toHaveBeenCalledExactlyOnceWith(
+          "Constructor alternate admission disabled",
+          expect.objectContaining({
+            reason: fault === "lost-response" ? "ambiguous_begin" : "unsupported_alternate_method",
+            callerAborted: fault === "lost-response",
+            preparing: 0,
+            uncertain: fault === "lost-response" ? 1 : 0,
+          })
+        );
       } finally {
         server.closeAllConnections();
         await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
       }
+    });
+
+    it.each([false, true])(
+      "logs a late ambiguous begin after caller cancellation (alternate=%s)",
+      async (alternate) => {
+        const {source, fetch, request, warn} = setup(true);
+        if (alternate) {
+          fetch.mockResolvedValueOnce({sessionId: "primary"});
+          await source.prepare(request, signal);
+        }
+        const controller = new AbortController();
+        const begin = defer<{sessionId: string}>();
+        fetch.mockImplementationOnce(() => begin.promise);
+        const failure = new Error("https://private:secret@example.invalid/rpc?token=private-order");
+        const pending = source.prepare({...request, requireUnleased: alternate}, controller.signal);
+        const rejected = expect(pending).rejects.toBe(failure);
+        controller.abort();
+        expect(warn).not.toHaveBeenCalled();
+        begin.reject(failure);
+        await rejected;
+        expect(warn).toHaveBeenCalledExactlyOnceWith("Constructor alternate admission disabled", {
+          code: "SESSION_PAYLOAD_ALTERNATES_DISABLED",
+          reason: "ambiguous_begin",
+          method: alternate ? "zbuilder_beginAlternateV1" : "zbuilder_beginV1",
+          slot: request.payloadAttributes.slotNumber,
+          parentBlockHash: request.forkchoiceState.headBlockHash,
+          parentBlockRoot: toHex(request.payloadAttributes.parentBeaconBlockRoot),
+          callerAborted: true,
+          orphaned: 1,
+          capacity: 2,
+          preparing: 0,
+          active: alternate ? 1 : 0,
+          releasing: 0,
+          uncertain: 1,
+          alternatesDisabled: true,
+        });
+        await source.reconcileResources(signal);
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(source.getResources()).toMatchObject({uncertain: 1, alternatesDisabled: true});
+      }
+    );
+
+    it("preserves the original begin error and reservation when the warning logger throws", async () => {
+      const {source, fetch, request, warn} = setup(true);
+      const failure = new Error("response lost");
+      warn.mockImplementation(() => {
+        throw new Error("logger unavailable");
+      });
+      fetch.mockRejectedValueOnce(failure);
+      await expect(source.prepare(request, signal)).rejects.toBe(failure);
+      expect(source.getResources()).toMatchObject({preparing: 0, uncertain: 1, alternatesDisabled: true});
+    });
+
+    it("still releases an unconfirmed alternate capability when the warning logger throws", async () => {
+      const {source, fetch, request, warn} = setup(true);
+      fetch.mockResolvedValueOnce({sessionId: "primary"});
+      await source.prepare(request, signal);
+      warn.mockImplementation(() => {
+        throw new Error("logger unavailable");
+      });
+      fetch.mockResolvedValueOnce({sessionId: "alternate"}).mockResolvedValueOnce(true);
+      await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toMatchObject(
+        errorCode(SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED)
+      );
+      expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_endV1", params: ["alternate"]});
+      expect(source.getResources()).toMatchObject({active: 1, releasing: 0, uncertain: 0, alternatesDisabled: true});
     });
 
     it("retains an unknown begin outcome and never infers recovery from a session listing", async () => {

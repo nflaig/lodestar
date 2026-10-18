@@ -177,7 +177,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
           signal,
           timeout: args["execution.timeout"],
         }),
-      {boundedAlternates: alternateBranches}
+      {boundedAlternates: alternateBranches, logger}
     );
     logger.info("Session payload source", {
       url: toPrintableUrl(constructorUrl),
