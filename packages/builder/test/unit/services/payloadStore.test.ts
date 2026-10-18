@@ -5,6 +5,24 @@ import {mockBuiltPayload} from "../utils/payload.js";
 describe("PayloadStore", () => {
   const blockHash = "0x" + "cc".repeat(32);
 
+  it("reserves primary byte and count headroom without evicting alternate commitments", () => {
+    const first = {slot: 5, parentBlockRoot: Buffer.alloc(32), blockHash, payload: mockBuiltPayload()};
+    const measured = new PayloadStore();
+    measured.add(first);
+    const store = new PayloadStore(measured.bytes * 8, 4);
+    store.add(first, "alternate");
+    const second = {...first, blockHash: "0x" + "dd".repeat(32)};
+    expect(() => store.add(second, "alternate")).toThrow();
+    store.add(second);
+    expect(store.get(blockHash)).toBe(first);
+    expect(store.size).toBe(2);
+    const countLimited = new PayloadStore(256 * 1024 * 1024, 2);
+    countLimited.add(first, "alternate");
+    expect(() => countLimited.add(second, "alternate")).toThrow();
+    countLimited.add(second);
+    expect(countLimited.size).toBe(2);
+  });
+
   it("shares blob bytes across a full revision window and preserves earlier sidecars", () => {
     const store = new PayloadStore();
     let firstBytes = 0;

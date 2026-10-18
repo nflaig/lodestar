@@ -63,6 +63,25 @@ describe("cmds / builder / args handler", () => {
     ).rejects.toThrow("--bidding.maxRevisionsPerSlot must be between 1 and 256");
   });
 
+  it("rejects alternate branches without a session source and updates", async () => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateBranches": true})
+    ).rejects.toThrow("Alternate branches require --payload.constructorUrl and payload updates");
+    await expect(
+      runBuilderHandler({
+        "params.GLOAS_FORK_EPOCH": "0",
+        "bidding.alternateBranches": true,
+        "payload.constructorUrl": "http://127.0.0.1:8547",
+      })
+    ).rejects.toThrow("Alternate branches require --payload.constructorUrl and payload updates");
+  });
+
+  it.each([0, 249, 1001, 500.5, NaN, Infinity])("rejects unbounded alternate duration %s", async (duration) => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateBuildDurationMs": duration})
+    ).rejects.toThrow("--bidding.alternateBuildDurationMs must be between 250 and 1000");
+  });
+
   it.each([
     [
       {"proposerPreferences.urls": ["http://a:9596", "http://b:9596", "http://c:9596", "http://d:9596"]},

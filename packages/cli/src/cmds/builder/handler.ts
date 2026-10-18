@@ -65,6 +65,8 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   const updateIntervalMs = args["bidding.updateIntervalMs"];
   const updateCutoffBps = args["bidding.updateCutoffBps"];
   const maxRevisionsPerSlot = args["bidding.maxRevisionsPerSlot"];
+  const alternateBranches = args["bidding.alternateBranches"] ?? false;
+  const alternateBuildDurationMs = args["bidding.alternateBuildDurationMs"] ?? 500;
   if (
     !Number.isSafeInteger(updateIntervalMs) ||
     (updateIntervalMs !== 0 && (updateIntervalMs < 25 || !constructorUrl))
@@ -80,6 +82,16 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     maxRevisionsPerSlot > MAX_BID_REVISIONS_PER_SLOT
   ) {
     throw new YargsError(`--bidding.maxRevisionsPerSlot must be between 1 and ${MAX_BID_REVISIONS_PER_SLOT}`);
+  }
+  if (alternateBranches && (!constructorUrl || updateIntervalMs === 0)) {
+    throw new YargsError("Alternate branches require --payload.constructorUrl and payload updates");
+  }
+  if (
+    !Number.isSafeInteger(alternateBuildDurationMs) ||
+    alternateBuildDurationMs < 250 ||
+    alternateBuildDurationMs > 1000
+  ) {
+    throw new YargsError("--bidding.alternateBuildDurationMs must be between 250 and 1000");
   }
   const proposerPreferencesUrls = parseProposerPreferencesUrls(
     args["proposerPreferences.urls"] ?? [],
@@ -164,13 +176,16 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
         new JsonRpcHttpClient([constructorUrl], {
           signal,
           timeout: args["execution.timeout"],
-        })
+        }),
+      {boundedAlternates: alternateBranches}
     );
     logger.info("Session payload source", {
       url: toPrintableUrl(constructorUrl),
       updateIntervalMs,
       updateCutoffBps,
       maxRevisionsPerSlot,
+      alternateBranches,
+      alternateBuildDurationMs,
       dryRun: args["payload.dryRun"],
     });
   } else if (transactionsFile && testingUrl) {
@@ -257,6 +272,8 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       updateIntervalMs,
       updateCutoffBps,
       maxRevisionsPerSlot,
+      alternateBranches,
+      alternateBuildDurationMs,
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
     builderApi: builderApiOpts,
