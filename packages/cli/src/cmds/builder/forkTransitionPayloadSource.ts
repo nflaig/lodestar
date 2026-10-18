@@ -64,7 +64,10 @@ export class ForkTransitionPayloadSource implements PayloadSource {
     if (entry.getPayloadAt !== undefined) {
       if (Date.now() < entry.getPayloadAt) throw new PayloadSourceNotReady("Waiting for scheduled Engine snapshot");
       // Engine retrieval can stop construction. Retrieve once at the configured deadline, then retain it.
-      entry.snapshot ??= entry.source.getPayload(handle, signal);
+      entry.snapshot ??= entry.source.getPayload(handle, signal).catch((error: unknown) => {
+        entry.snapshot = undefined;
+        throw error;
+      });
       return entry.snapshot;
     }
     return entry.source.getPayload(handle, signal);

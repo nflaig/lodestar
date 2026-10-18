@@ -230,7 +230,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
         payloadSource,
         createEngineSource(),
         engineUntilSlot,
-        config.SLOT_DURATION_MS - config.getSlotComponentDurationMs(args["bidding.deadlineBps"])
+        config.SLOT_DURATION_MS - config.getSlotComponentDurationMs(args["bidding.deadlineBps"]) + 300
       );
       logger.info("Execution client builds through the configured fork transition slot", {engineUntilSlot});
     }

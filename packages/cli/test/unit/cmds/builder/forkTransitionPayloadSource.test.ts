@@ -1,9 +1,20 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
+import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {type BuildHandle, type BuildRequest, type BuiltPayload, PayloadSourceNotReady} from "@lodestar/builder";
+import {createBeaconConfig} from "@lodestar/config";
+import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {defer} from "@lodestar/utils";
+import {defer, sleep, toRootHex} from "@lodestar/utils";
+import {BuilderSigner} from "../../../../../builder/src/services/builderSigner.js";
 import {PayloadOrchestrator} from "../../../../../builder/src/services/payloadOrchestrator.js";
+import {PayloadStore} from "../../../../../builder/src/services/payloadStore.js";
+import {ProposerPreferencesTracker} from "../../../../../builder/src/services/proposerPreferencesTracker.js";
+import {getApiClientStub, mockApiResponse} from "../../../../../builder/test/unit/utils/apiStub.js";
+import {createBiddingModules} from "../../../../../builder/test/unit/utils/bidding.js";
+import {ClockMock} from "../../../../../builder/test/unit/utils/clock.js";
+import {getMockedLogger} from "../../../../../builder/test/unit/utils/logger.js";
+import {mockBuiltPayload} from "../../../../../builder/test/unit/utils/payload.js";
 import {
   ForkTransitionPayloadErrorCode,
   ForkTransitionPayloadSource,
@@ -157,6 +168,82 @@ describe("ForkTransitionPayloadSource", () => {
     expect(await preparing).toBe(handle);
     await source.release(handle, signal);
     expect(engine.release).toHaveBeenCalledExactlyOnceWith(handle, signal);
+  });
+
+  it("does not cache a failed Engine read", async () => {
+    const engine = stub("engine");
+    const source = new ForkTransitionPayloadSource(stub("sessions"), engine, forkSlot, 900);
+    const handle = await source.prepare(request(), signal);
+    vi.setSystemTime(forkSlot * 12_000);
+    engine.getPayload.mockRejectedValueOnce(new Error("connection closed"));
+    await expect(source.getPayload(handle, signal)).rejects.toThrow("connection closed");
+    const payload = await source.getPayload(handle, signal);
+    expect(await source.getPayload(handle, signal)).toBe(payload);
+    expect(engine.getPayload).toHaveBeenCalledTimes(2);
+  });
+
+  it("publishes index zero on the configured deadline with Engine latency and the real bidder cutoff", async () => {
+    const sessions = stub("sessions");
+    const engine = stub("engine");
+    const source = new ForkTransitionPayloadSource(sessions, engine, forkSlot, 900 + 300);
+    const payload = {...mockBuiltPayload({sourceId: "engine", slot: forkSlot}), fork: ForkName.gloas as const};
+    engine.getPayload.mockImplementation(async () => {
+      await sleep(100);
+      return payload;
+    });
+    const api = getApiClientStub();
+    const dependentRoot = Buffer.alloc(32, 7);
+    api.validator.getProposerDutiesV2.mockResolvedValue(
+      mockApiResponse({data: [], meta: {executionOptimistic: false, dependentRoot: toRootHex(dependentRoot)}})
+    );
+    api.beacon.publishExecutionPayloadBid.mockResolvedValue(mockApiResponse({}));
+    const config = getConfig(ForkName.gloas);
+    const clock = new ClockMock();
+    clock.currentSlot = forkSlot - 1;
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1));
+    const tracker = new ProposerPreferencesTracker();
+    const preferences = ssz.gloas.SignedProposerPreferences.defaultValue();
+    preferences.message.proposalSlot = forkSlot;
+    preferences.message.dependentRoot = dependentRoot;
+    tracker.onProposerPreferences(preferences);
+    const store = new PayloadStore();
+    const {bidder} = createBiddingModules({
+      api,
+      config,
+      clock,
+      logger: getMockedLogger(),
+      builderSigner: new BuilderSigner(createBeaconConfig(config, Buffer.alloc(32)), {
+        secretKey,
+        publicKey: secretKey.toPublicKey(),
+      }),
+      proposerPreferencesTracker: tracker,
+      payloadStore: store,
+      payloadSource: source,
+      signal,
+      index: 0,
+      updateOptions: {deadlineBps: 9250, updateIntervalMs: 25, updateCutoffBps: 2100},
+    });
+    const data = ssz.gloas.SSEPayloadAttributes.defaultValue();
+    data.proposalSlot = forkSlot;
+    data.parentBlockHash = payload.executionPayload.parentHash;
+    data.payloadAttributes = {...request().payloadAttributes, prevRandao: payload.executionPayload.prevRandao};
+    const bidding = bidder.onPayloadAttributes({version: ForkName.gloas, data});
+    await vi.advanceTimersByTimeAsync(12_000 - 900 - 1);
+    expect(engine.getPayload).toHaveBeenCalledOnce();
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+    expect(api.beacon.publishExecutionPayloadBid.mock.calls[0][0].signedExecutionPayloadBid.message).toMatchObject({
+      builderIndex: 0,
+      slot: forkSlot,
+      blockHash: payload.executionPayload.blockHash,
+    });
+    await vi.advanceTimersByTimeAsync(900 + config.getSlotComponentDurationMs(2100));
+    await bidding;
+    expect(engine.getPayload).toHaveBeenCalledOnce();
+    expect(engine.release).toHaveBeenCalledOnce();
+    expect(sessions.prepare).not.toHaveBeenCalled();
+    expect(store.has(toRootHex(payload.executionPayload.blockHash))).toBe(true);
   });
 
   it("keeps Engine construction running until its deadline through the actual update orchestrator", async () => {
