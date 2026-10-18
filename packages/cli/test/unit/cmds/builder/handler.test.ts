@@ -35,6 +35,48 @@ describe("cmds / builder / args handler", () => {
     expect(builderOptions["builderApi.bidStreamAdaptiveTiming"].default).toBe(false);
   });
 
+  it.each([{assumeBuilderIndex: 0}, {assumeBuilderBalanceGwei: 10_000_000_000}])(
+    "rejects incomplete assumed identities before loading keys",
+    async (args) => {
+      await expect(runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", ...args})).rejects.toThrow(
+        "assumeBuilderIndex and assumeBuilderBalanceGwei must be set together"
+      );
+    }
+  );
+
+  it.each([-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects unsafe assumed indices %s before loading keys",
+    async (assumeBuilderIndex) => {
+      await expect(
+        runBuilderHandler({
+          "params.GLOAS_FORK_EPOCH": "0",
+          assumeBuilderIndex,
+          assumeBuilderBalanceGwei: 10_000_000_000,
+        })
+      ).rejects.toThrow("assumeBuilderIndex must be a non-negative safe integer");
+    }
+  );
+
+  it.each([0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects unsafe assumed balances %s before loading keys",
+    async (assumeBuilderBalanceGwei) => {
+      await expect(
+        runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", assumeBuilderIndex: 0, assumeBuilderBalanceGwei})
+      ).rejects.toThrow("assumeBuilderBalanceGwei must be a positive safe integer");
+    }
+  );
+
+  it("accepts index zero and the ten ETH deposit before unrelated validation", async () => {
+    await expect(
+      runBuilderHandler({
+        "params.GLOAS_FORK_EPOCH": "0",
+        assumeBuilderIndex: 0,
+        assumeBuilderBalanceGwei: 10_000_000_000,
+        executionFeeRecipient: ZERO_ADDRESS,
+      })
+    ).rejects.toThrow("Cannot put zero address as an executionFeeRecipient");
+  });
+
   it.each([
     {executionFeeRecipient: ZERO_ADDRESS},
     {builderApi: true, "builderApi.bidStream": false},
@@ -93,6 +135,27 @@ describe("cmds / builder / args handler", () => {
     await expect(
       runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "payload.beginReservations": true})
     ).rejects.toThrow("--payload.beginReservations requires --payload.constructorUrl");
+  });
+
+  it.each([undefined, "http://127.0.0.1:8547"])(
+    "rejects invalid Engine cutoff slots before loading keys (constructor=%s)",
+    async (constructorUrl) => {
+      for (const cutoff of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        await expect(
+          runBuilderHandler({
+            "params.GLOAS_FORK_EPOCH": "0",
+            "payload.constructorUrl": constructorUrl,
+            "payload.engineUntilSlot": cutoff,
+          })
+        ).rejects.toThrow("--payload.engineUntilSlot requires --payload.constructorUrl and a non-negative safe slot");
+      }
+    }
+  );
+
+  it("requires a constructor after the Engine cutoff", async () => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "payload.engineUntilSlot": 4_235_264})
+    ).rejects.toThrow("--payload.engineUntilSlot requires --payload.constructorUrl");
   });
 
   it("rejects alternate branches without a session source and updates", async () => {
