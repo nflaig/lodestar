@@ -1,16 +1,25 @@
 import {createHash} from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import type {Type} from "@chainsafe/ssz";
 import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB} from "@lodestar/params";
 import {RootHex, gloas, ssz} from "@lodestar/types";
-import {fromHex, toRootHex} from "@lodestar/utils";
+import {fromHex, toHex, toRootHex} from "@lodestar/utils";
 import {BidLedger} from "./bidLedger.js";
 import {BidStore} from "./bidStore.js";
-import {BID_HISTORY_SLOTS, MAX_COMMITMENT_JOURNAL_FILES, PAYLOAD_RETENTION_SLOTS} from "./commitmentLimits.js";
+import {
+  BID_HISTORY_SLOTS,
+  MAX_COMMITMENT_JOURNAL_BYTES,
+  MAX_COMMITMENT_JOURNAL_FILES,
+  MAX_REVEAL_RECORD_BYTES,
+  PAYLOAD_RETENTION_SLOTS,
+  RESERVED_REVEAL_BYTES,
+  RESERVED_REVEAL_FILES,
+} from "./commitmentLimits.js";
 import {PayloadStore, StoredPayload} from "./payloadStore.js";
 
 const KEEP_SLOTS = BID_HISTORY_SLOTS;
-const MAX_BYTES = 768 * 1024 * 1024;
+const MAX_BYTES = MAX_COMMITMENT_JOURNAL_BYTES;
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
 const MAX_FILES = MAX_COMMITMENT_JOURNAL_FILES;
 const recordName = /^(payload|bid|reveal|blob)-(\d+)-(0x[0-9a-f]{64})\.(json|bin)$/;
@@ -32,6 +41,18 @@ type PayloadRecord = {
 
 export type RevealRecord = {slot: number; blockRoot: RootHex; blockHash: RootHex; envelopeRoot: RootHex};
 export type JournalIdentity = {genesisValidatorsRoot: RootHex; pubkey: string};
+type DurableFile = {name: string; bytes: number; dev: bigint; ino: bigint; mtimeNs: bigint};
+/** Issued only after durable retention. Files are immutable; recipients hard-link
+ * them into their own journal before publishing, independently of source pruning. */
+export type DurablePayload = {
+  slot: number;
+  blockHash: RootHex;
+  parentBlockHash: RootHex;
+  parentBlockRoot: RootHex;
+  executionRequestsRoot: RootHex;
+  commitments: Uint8Array[];
+  files: DurableFile[];
+};
 
 /** Single-process Gloas journal. Commit files and their directory are synced
  * before an offer becomes externally visible. An uncertain write poisons new
@@ -41,7 +62,10 @@ export type JournalIdentity = {genesisValidatorsRoot: RootHex; pubkey: string};
 export class CommitmentJournal {
   private readonly sizes = new Map<string, number>();
   private bytes = 0;
+  private revealBytes = 0;
+  private revealFiles = 0;
   private failed = false;
+  private readonly references = new Map<string, DurablePayload | undefined>();
 
   constructor(
     private readonly directory: string,
@@ -51,16 +75,7 @@ export class CommitmentJournal {
   ) {
     if (sharedPayloadDirectory !== undefined && path.resolve(sharedPayloadDirectory) === path.resolve(directory))
       throw Error("COMMITMENT_SHARED_DIRECTORY");
-    const created = fs.mkdirSync(directory, {recursive: true, mode: 0o700});
-    if (created) {
-      // Persist newly created directory entries too: syncing a record's own
-      // directory does not by itself make that directory's parent entry durable.
-      const last = path.dirname(path.resolve(created));
-      for (let parent = path.dirname(path.resolve(directory)); ; parent = path.dirname(parent)) {
-        syncDirectory(parent);
-        if (parent === last) break;
-      }
-    }
+    ensureCommitmentDirectory(directory);
     const names = fs.readdirSync(directory);
     const incomplete = names.filter(
       (name) => name.endsWith(".tmp") && (name === "identity.json.tmp" || recordName.test(name.slice(0, -4)))
@@ -74,6 +89,10 @@ export class CommitmentJournal {
         throw Error("COMMITMENT_JOURNAL_INVALID_FILE");
       this.sizes.set(name, info.size);
       this.bytes += info.size;
+      if (match?.[1] === "reveal") {
+        this.revealBytes += info.size;
+        this.revealFiles++;
+      }
     }
     const expected = {version: 1, ...identity};
     if (this.sizes.has("identity.json")) {
@@ -109,11 +128,14 @@ export class CommitmentJournal {
     }
   }
 
-  retain(signedBid: gloas.SignedExecutionPayloadBid, stored: StoredPayload): void {
+  retain(signedBid: gloas.SignedExecutionPayloadBid, stored: StoredPayload): DurablePayload | undefined {
     const {slot, blockHash, parentBlockRoot, payload} = stored;
     if (
       slot !== signedBid.message.slot ||
+      slot !== payload.executionPayload.slotNumber ||
       blockHash !== toRootHex(signedBid.message.blockHash) ||
+      blockHash !== toRootHex(payload.executionPayload.blockHash) ||
+      toRootHex(payload.executionPayload.parentHash) !== toRootHex(signedBid.message.parentBlockHash) ||
       toRootHex(parentBlockRoot) !== toRootHex(signedBid.message.parentBlockRoot)
     )
       throw Error("COMMITMENT_PAYLOAD_MISMATCH");
@@ -124,7 +146,11 @@ export class CommitmentJournal {
       )
     )
       throw Error("COMMITMENT_BLOB_MISMATCH");
+    const executionRequestsRoot = toRootHex(ssz.gloas.ExecutionRequests.hashTreeRoot(payload.executionRequests));
+    if (executionRequestsRoot !== toRootHex(signedBid.message.executionRequestsRoot))
+      throw Error("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
     const payloadName = `payload-${slot}-${blockHash}.json`;
+    let payloadRecord: PayloadRecord | undefined;
     if (!this.sizes.has(payloadName)) {
       const {blobs, commitments, proofs} = payload.blobsBundle;
       if (blobs.length !== commitments.length || proofs.length !== blobs.length * CELLS_PER_EXT_BLOB)
@@ -149,11 +175,158 @@ export class CommitmentJournal {
         parentBlockRoot: toRootHex(parentBlockRoot),
         sourceId: payload.sourceId,
         value: payload.executionPayloadValue.toString(),
-        payload: ssz.gloas.ExecutionPayload.toJson(payload.executionPayload),
+        payload: payloadToJson(payload.executionPayload),
         requests: ssz.gloas.ExecutionRequests.toJson(payload.executionRequests),
         blobRefs,
       };
       this.write(payloadName, record, true);
+      payloadRecord = record;
+    } else {
+      // The immutable file, not a fresh source response with the same hash,
+      // determines what recovery can reveal for an additional signed offer.
+      const reference = this.references.get(payloadName);
+      let retainedParent: RootHex;
+      let retainedParentRoot: RootHex;
+      let retainedRequestsRoot: RootHex;
+      let retainedCommitments: Uint8Array[];
+      if (reference) {
+        retainedParent = reference.parentBlockHash;
+        retainedParentRoot = reference.parentBlockRoot;
+        retainedRequestsRoot = reference.executionRequestsRoot;
+        retainedCommitments = reference.commitments;
+      } else {
+        payloadRecord = this.read(payloadName) as PayloadRecord;
+        retainedParent = toRootHex(ssz.gloas.ExecutionPayload.fromJson(payloadRecord.payload).parentHash);
+        retainedParentRoot = payloadRecord.parentBlockRoot;
+        retainedRequestsRoot = toRootHex(
+          ssz.gloas.ExecutionRequests.hashTreeRoot(ssz.gloas.ExecutionRequests.fromJson(payloadRecord.requests))
+        );
+        retainedCommitments = payloadRecord.blobRefs
+          ? payloadRecord.blobRefs.map((hash) =>
+              fs
+                .readFileSync(path.join(this.directory, `blob-${slot}-${hash}.bin`))
+                .subarray(BLOB_BYTES, BLOB_BYTES + COMMITMENT_BYTES)
+            )
+          : ssz.gloas.BlobsBundle.fromJson(payloadRecord.blobs).commitments;
+      }
+      if (
+        retainedParent !== toRootHex(signedBid.message.parentBlockHash) ||
+        retainedParentRoot !== toRootHex(parentBlockRoot)
+      )
+        throw Error("COMMITMENT_PAYLOAD_MISMATCH");
+      if (retainedRequestsRoot !== executionRequestsRoot) throw Error("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
+      if (
+        !ssz.gloas.ExecutionPayloadBid.fields.blobKzgCommitments.equals(
+          retainedCommitments,
+          signedBid.message.blobKzgCommitments
+        )
+      )
+        throw Error("COMMITMENT_BLOB_MISMATCH");
+    }
+    const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid));
+    const name = `bid-${slot}-${root}.json`;
+    if (!this.sizes.has(name)) this.write(name, ssz.gloas.SignedExecutionPayloadBid.toJson(signedBid));
+    if (this.references.has(payloadName)) return this.references.get(payloadName);
+    let reference: DurablePayload | undefined;
+    try {
+      const record = payloadRecord ?? (this.read(payloadName) as PayloadRecord);
+      // Legacy inline sidecars need the ordinary serialization path.
+      if (record.blobRefs === undefined) {
+        this.references.set(payloadName, undefined);
+        return undefined;
+      }
+      const names = [payloadName, ...record.blobRefs.map((hash) => `blob-${slot}-${hash}.bin`)];
+      reference = {
+        slot,
+        blockHash,
+        parentBlockHash: toRootHex(payload.executionPayload.parentHash),
+        parentBlockRoot: toRootHex(parentBlockRoot),
+        executionRequestsRoot,
+        commitments: payload.blobsBundle.commitments.map((commitment) => commitment.slice()),
+        files: names.map((name) => {
+          const info = fs.lstatSync(path.join(this.directory, name), {bigint: true});
+          if (!info.isFile()) throw Error("COMMITMENT_JOURNAL_INVALID_FILE");
+          return {name, bytes: Number(info.size), dev: info.dev, ino: info.ino, mtimeNs: info.mtimeNs};
+        }),
+      };
+    } catch {
+      // The offer is already durable. An optional optimization cannot revoke
+      // its acknowledgement or block reveals on a reference-metadata error.
+    }
+    this.references.set(payloadName, reference);
+    return reference;
+  }
+
+  retainReference(signedBid: gloas.SignedExecutionPayloadBid, reference: DurablePayload): void {
+    if (this.failed) throw Error("COMMITMENT_JOURNAL_FAILED");
+    if (!this.sharedPayloadDirectory) throw Error("COMMITMENT_REFERENCE_UNAVAILABLE");
+    const {slot, blockHash, parentBlockHash, parentBlockRoot, executionRequestsRoot, commitments, files} = reference;
+    if (
+      slot !== signedBid.message.slot ||
+      blockHash !== toRootHex(signedBid.message.blockHash) ||
+      parentBlockHash !== toRootHex(signedBid.message.parentBlockHash) ||
+      parentBlockRoot !== toRootHex(signedBid.message.parentBlockRoot)
+    )
+      throw Error("COMMITMENT_PAYLOAD_MISMATCH");
+    if (executionRequestsRoot !== toRootHex(signedBid.message.executionRequestsRoot))
+      throw Error("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
+    if (
+      !ssz.gloas.ExecutionPayloadBid.fields.blobKzgCommitments.equals(commitments, signedBid.message.blobKzgCommitments)
+    )
+      throw Error("COMMITMENT_BLOB_MISMATCH");
+    if (files.length !== commitments.length + 1 || files[0]?.name !== `payload-${slot}-${blockHash}.json`)
+      throw Error("COMMITMENT_PAYLOAD_REFERENCE");
+    for (const [index, file] of files.entries()) {
+      const match = recordName.exec(file.name);
+      if (
+        !match ||
+        Number(match[2]) !== slot ||
+        (index > 0 && (match[1] !== "blob" || match[4] !== "bin" || file.bytes !== SIDECAR_BYTES))
+      )
+        throw Error("COMMITMENT_PAYLOAD_REFERENCE");
+    }
+    // A failed offer may leave orphan sidecars, never a payload referencing
+    // absent sidecars: recovery also needs this dependency order.
+    for (const file of this.sizes.has(files[0].name) ? [] : [...files.slice(1), files[0]]) {
+      if (this.sizes.has(file.name)) continue;
+      this.assertCapacity(file.name, file.bytes);
+      const filename = path.join(this.directory, file.name);
+      const temporary = `${filename}.tmp`;
+      // Missing/pruned source files fail this offer before publishing. Completed
+      // links own their data and can safely be reused by a subsequent offer.
+      try {
+        fs.unlinkSync(temporary);
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      }
+      try {
+        fs.linkSync(path.join(this.sharedPayloadDirectory, file.name), temporary);
+      } catch (error) {
+        throw Error("COMMITMENT_REFERENCE_UNAVAILABLE", {cause: error});
+      }
+      try {
+        const info = fs.lstatSync(temporary, {bigint: true});
+        if (
+          !info.isFile() ||
+          info.dev !== file.dev ||
+          info.ino !== file.ino ||
+          info.size !== BigInt(file.bytes) ||
+          info.mtimeNs !== file.mtimeNs
+        )
+          throw Error("COMMITMENT_PAYLOAD_REFERENCE");
+      } catch (error) {
+        fs.unlinkSync(temporary);
+        throw error;
+      }
+      try {
+        fs.renameSync(temporary, filename);
+        syncDirectory(this.directory);
+        this.sizes.set(file.name, file.bytes);
+        this.bytes += file.bytes;
+      } catch (error) {
+        this.failed = true;
+        throw error;
+      }
     }
     const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid));
     const name = `bid-${slot}-${root}.json`;
@@ -266,7 +439,12 @@ export class CommitmentJournal {
           )
         )
           throw Error("COMMITMENT_BLOB_MISMATCH");
-        bids.add(signed);
+        if (
+          toRootHex(ssz.gloas.ExecutionRequests.hashTreeRoot(payload.payload.executionRequests)) !==
+          toRootHex(bid.executionRequestsRoot)
+        )
+          throw Error("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
+        bids.add(signed, "recovery");
       }
       recovered++;
     }
@@ -289,8 +467,14 @@ export class CommitmentJournal {
       )
         continue;
       fs.unlinkSync(path.join(this.directory, name));
-      this.bytes -= this.sizes.get(name) ?? 0;
+      const bytes = this.sizes.get(name) ?? 0;
+      this.bytes -= bytes;
+      if (match[1] === "reveal") {
+        this.revealBytes -= bytes;
+        this.revealFiles--;
+      }
       this.sizes.delete(name);
+      this.references.delete(name);
     }
     // Unsynced deletion can only restore expired records after a crash. Recovery
     // prunes by slot before serving; it never makes expired offers eligible again.
@@ -306,15 +490,15 @@ export class CommitmentJournal {
   }
 
   private write(name: string, data: unknown, sharePayload = false): void {
-    const text = JSON.stringify({data, checksum: digest(JSON.stringify(data))});
+    const json = JSON.stringify(data);
+    const text = `{"data":${json},"checksum":"${digest(json)}"}`;
     this.writeBytes(name, Buffer.from(text), sharePayload);
   }
 
   private writeBytes(name: string, data: Uint8Array, sharePayload = false): void {
     if (this.failed) throw Error("COMMITMENT_JOURNAL_FAILED");
     const bytes = data.byteLength;
-    if (bytes > MAX_FILE_BYTES || this.bytes + bytes > MAX_BYTES || this.sizes.size >= MAX_FILES)
-      throw Error("COMMITMENT_JOURNAL_CAPACITY");
+    this.assertCapacity(name, bytes);
     const filename = path.join(this.directory, name);
     const temporary = `${filename}.tmp`;
     try {
@@ -361,15 +545,57 @@ export class CommitmentJournal {
       syncDirectory(this.directory);
       this.sizes.set(name, bytes);
       this.bytes += bytes;
+      if (name.startsWith("reveal-")) {
+        this.revealBytes += bytes;
+        this.revealFiles++;
+      }
     } catch (error) {
       this.failed = true;
       throw error;
     }
   }
+
+  private assertCapacity(name: string, bytes: number): void {
+    const reveal = name.startsWith("reveal-");
+    if (reveal && bytes > MAX_REVEAL_RECORD_BYTES) throw Error("COMMITMENT_REVEAL_SIZE");
+    // Existing reveal files consume the reserve. New offers cannot occupy its
+    // remaining quota, including after recovery or an incomplete failed offer.
+    const reservedBytes = reveal ? 0 : Math.max(0, RESERVED_REVEAL_BYTES - this.revealBytes);
+    const reservedFiles = reveal ? 0 : Math.max(0, RESERVED_REVEAL_FILES - this.revealFiles);
+    if (
+      bytes > MAX_FILE_BYTES ||
+      this.bytes + bytes > MAX_BYTES - reservedBytes ||
+      this.sizes.size >= MAX_FILES - reservedFiles
+    )
+      throw Error("COMMITMENT_JOURNAL_CAPACITY");
+  }
+}
+
+function payloadToJson(payload: gloas.ExecutionPayload): Record<string, unknown> {
+  const json: Record<string, unknown> = {};
+  for (const {fieldName, fieldType, jsonKey} of ssz.gloas.ExecutionPayload.fieldsEntries) {
+    // Keep SSZ field order and encoding identical for checksums, shared files and older readers.
+    if (fieldName === "transactions") json[jsonKey] = Array.from(payload.transactions, (tx) => toHex(tx));
+    else if (fieldName === "blockAccessList") json[jsonKey] = toHex(payload.blockAccessList);
+    else json[jsonKey] = (fieldType as Type<unknown>).toJson(payload[fieldName]);
+  }
+  return json;
 }
 
 function digest(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+export function ensureCommitmentDirectory(directory: string): void {
+  const created = fs.mkdirSync(directory, {recursive: true, mode: 0o700});
+  if (created) {
+    // A synced record directory alone does not persist its newly created ancestors.
+    const last = path.dirname(path.resolve(created));
+    for (let parent = path.dirname(path.resolve(directory)); ; parent = path.dirname(parent)) {
+      syncDirectory(parent);
+      if (parent === last) break;
+    }
+  }
 }
 
 function syncDirectory(directory: string): void {
