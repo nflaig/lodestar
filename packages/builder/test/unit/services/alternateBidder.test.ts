@@ -24,6 +24,10 @@ const dependentRoot = Buffer.alloc(32, 7);
 const key = SecretKey.fromBytes(Buffer.alloc(32, 1));
 const pubkey = key.toPublicKey().toBytes();
 
+function hasReason(context: unknown, reason: string): boolean {
+  return typeof context === "object" && context !== null && "reason" in context && context.reason === reason;
+}
+
 function attributes(root: number, hash: number): AlternatePayloadAttributesEvent {
   const data = ssz.gloas.SSEPayloadAttributes.defaultValue();
   data.proposalSlot = 1;
@@ -151,6 +155,7 @@ describe("alternate parent bidder", () => {
     return {
       ...modules,
       api,
+      clock,
       payloadSource,
       payloadStore,
       sessions,
@@ -275,6 +280,103 @@ describe("alternate parent bidder", () => {
     m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
     await vi.advanceTimersByTimeAsync(1000);
     expect(m.payloadSource.prepare).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs source blocking reasons once per slot despite repeated resource polls", async () => {
+    const m = setup();
+    const resources: PayloadSourceResources = {
+      capacity: 2,
+      active: 1,
+      preparing: 0,
+      releasing: 0,
+      uncertain: 1,
+      alternatesDisabled: false,
+    };
+    Object.assign(resources, {code: "private-code", reason: "private-reason", endpoint: "http://private:secret@rpc"});
+    m.payloadSource.getResources.mockReturnValue(resources);
+    const alternate = attributes(4, 6);
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(alternate);
+    await vi.advanceTimersByTimeAsync(2000);
+    const diagnostics = () => m.logger.debug.mock.calls.filter(([message]) => message === "Alternate parent admission");
+    expect(m.payloadSource.getResources.mock.calls.length).toBeGreaterThan(30);
+    expect(diagnostics().filter(([, context]) => hasReason(context, "source_busy"))).toHaveLength(1);
+    expect(m.logger.debug).toHaveBeenCalledWith("Alternate parent admission", {
+      code: "BUILDER_ALTERNATE_ADMISSION",
+      reason: "source_busy",
+      localSlot: 0,
+      slot: 1,
+      parentBlockRoot: toRootHex(alternate.data.parentBlockRoot),
+      parentBlockHash: toRootHex(alternate.data.parentBlockHash),
+      primarySlot: 1,
+      primaryReady: true,
+      activeBuilds: 1,
+      queueSize: 1,
+      attempts: 0,
+      capacity: 2,
+      active: 1,
+      preparing: 0,
+      releasing: 0,
+      uncertain: 1,
+      alternatesDisabled: false,
+    });
+    resources.alternatesDisabled = true;
+    await vi.advanceTimersByTimeAsync(2000);
+    for (let i = 0; i < 100; i++) m.bidder.onAlternatePayloadAttributes(alternate);
+    expect(diagnostics().filter(([, context]) => hasReason(context, "source_disabled"))).toHaveLength(1);
+    expect(diagnostics().filter(([, context]) => hasReason(context, "received"))).toHaveLength(1);
+    expect(diagnostics().length).toBeLessThanOrEqual(16);
+    expect(m.payloadSource.prepare).toHaveBeenCalledTimes(1);
+    expect(m.offer(alternate)).toBeNull();
+    expect(m.offer(attributes(4, 5))).not.toBeNull();
+  });
+
+  it("bounds receipt diagnostics by local slot regardless of event slot or tuple churn", () => {
+    const m = setup();
+    const flood = () => {
+      for (let i = 0; i < 200; i++) {
+        const event = attributes(i, 6);
+        event.data.proposalSlot = 1000 + i;
+        m.bidder.onAlternatePayloadAttributes(event);
+      }
+    };
+    const diagnostics = () => m.logger.debug.mock.calls.filter(([message]) => message === "Alternate parent admission");
+    flood();
+    expect(diagnostics().filter(([, context]) => hasReason(context, "received"))).toHaveLength(4);
+    expect(diagnostics().filter(([, context]) => hasReason(context, "primary_context_unavailable"))).toHaveLength(1);
+    expect(diagnostics().length).toBeLessThanOrEqual(16);
+    vi.setSystemTime(12_000);
+    flood();
+    expect(diagnostics().filter(([, context]) => hasReason(context, "received"))).toHaveLength(8);
+    expect(diagnostics().length).toBeLessThanOrEqual(32);
+    const count = diagnostics().length;
+    vi.setSystemTime(0);
+    flood();
+    expect(diagnostics()).toHaveLength(count);
+    expect(m.payloadSource.prepare).not.toHaveBeenCalled();
+  });
+
+  it("does not alter primary or alternate construction when admission diagnostics throw", async () => {
+    const m = setup();
+    m.logger.debug.mockImplementation((message) => {
+      if (message === "Alternate parent admission") throw new Error("logger unavailable");
+    });
+    m.start(attributes(4, 5));
+    m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(m.payloadSource.prepare).toHaveBeenCalledTimes(2);
+    expect(m.sessions.size).toBe(1);
+    expect(m.offer(attributes(4, 5))).not.toBeNull();
+    expect(m.offer(attributes(4, 6))).not.toBeNull();
+  });
+
+  it("does not expose a diagnostic clock failure when no primary exists", () => {
+    const m = setup();
+    vi.spyOn(m.clock, "getCurrentSlot").mockImplementation(() => {
+      throw new Error("clock unavailable");
+    });
+    expect(() => m.bidder.onAlternatePayloadAttributes(attributes(4, 6))).not.toThrow();
+    expect(m.payloadSource.prepare).not.toHaveBeenCalled();
   });
 
   it("waits around gossip and does not allocate new work too late to finish before the slot", async () => {
