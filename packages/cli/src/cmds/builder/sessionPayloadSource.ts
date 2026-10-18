@@ -114,17 +114,12 @@ export class SessionPayloadSource implements PayloadSource {
       params: [request.forkchoiceState.headBlockHash, serializePayloadAttributes(request.payloadAttributes)],
     };
     const before = this.getResources();
-    // An uncertain old handle still owns one worker. Reconcile it only when
-    // needed for admission; a new primary can use the genuinely free worker.
-    if (
-      bounded &&
-      !alternate &&
-      before?.uncertain &&
-      before.preparing + before.active + before.releasing + before.uncertain >= before.capacity
-    ) {
-      await this.reconcileResources(signal);
-      if (signal.aborted) throw new ErrorAborted();
+    // Cleanup owns its reservation independently of a short primary deadline.
+    // A primary may use a free worker without waiting for every old end reply.
+    if (!alternate && before && before.uncertain > this.orphaned && this.reconciliation === undefined) {
+      void this.reconcileResources(AbortSignal.timeout(6000)).catch(() => {});
     }
+    if (signal.aborted) throw new ErrorAborted();
     const resources = this.getResources();
     if (resources) {
       if (
@@ -143,21 +138,23 @@ export class SessionPayloadSource implements PayloadSource {
     }
     let result: {sessionId: string; orderGenerationVersion?: number; alternateSessionVersion?: number};
     try {
-      result = await this.rpc(signal).fetch<typeof result, typeof call.params>(call);
+      // Cancelling the build must not discard a late allocation handle. Keep
+      // one bounded request alive, then end any handle the caller no longer owns.
+      result = await this.rpc(bounded ? AbortSignal.timeout(6000) : signal).fetch<typeof result, typeof call.params>(
+        call
+      );
     } catch (error) {
       if (bounded) {
         const rejection = error instanceof ErrorJsonRpcResponse ? error.response.error : undefined;
-        const definite =
-          rejection !== undefined &&
-          (alternate ||
-            ["SessionLimit", "SlotNotArmed", "ConstructionHalted", "WorkerRejected", "ParentUnavailable"].includes(
-              rejection.message
-            ));
+        // Native begin dispatch cleans its allocation before returning an RPC
+        // error. Refused connections never send the non-idempotent request.
+        const definite = rejection !== undefined || (isFetchError(error) && error.code === "ECONNREFUSED");
         if (!definite) {
           this.orphaned++;
           this.alternatesDisabled = true;
         } else if (
           alternate &&
+          rejection &&
           (rejection.code === -32601 ||
             ["UnknownSession", "UnknownMethod", "MethodNotFound", "AlternateLeasesUnsupported"].includes(
               rejection.message
@@ -334,6 +331,16 @@ export class SessionPayloadSource implements PayloadSource {
         this.requests.delete(handle.payloadId);
       })
       .catch((error: unknown) => {
+        if (
+          error instanceof ErrorJsonRpcResponse &&
+          error.response.error.code === -32000 &&
+          error.response.error.message === "UnknownSession" &&
+          /^native-[0-9a-f]{32}-[01]-(?:0|[1-9][0-9]{0,19})$/.test(handle.payloadId) &&
+          BigInt(handle.payloadId.slice(handle.payloadId.lastIndexOf("-") + 1)) <= 0xffffffffffffffffn
+        ) {
+          this.requests.delete(handle.payloadId);
+          return;
+        }
         entry.state = "uncertain";
         throw error;
       })

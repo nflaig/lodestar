@@ -476,6 +476,8 @@ describe("SessionPayloadSource", () => {
       end.reject(new Error("lost end response"));
       await failed;
       fetch.mockResolvedValueOnce(true).mockResolvedValueOnce({sessionId: "new-primary"});
+      await expect(source.prepare(request, signal)).rejects.toMatchObject(errorCode(SessionPayloadErrorCode.CAPACITY));
+      await source.reconcileResources(signal);
       await expect(source.prepare(request, signal)).resolves.toMatchObject({payloadId: "new-primary"});
       expect(fetch.mock.calls.slice(-2).map(([call]) => call.method)).toEqual(["zbuilder_endV1", "zbuilder_beginV1"]);
       expect(source.getResources()).toMatchObject({preparing: 0, active: 2, releasing: 0, uncertain: 0});
@@ -490,18 +492,25 @@ describe("SessionPayloadSource", () => {
         errorCode(SessionPayloadErrorCode.RELEASE_UNCONFIRMED)
       );
       expect(source.getResources()).toMatchObject({active: 0, uncertain: 1});
-      fetch.mockResolvedValueOnce({sessionId: "new-primary"});
+      const end = defer<boolean>();
+      fetch.mockImplementation(async (call) =>
+        call.method === "zbuilder_endV1" ? end.promise : {sessionId: "new-primary"}
+      );
       await expect(source.prepare(request, signal)).resolves.toMatchObject({payloadId: "new-primary"});
       expect(fetch.mock.calls.map(([call]) => call.method)).toEqual([
         "zbuilder_beginV1",
         "zbuilder_endV1",
         "zbuilder_beginV1",
+        "zbuilder_endV1",
       ]);
-      expect(source.getResources()).toMatchObject({active: 1, uncertain: 1, preparing: 0, releasing: 0});
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 0, preparing: 0, releasing: 1});
       await expect(source.prepare({...request, requireUnleased: true}, signal)).rejects.toMatchObject(
         errorCode(SessionPayloadErrorCode.CAPACITY)
       );
-      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(fetch).toHaveBeenCalledTimes(4);
+      end.resolve(true);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 0, releasing: 0});
     });
 
     it("serializes concurrent reconciliation over both known handles", async () => {
@@ -535,7 +544,7 @@ describe("SessionPayloadSource", () => {
           return true;
         })
         .mockResolvedValueOnce({sessionId: "new-primary"});
-      const primary = source.prepare(request, signal);
+      await expect(source.prepare(request, signal)).rejects.toMatchObject(errorCode(SessionPayloadErrorCode.CAPACITY));
       await firstStarted.promise;
       const duplicate = source.reconcileResources(signal);
       expect(order).toEqual(["first"]);
@@ -544,13 +553,16 @@ describe("SessionPayloadSource", () => {
       await secondStarted.promise;
       expect(order).toEqual(["first", "second"]);
       expect(source.getResources()).toMatchObject({preparing: 0, releasing: 1, uncertain: 0});
+      // The first acknowledgement frees one worker even while the second
+      // cleanup is still in progress. No cleanup RPC runs concurrently.
+      await expect(source.prepare(request, signal)).resolves.toMatchObject({payloadId: "new-primary"});
+      expect(source.getResources()).toMatchObject({active: 1, releasing: 1, uncertain: 0});
       secondEnded.resolve();
       await duplicate;
-      await expect(primary).resolves.toMatchObject({payloadId: "new-primary"});
       expect(source.getResources()).toMatchObject({preparing: 0, active: 1, releasing: 0, uncertain: 0});
     });
 
-    it("aborts a waiting primary without cancelling another caller's end or beginning an orphan", async () => {
+    it("aborts a reconciliation waiter without cancelling another caller's end or beginning an orphan", async () => {
       const {source, fetch, request} = setup(true);
       fetch.mockResolvedValueOnce({sessionId: "old"}).mockResolvedValueOnce({sessionId: "second"});
       const handle = await source.prepare(request, signal);
@@ -574,8 +586,8 @@ describe("SessionPayloadSource", () => {
       const reconciliation = source.reconcileResources(signal);
       await started.promise;
       const controller = new AbortController();
-      const primary = source.prepare(request, controller.signal);
-      const aborted = expect(primary).rejects.toBeInstanceOf(ErrorAborted);
+      const waiting = source.reconcileResources(controller.signal);
+      const aborted = expect(waiting).rejects.toBeInstanceOf(ErrorAborted);
       controller.abort();
       await aborted;
       expect(source.getResources()).toMatchObject({preparing: 0, releasing: 1, uncertain: 1});
@@ -689,6 +701,154 @@ describe("SessionPayloadSource", () => {
       expect(source.getResources()).toMatchObject({uncertain: 0});
     });
 
+    it("reconciles an absent instance-scoped handle without releasing another instance", async () => {
+      const {source, fetch, request} = setup(true);
+      const oldId = `native-${"ab".repeat(16)}-0-17`;
+      const newId = `native-${"cd".repeat(16)}-0-17`;
+      fetch.mockResolvedValueOnce({sessionId: oldId}).mockResolvedValueOnce({sessionId: newId});
+      const old = await source.prepare(request, signal);
+      const current = await source.prepare(request, signal);
+      fetch.mockRejectedValueOnce(transportError("ECONNRESET"));
+      await expect(source.release(old, signal)).rejects.toBeInstanceOf(FetchError);
+      const absent = new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "UnknownSession"}},
+        "zbuilder_endV1"
+      );
+      fetch.mockRejectedValueOnce(absent);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({active: 1, releasing: 0, uncertain: 0});
+      fetch.mockResolvedValueOnce(payloadResponse(request));
+      await expect(source.getPayload(current, signal)).resolves.toMatchObject({sourceId: "session"});
+      expect(
+        fetch.mock.calls.filter(([call]) => call.method === "zbuilder_endV1").map(([call]) => call.params)
+      ).toEqual([[oldId], [oldId]]);
+    });
+
+    it.each([
+      ["foreign-handle", -32000, "UnknownSession"],
+      [`native-${"ab".repeat(16)}-2-17`, -32000, "UnknownSession"],
+      [`native-${"ab".repeat(16)}-0-18446744073709551616`, -32000, "UnknownSession"],
+      [`native-${"ab".repeat(16)}-0-17`, -32601, "UnknownSession"],
+      [`native-${"ab".repeat(16)}-0-17`, -32000, "WorkerRejected"],
+    ] as const)("keeps unconfirmed end error occupied for %s/%i/%s", async (payloadId, code, message) => {
+      const {source, fetch, request} = setup(true);
+      fetch.mockResolvedValueOnce({sessionId: payloadId});
+      const handle = await source.prepare(request, signal);
+      fetch.mockRejectedValueOnce(
+        new ErrorJsonRpcResponse({jsonrpc: "2.0", id: 1, error: {code, message}}, "zbuilder_endV1")
+      );
+      await expect(source.release(handle, signal)).rejects.toBeInstanceOf(ErrorJsonRpcResponse);
+      expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 1});
+    });
+
+    it("recovers after two real refused begin connections without losing capacity", async () => {
+      const methods: string[] = [];
+      const server = createServer(async (req, res) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(Buffer.from(chunk));
+        const call = JSON.parse(Buffer.concat(chunks).toString()) as {id: number; method: string};
+        methods.push(call.method);
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({jsonrpc: "2.0", id: call.id, result: {sessionId: `restored-${methods.length}`}}));
+      });
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Missing listener address");
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      const source = new SessionPayloadSource(
+        "socket",
+        (signal) => new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal, timeout: 1000}),
+        {boundedAlternates: true}
+      );
+      for (let i = 0; i < 2; i++) {
+        await expect(source.prepare(buildRequest(), signal)).rejects.toMatchObject({code: "ECONNREFUSED"});
+        expect(source.getResources()).toMatchObject({preparing: 0, active: 0, uncertain: 0, alternatesDisabled: false});
+      }
+      server.listen(address.port, "127.0.0.1");
+      await once(server, "listening");
+      try {
+        await source.prepare(buildRequest(), signal);
+        await source.prepare(buildRequest(), signal);
+        expect(source.getResources()).toMatchObject({active: 2, preparing: 0, uncertain: 0, alternatesDisabled: false});
+        expect(methods).toEqual(["zbuilder_beginV1", "zbuilder_beginV1"]);
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      }
+    });
+
+    it("keeps a cancelled HTTP begin tracked until its late handle is physically released", async () => {
+      const beginEntered = defer<void>();
+      const beginReply = defer<void>();
+      const endEntered = defer<void>();
+      const endReply = defer<void>();
+      const methods: string[] = [];
+      const id = `native-${"ab".repeat(16)}-1-19`;
+      const server = createServer(async (req, res) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(Buffer.from(chunk));
+        const call = JSON.parse(Buffer.concat(chunks).toString()) as {id: number; method: string; params: unknown[]};
+        methods.push(call.method);
+        if (call.method === "zbuilder_beginV1") {
+          beginEntered.resolve();
+          await beginReply.promise;
+        } else {
+          expect(call).toMatchObject({method: "zbuilder_endV1", params: [id]});
+          endEntered.resolve();
+          await endReply.promise;
+        }
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: call.id,
+            result: call.method === "zbuilder_beginV1" ? {sessionId: id} : true,
+          })
+        );
+      });
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const controller = new AbortController();
+      const callSignals: AbortSignal[] = [];
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Missing listener address");
+        const source = new SessionPayloadSource(
+          "socket",
+          (signal) => {
+            callSignals.push(signal);
+            return new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal, timeout: 1000});
+          },
+          {boundedAlternates: true}
+        );
+        const prepare = source.prepare(buildRequest(), controller.signal);
+        const cancelled = expect(prepare).rejects.toBeInstanceOf(ErrorAborted);
+        await beginEntered.promise;
+        controller.abort();
+        expect(callSignals[0].aborted).toBe(false);
+        expect(source.getResources()).toMatchObject({preparing: 1, active: 0, releasing: 0, uncertain: 0});
+        beginReply.resolve();
+        await endEntered.promise;
+        expect(source.getResources()).toMatchObject({preparing: 0, active: 0, releasing: 1, uncertain: 0});
+        endReply.resolve();
+        await cancelled;
+        expect(source.getResources()).toMatchObject({
+          preparing: 0,
+          active: 0,
+          releasing: 0,
+          uncertain: 0,
+          alternatesDisabled: false,
+        });
+        expect(methods).toEqual(["zbuilder_beginV1", "zbuilder_endV1"]);
+      } finally {
+        beginReply.resolve();
+        endReply.resolve();
+        server.closeAllConnections();
+        await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      }
+    });
+
     it.each(["unsupported", "lost-response"])("tracks real HTTP alternate begin outcome: %s", async (fault) => {
       const request = buildRequest();
       const controller = new AbortController();
@@ -775,12 +935,12 @@ describe("SessionPayloadSource", () => {
       expect(source.getResources()).toMatchObject({active: 1, uncertain: 0, alternatesDisabled: true});
     });
 
-    it.each(["WorkerRejected", "AlternateSessionLimit", "SessionLimit"])(
+    it.each(["WorkerRejected", "AlternateSessionLimit", "SessionLimit", "FileNotFound", "SyntaxError", "OutOfMemory"])(
       "allows a fresh attempt after definite native rejection %s without charging an orphan",
       async (reason) => {
         const {source, fetch, request} = setup(true);
-        fetch.mockRejectedValueOnce(rejectedBegin("WorkerRejected"));
-        await expect(source.prepare(request, signal)).rejects.toThrow("WorkerRejected");
+        fetch.mockRejectedValueOnce(rejectedBegin(reason));
+        await expect(source.prepare(request, signal)).rejects.toThrow(reason);
         expect(source.getResources()).toMatchObject({active: 0, uncertain: 0, alternatesDisabled: false});
         fetch.mockResolvedValueOnce({sessionId: "primary"});
         await source.prepare(request, signal);
