@@ -125,7 +125,7 @@ fallback. Reservations are scoped to one native process instance, so a native re
 requires coordinated publisher restart and recovery of its durable reveal journal.
 Routing a reservation to another instance fails closed and keeps its capacity
 uncertain. A cleanup timeout also retains capacity; later reconciliation may recover
-it without restarting either process. Already signed payloads remain revealable.
+it without restarting either process. Already signed payloads remain available for reveal.
 
 ## Experimental alternate parent bids
 
