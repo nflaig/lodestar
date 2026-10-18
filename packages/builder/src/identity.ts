@@ -1,20 +1,13 @@
-import {pubkeyCache} from "@chainsafe/lodestar-z/pubkeys";
-import {ApiClient, ApiError, HttpStatusCode, WireFormat, routes} from "@lodestar/api";
+import {ApiClient, ApiError, HttpStatusCode, routes} from "@lodestar/api";
 import {BeaconConfig} from "@lodestar/config";
-import {MAX_PENDING_DEPOSITS_PER_EPOCH, PAYLOAD_BUILDER_VERSION} from "@lodestar/params";
-import {
-  IClock,
-  computeStartSlotAtEpoch,
-  createBeaconStateView,
-  getValidatorCountFromStateBytes,
-  isStatePostGloas,
-} from "@lodestar/state-transition";
-import {BuilderStatus, Slot, getBuilderStatus as getStatusOfBuilder} from "@lodestar/types";
+import {PAYLOAD_BUILDER_VERSION} from "@lodestar/params";
+import {IClock, computeStartSlotAtEpoch} from "@lodestar/state-transition";
+import {BuilderStatus} from "@lodestar/types";
 import {ErrorAborted, Logger, TimeoutError, isErrorAborted, isFetchError, sleep, toHex} from "@lodestar/utils";
 
 /**
  * Point within the last slot before the Gloas fork at which the builder registry of the fork is
- * computed, in basis points. Late enough for the block of that slot to be the head and early
+ * fetched, in basis points. Late enough for the block of that slot to be the head and early
  * enough to bid for the first Gloas slot.
  */
 const FORK_REGISTRY_LOOKUP_BPS = 5000;
@@ -95,16 +88,15 @@ async function waitForBuilder(
         continue;
       }
 
-      // Builders deposited before the fork are onboarded by the fork upgrade, the beacon node only knows
-      // them once the first Gloas block is the head. Compute the registry of the fork from the head state
-      // of the last slot before it, to be able to bid for the first Gloas slot.
+      // Builders deposited before the fork are onboarded by the fork upgrade. The head state only has them
+      // once the first Gloas block is the head, the state of the fork slot has them before that block exists.
       await sleep(config.getSlotComponentDurationMs(FORK_REGISTRY_LOOKUP_BPS) - clock.msFromSlot(currentSlot), signal);
       let builder: routes.beacon.BuilderResponse | null = null;
       try {
-        builder = await fetchBuilderAtFork(api, config, forkSlot, id);
+        builder = await fetchBuilder(api, logger, id, forkSlot);
       } catch (e) {
         if (isErrorAborted(e)) throw e;
-        logger.warn("Unable to compute the builder registry of the Gloas fork", {forkSlot}, e as Error);
+        logger.warn("Unable to fetch the builder registry of the Gloas fork", {forkSlot}, e as Error);
       }
       if (builder?.status === "active") {
         return builder;
@@ -152,11 +144,12 @@ async function waitForBuilder(
 async function fetchBuilder(
   api: ApiClient,
   logger: Logger,
-  id: routes.beacon.BuilderId
+  id: routes.beacon.BuilderId,
+  stateId: routes.beacon.StateId = "head"
 ): Promise<routes.beacon.BuilderResponse | null> {
   try {
     const builderRes = await api.beacon.getStateBuilders({
-      stateId: "head",
+      stateId,
       builderIds: [id],
     });
 
@@ -184,35 +177,6 @@ async function fetchBuilder(
     }
     throw e;
   }
-}
-
-async function fetchBuilderAtFork(
-  api: ApiClient,
-  config: BeaconConfig,
-  forkSlot: Slot,
-  id: routes.beacon.BuilderId
-): Promise<routes.beacon.BuilderResponse | null> {
-  const stateBytes = (await api.debug.getStateV2({stateId: "head"}, {responseWireFormat: WireFormat.ssz})).ssz();
-  const validatorCount = getValidatorCountFromStateBytes(config, stateBytes);
-  if (validatorCount === null) {
-    throw Error("Cannot read validator count from head state");
-  }
-  // The view syncs pubkeys during construction, capacity must be reserved first
-  pubkeyCache.ensureCapacity(validatorCount + MAX_PENDING_DEPOSITS_PER_EPOCH);
-  const forkState = createBeaconStateView({useNative: false, config, stateBytes}).processSlots(forkSlot);
-  if (!isStatePostGloas(forkState)) {
-    throw Error(`Expected gloas state at fork slot, got fork=${forkState.forkName}`);
-  }
-
-  const finalizedEpoch = forkState.finalizedCheckpoint.epoch;
-  const buildersLength = forkState.getBuildersLength();
-  for (let index = 0; index < buildersLength; index++) {
-    const builder = forkState.getBuilder(index);
-    if (typeof id === "number" ? id === index : id === toHex(builder.pubkey)) {
-      return {index, status: getStatusOfBuilder(builder, finalizedEpoch), builder};
-    }
-  }
-  return null;
 }
 
 function msToNextEpochPoll(clock: IClock): number {

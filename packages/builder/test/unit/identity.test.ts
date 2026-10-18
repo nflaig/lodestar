@@ -207,6 +207,53 @@ describe("Identity", () => {
     expect(api.beacon.getStateBuilders).toHaveBeenCalledTimes(2);
   });
 
+  it("fetches the registry of the fork slot from the beacon node in the last slot before the fork", async () => {
+    vi.useFakeTimers();
+    const forkClock = new ClockMock();
+    forkClock.currentSlot = SLOTS_PER_EPOCH - 1;
+    const forkConfig = createBeaconConfig({...getConfig(ForkName.fulu), GLOAS_FORK_EPOCH: 1}, Buffer.alloc(32));
+    api.beacon.getStateBuilders.mockResolvedValue(
+      mockGetStateBuildersResponse(index, {status, pubkey, balance, version})
+    );
+    const promise = resolveBuilderIdentity(api, logger, pubkeyString, abortController.signal, forkClock, forkConfig);
+
+    await vi.advanceTimersByTimeAsync(forkConfig.getSlotComponentDurationMs(5000) - 1);
+    expect(api.beacon.getStateBuilders).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await promise).index).toEqual(index);
+    expect(api.beacon.getStateBuilders).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({stateId: SLOTS_PER_EPOCH, builderIds: [pubkeyString]})
+    );
+  });
+
+  it("falls back to the head state after the fork when the beacon node does not serve the fork slot", async () => {
+    vi.useFakeTimers();
+    const forkClock = new ClockMock();
+    forkClock.currentSlot = SLOTS_PER_EPOCH - 1;
+    const forkConfig = createBeaconConfig({...getConfig(ForkName.fulu), GLOAS_FORK_EPOCH: 1}, Buffer.alloc(32));
+    api.beacon.getStateBuilders.mockResolvedValueOnce(await mockApiErrorResponse(404));
+    api.beacon.getStateBuilders.mockResolvedValue(
+      mockGetStateBuildersResponse(index, {status, pubkey, balance, version})
+    );
+    const promise = resolveBuilderIdentity(api, logger, pubkeyString, abortController.signal, forkClock, forkConfig);
+
+    await vi.advanceTimersByTimeAsync(forkConfig.getSlotComponentDurationMs(5000));
+    expect(api.beacon.getStateBuilders).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({stateId: SLOTS_PER_EPOCH})
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Unable to fetch the builder registry of the Gloas fork",
+      expect.objectContaining({forkSlot: SLOTS_PER_EPOCH}),
+      expect.anything()
+    );
+
+    forkClock.currentSlot = SLOTS_PER_EPOCH;
+    await vi.advanceTimersByTimeAsync(forkClock.msToSlot(SLOTS_PER_EPOCH + 1));
+    expect((await promise).index).toEqual(index);
+    expect(api.beacon.getStateBuilders).toHaveBeenLastCalledWith(expect.objectContaining({stateId: "head"}));
+  });
+
   it("resolves once the Gloas fork is reached", async () => {
     vi.useFakeTimers();
     const forkClock = new ClockMock();
