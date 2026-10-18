@@ -314,7 +314,7 @@ as HTTP; ping/pong RTT is diagnostic only and does not change its send or close 
 Adaptive timing is separately opt-in with `--builderApi.bidStreamAdaptiveTiming`,
 which defaults to false and requires `--builderApi --builderApi.bidStream`. Enable
 it only after verifying end-to-end pong forwarding through the exact deployment path.
-It does not assume that Cloudflare or another intermediary forwards control frames.
+It does not assume that an intermediary forwards control frames.
 
 In adaptive mode, before authentication it fixes a hard stop at the earlier of the requested
 slot's end and the caller's timeout minus observed inbound age and a 50 ms margin.
@@ -334,7 +334,7 @@ stop is later. This adaptation does not resolve those 204 responses or infer clo
 offsets from request headers.
 
 The measured RTT must reach the authenticated proposer connection. Use direct or
-transparent WebSocket proxying; an intermediary that answers pings instead of
+transparent WebSocket forwarding; an intermediary that answers pings instead of
 forwarding them measures only the path to that intermediary. Verify control-frame
 forwarding before enabling this mode behind a proxy. The reserved RTT is a measured
 sample, not a guarantee of future return-path latency.
