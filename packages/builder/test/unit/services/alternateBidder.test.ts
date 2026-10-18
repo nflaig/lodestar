@@ -201,6 +201,70 @@ describe("alternate parent bidder", () => {
     expect(m.payloadSource.prepare).toHaveBeenCalledTimes(4);
   });
 
+  it.each([250, 500, 1000])(
+    "finishes a 100ms alternate journal write within the existing %ims budget",
+    async (duration) => {
+      const m = setup({alternateBuildDurationMs: duration});
+      const primary = attributes(4, 5);
+      const alternate = attributes(4, 6);
+      let retainedAt: number | undefined;
+      m.retainCommitment.mockImplementation(async (bid) => {
+        if (toRootHex(bid.message.parentBlockHash) === toRootHex(alternate.data.parentBlockHash)) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 100));
+          retainedAt = Date.now();
+        }
+      });
+      m.start(primary);
+      const startedAt = Date.now();
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(duration);
+
+      expect(retainedAt).toBeDefined();
+      expect(retainedAt).toBeLessThan(startedAt + duration);
+      expect(m.offer(alternate)).not.toBeNull();
+      expect(m.offer(primary)).not.toBeNull();
+      expect(m.sessions.size).toBe(1);
+      expect(m.payloadSource.release.mock.calls.map(([handle]) => handle.payloadId)).not.toContain("1");
+    }
+  );
+
+  it.each([20, 30])(
+    "includes %ims of retrieval in the shortest alternate retention deadline",
+    async (retrievalTime) => {
+      const m = setup({alternateBuildDurationMs: 250});
+      const alternate = attributes(4, 6);
+      const retained: gloas.SignedExecutionPayloadBid[] = [];
+      m.payloadSource.getPayload.mockImplementation(async (handle) => {
+        if (handle.payloadId === "2") await new Promise<void>((resolve) => setTimeout(resolve, retrievalTime));
+        const session = m.sessions.get(handle.payloadId);
+        if (!session) throw Error("Missing session");
+        return session.payload;
+      });
+      m.retainCommitment.mockImplementation(async (bid) => {
+        if (toRootHex(bid.message.parentBlockHash) === toRootHex(alternate.data.parentBlockHash)) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 100));
+          retained.push(bid);
+        }
+      });
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(retained).toHaveLength(1);
+      expect(m.bidStore.has(retained[0])).toBe(true);
+      expect(m.payloadStore.has(toRootHex(retained[0].message.blockHash))).toBe(true);
+      expect(m.bidStore.canOffer(retained[0])).toBe(retrievalTime === 20);
+      expect(m.offer(alternate) !== null).toBe(retrievalTime === 20);
+      if (retrievalTime === 30)
+        expect(m.logger.debug).toHaveBeenCalledWith("Skipping alternate parent bid", {
+          slot: 1,
+          parentBlockRoot: toRootHex(alternate.data.parentBlockRoot),
+          parentBlockHash: toRootHex(alternate.data.parentBlockHash),
+          reason: "deadline_after_retention",
+        });
+    }
+  );
+
   it.each([false, true])(
     "keeps the primary alive across standard-topic alternate/repeated-primary interleaving (enabled=%s)",
     async (alternateBranches) => {
