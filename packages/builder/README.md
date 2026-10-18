@@ -127,6 +127,14 @@ Routing a reservation to another instance fails closed and keeps its capacity
 uncertain. A cleanup timeout also retains capacity; later reconciliation may recover
 it without restarting either process. Already signed payloads remain available for reveal.
 
+Reconciliation attempts both occupied handles independently, so a failed cancellation
+cannot block the other handle's cleanup. An instance-mismatch cancellation backs off
+only that handle's reconciliation, while keeping its capacity occupied. Native arming
+and halted-construction rejections back off from 200 ms to at most one second within
+the existing build deadline. These same-slot primary retries wait until every rejected
+reservation finishes cancellation. Received rejections have bounded, sanitized
+diagnostics; neither rejection messages nor delayed retries release uncertain capacity.
+
 ## Experimental alternate parent bids
 
 The builder can retain an API and stream bid for additional parent tuples using the
