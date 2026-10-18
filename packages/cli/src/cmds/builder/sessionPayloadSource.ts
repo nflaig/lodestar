@@ -26,6 +26,28 @@ type LeasedResponse = {generation: string; leaseMs: number; ready: boolean; payl
 // Native operations allow up to 15s; retain the reply through bounded failure
 // cleanup too. The orchestrator's build deadline still detaches independently.
 const BEGIN_RPC_TIMEOUT_MS = 20_000;
+const CONSTRUCTOR_CAPACITY = 2;
+const BEGIN_REJECTION_LOG_INTERVAL_MS = 1000;
+const BEGIN_RETRY_MAX_MS = 1000;
+const BEGIN_REJECTIONS = [
+  "SlotNotArmed",
+  "ConstructionHalted",
+  "SessionLimit",
+  "AlternateSessionLimit",
+  "UnknownSession",
+  "BeginReservationInstanceMismatch",
+  "BeginReservationClaimed",
+  "UnknownBeginReservation",
+  "BeginReservationCancelled",
+  "BeginReservationLimit",
+  "BeginReservationExhausted",
+  "AlternateLeasesUnsupported",
+  "MethodNotSupported",
+  "UnknownMethod",
+  "MethodNotFound",
+  "InvalidParameters",
+] as const;
+type BeginRejection = (typeof BEGIN_REJECTIONS)[number] | "OtherJsonRpcRejection";
 
 export enum SessionPayloadErrorCode {
   INVALID_SESSION = "SESSION_PAYLOAD_INVALID_SESSION",
@@ -46,6 +68,17 @@ type SessionEntry = {
   state: "active" | "releasing" | "uncertain";
   release?: Promise<void>;
   reserved?: boolean;
+  reconcileAfter?: number;
+  reconcileFailures?: number;
+  beginRejected?: boolean;
+};
+
+type Reconciliation = {
+  signal: AbortSignal;
+  attempted: Set<string>;
+  releases: Promise<PromiseSettledResult<void>>[];
+  promise: Promise<void>;
+  accepting: boolean;
 };
 
 type AlternateDisabledReason =
@@ -61,7 +94,9 @@ export class SessionPayloadSource implements PayloadSource {
   private preparing = 0;
   private orphaned = 0;
   private alternatesDisabled = false;
-  private reconciliation: Promise<void> | undefined;
+  private reconciliation: Reconciliation | undefined;
+  private beginRetry = {slot: -1, failures: 0, after: 0};
+  private readonly beginRejectionWarnings = new Map<BeginRejection, number>();
 
   constructor(
     readonly id: string,
@@ -84,7 +119,7 @@ export class SessionPayloadSource implements PayloadSource {
   getResources(): PayloadSourceResources | undefined {
     if (!this.tracksSessions) return undefined;
     const result: PayloadSourceResources = {
-      capacity: 2,
+      capacity: CONSTRUCTOR_CAPACITY,
       preparing: this.preparing,
       active: 0,
       releasing: 0,
@@ -126,24 +161,110 @@ export class SessionPayloadSource implements PayloadSource {
     }
   }
 
+  private noteBeginRejection(
+    request: BuildRequest,
+    signal: AbortSignal,
+    method: string,
+    error: unknown,
+    ticket?: string
+  ): BeginRejection | undefined {
+    let reason: BeginRejection | undefined;
+    try {
+      if (!(error instanceof ErrorJsonRpcResponse)) return undefined;
+      const rejection = error.response.error;
+      reason =
+        rejection.code === -32601
+          ? "MethodNotFound"
+          : (rejection.code === -32000 && BEGIN_REJECTIONS.find((name) => name === rejection.message)) ||
+            "OtherJsonRpcRejection";
+      const now = performance.now();
+      if (
+        !request.requireUnleased &&
+        (reason === "SlotNotArmed" || reason === "ConstructionHalted") &&
+        this.beginRetry.slot === request.payloadAttributes.slotNumber
+      ) {
+        this.beginRetry.failures = Math.min(4, this.beginRetry.failures + 1);
+        this.beginRetry.after = now + Math.min(BEGIN_RETRY_MAX_MS, 100 * 2 ** this.beginRetry.failures);
+      }
+      const previous = this.beginRejectionWarnings.get(reason);
+      if (previous !== undefined && now - previous < BEGIN_REJECTION_LOG_INTERVAL_MS) return reason;
+      this.beginRejectionWarnings.set(reason, now);
+      this.options.logger?.warn("Constructor begin rejected", {
+        code: "SESSION_PAYLOAD_BEGIN_REJECTED",
+        reason,
+        method,
+        slot: request.payloadAttributes.slotNumber,
+        callerAborted: signal.aborted,
+        cleanupPending: ticket !== undefined,
+        sessionId: ticket,
+      });
+    } catch {
+      // Diagnostics must not change the original error or ticket ownership.
+    }
+    return reason;
+  }
+
+  private resetBeginRetry(request: BuildRequest): void {
+    if (this.beginRetry.slot === request.payloadAttributes.slotNumber) {
+      this.beginRetry.failures = 0;
+      this.beginRetry.after = 0;
+    }
+  }
+
+  private addReconciliationEntries(pending: Reconciliation): void {
+    if (!pending.accepting || pending.signal.aborted) return;
+    const now = performance.now();
+    for (const [payloadId, entry] of [...this.requests]) {
+      if (pending.attempted.size === CONSTRUCTOR_CAPACITY) break;
+      if (entry.state !== "uncertain" || (entry.reconcileAfter ?? 0) > now || pending.attempted.has(payloadId))
+        continue;
+      pending.attempted.add(payloadId);
+      pending.releases.push(
+        Promise.allSettled([
+          this.release({sourceId: this.id, fork: entry.request.fork, payloadId}, pending.signal),
+        ]).then(([result]) => result)
+      );
+    }
+  }
+
   async reconcileResources(signal: AbortSignal): Promise<void> {
     if (!this.tracksSessions) return;
     let pending = this.reconciliation;
-    if (pending === undefined) {
+    if (pending === undefined || !pending.accepting) {
       const cleanupSignal = AbortSignal.any([signal, AbortSignal.timeout(6000)]);
-      pending = (async () => {
-        for (const [payloadId, entry] of this.requests) {
-          cleanupSignal.throwIfAborted();
-          if (entry.state === "uncertain") {
-            await this.release({sourceId: this.id, fork: entry.request.fork, payloadId}, cleanupSignal);
+      pending = {
+        signal: cleanupSignal,
+        attempted: new Set(),
+        releases: [],
+        promise: Promise.resolve(),
+        accepting: true,
+      };
+      this.reconciliation = pending;
+      this.addReconciliationEntries(pending);
+      const current = pending;
+      current.promise = (async () => {
+        try {
+          let completed = 0;
+          const failed: PromiseRejectedResult[] = [];
+          while (completed < current.releases.length) {
+            const releases = current.releases.slice(completed);
+            completed += releases.length;
+            const results = await Promise.all(releases);
+            for (const result of results) if (result.status === "rejected") failed.push(result);
           }
+          cleanupSignal.throwIfAborted();
+          if (failed.length > 0) throw failed[0].reason;
+        } finally {
+          current.accepting = false;
         }
       })().finally(() => {
-        this.reconciliation = undefined;
+        if (this.reconciliation === current) this.reconciliation = undefined;
       });
-      this.reconciliation = pending;
+    } else {
+      this.addReconciliationEntries(pending);
     }
-    await withTimeout(() => pending, 6000, signal);
+    const current = pending;
+    await withTimeout(() => current.promise, 6000, signal);
   }
 
   async prepare(request: BuildRequest, signal: AbortSignal): Promise<BuildHandle> {
@@ -153,6 +274,9 @@ export class SessionPayloadSource implements PayloadSource {
     }
     const bounded = this.tracksSessions;
     const alternate = request.requireUnleased === true;
+    if (request.payloadAttributes.slotNumber > this.beginRetry.slot) {
+      this.beginRetry = {slot: request.payloadAttributes.slotNumber, failures: 0, after: 0};
+    }
     if (alternate && (!this.supportsBoundedAlternates || this.alternatesDisabled))
       throw new SessionPayloadError({
         code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED,
@@ -165,8 +289,26 @@ export class SessionPayloadSource implements PayloadSource {
     const before = this.getResources();
     // Cleanup owns its reservation independently of a short primary deadline.
     // A primary may use a free worker without waiting for every old end reply.
-    if (!alternate && before && before.uncertain > this.orphaned && this.reconciliation === undefined) {
+    if (!alternate && before && before.uncertain > this.orphaned) {
       void this.reconcileResources(AbortSignal.timeout(6000)).catch(() => {});
+    }
+    if (!alternate) {
+      while (this.beginRetry.slot === request.payloadAttributes.slotNumber) {
+        const delay = this.beginRetry.after - performance.now();
+        if (delay <= 0) break;
+        await sleep(delay, signal);
+      }
+      if (signal.aborted) throw new ErrorAborted();
+      if (
+        [...this.requests.values()].some(
+          (entry) =>
+            entry.beginRejected && entry.request.payloadAttributes.slotNumber === request.payloadAttributes.slotNumber
+        )
+      )
+        throw new SessionPayloadError({
+          code: SessionPayloadErrorCode.CAPACITY,
+          reason: "Rejected constructor begin awaiting cancellation",
+        });
     }
     if (signal.aborted) throw new ErrorAborted();
     const resources = this.getResources();
@@ -195,6 +337,7 @@ export class SessionPayloadSource implements PayloadSource {
         ? await beginRpc.fetch<typeof result, typeof call.params>(call, {timeout: BEGIN_RPC_TIMEOUT_MS})
         : await beginRpc.fetch<typeof result, typeof call.params>(call);
     } catch (error) {
+      this.noteBeginRejection(request, signal, call.method, error);
       if (bounded) {
         const rejection = error instanceof ErrorJsonRpcResponse ? error.response.error : undefined;
         // Native begin dispatch cleans its allocation before returning an RPC
@@ -271,6 +414,7 @@ export class SessionPayloadSource implements PayloadSource {
         reason: "Unsupported order generation protocol",
       });
     }
+    this.resetBeginRetry(request);
     return handle;
   }
 
@@ -341,9 +485,11 @@ export class SessionPayloadSource implements PayloadSource {
             ? {generation: "", validUntil: 0, validUntilUnixMs: 0, ready: false}
             : undefined,
       });
+      this.resetBeginRetry(request);
       if (signal.aborted) throw new ErrorAborted();
       return {sourceId: this.id, fork: request.fork, payloadId: ticket};
     } catch (error) {
+      const rejected = this.noteBeginRejection(request, signal, method, error, ticket);
       if (request.requireUnleased && error instanceof ErrorJsonRpcResponse) {
         const rejection = error.response.error;
         if (
@@ -361,16 +507,20 @@ export class SessionPayloadSource implements PayloadSource {
       if (ticket !== undefined) {
         const entry: SessionEntry = this.requests.get(ticket) ?? {request, state: "uncertain", reserved: true};
         entry.state = "uncertain";
+        entry.beginRejected =
+          !request.requireUnleased && (rejected === "SlotNotArmed" || rejected === "ConstructionHalted");
         this.requests.set(ticket, entry);
-        try {
-          this.options.logger?.warn("Constructor begin awaiting confirmed cancellation", {
-            code: "SESSION_PAYLOAD_BEGIN_UNCERTAIN",
-            slot: request.payloadAttributes.slotNumber,
-            sessionId: ticket,
-            callerAborted: signal.aborted,
-          });
-        } catch {
-          // Diagnostic failures cannot change ticket ownership.
+        if (!rejected) {
+          try {
+            this.options.logger?.warn("Constructor begin awaiting confirmed cancellation", {
+              code: "SESSION_PAYLOAD_BEGIN_UNCERTAIN",
+              slot: request.payloadAttributes.slotNumber,
+              sessionId: ticket,
+              callerAborted: signal.aborted,
+            });
+          } catch {
+            // Diagnostic failures cannot change ticket ownership.
+          }
         }
       }
       throw error;
@@ -512,6 +662,20 @@ export class SessionPayloadSource implements PayloadSource {
         this.requests.delete(handle.payloadId);
       })
       .catch((error: unknown) => {
+        entry.state = "uncertain";
+        try {
+          if (
+            entry.reserved &&
+            error instanceof ErrorJsonRpcResponse &&
+            error.response.error.code === -32000 &&
+            error.response.error.message === "BeginReservationInstanceMismatch"
+          ) {
+            entry.reconcileFailures = Math.min(4, (entry.reconcileFailures ?? 0) + 1);
+            entry.reconcileAfter = performance.now() + Math.min(BEGIN_RETRY_MAX_MS, 100 * 2 ** entry.reconcileFailures);
+          }
+        } catch {
+          // An unreadable response still retains ownership and its original error.
+        }
         if (
           !entry.reserved &&
           error instanceof ErrorJsonRpcResponse &&
@@ -523,7 +687,6 @@ export class SessionPayloadSource implements PayloadSource {
           this.requests.delete(handle.payloadId);
           return;
         }
-        entry.state = "uncertain";
         throw error;
       })
       .finally(() => {
