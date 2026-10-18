@@ -1,3 +1,9 @@
+import {once} from "node:events";
+import {readFileSync} from "node:fs";
+import {ClientRequest} from "node:http";
+import {Agent} from "node:https";
+import {Socket, createConnection} from "node:net";
+import {Server as TlsServer, createSecureContext, createServer} from "node:tls";
 import {Mock, afterEach, describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {routes} from "@lodestar/api";
@@ -16,6 +22,7 @@ import {gloas, ssz} from "@lodestar/types";
 import {toHex} from "@lodestar/utils";
 import {BlsSingleThreadVerifier} from "../../../../../beacon-node/src/chain/bls/singleThread.js";
 import {BuilderApiClient, BuilderApiClientOpts} from "../../../../../beacon-node/src/execution/builder/apiClient.js";
+import {getExecutionPayloadBidStream} from "../../../../../beacon-node/src/execution/builder/bidStream.js";
 import {IClock} from "../../../../../beacon-node/src/util/clock.js";
 import {getMockedLogger} from "../../../../../beacon-node/test/mocks/loggerMock.js";
 import {BuilderBidStreamApi, getBuilderBidStreamApi} from "../../../../../builder/src/api/bidStream.js";
@@ -53,9 +60,22 @@ describe.each([false, true])("native Lodestar stream interop, adaptive timing %s
   let streamOpen: Mock<BuilderBidStreamApi["open"]>;
   let onStreamOpen: (() => void) | undefined;
   const bls = new BlsSingleThreadVerifier({metrics: null});
+  const tlsServers: TlsServer[] = [];
+  const tlsSockets = new Set<Socket>();
+  const agents: Agent[] = [];
+  const handshakeTimers = new Set<NodeJS.Timeout>();
 
   afterEach(async () => {
     controller?.abort();
+    for (const agent of agents.splice(0)) agent.destroy();
+    for (const socket of tlsSockets) socket.destroy();
+    tlsSockets.clear();
+    for (const timer of handshakeTimers) clearTimeout(timer);
+    handshakeTimers.clear();
+    await Promise.all(
+      tlsServers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve())))
+    );
+    vi.restoreAllMocks();
     await server?.close();
     server = undefined;
     onStreamOpen = undefined;
@@ -150,6 +170,114 @@ describe.each([false, true])("native Lodestar stream interop, adaptive timing %s
     bidStore.add(signedBid, {generation: lease.generation, lease});
     return signedBid;
   }
+
+  async function delayedTls(delayMs: number, onHandshake?: () => void): Promise<{url: string; agent: Agent}> {
+    if (!server) throw Error("Server is not started");
+    const target = new URL(server.url);
+    const fixture = "../../../../../beacon-node/test/unit/execution/builder/fixtures/";
+    const cert = readFileSync(new URL(`${fixture}bid-stream-localhost-cert.pem`, import.meta.url));
+    const key = readFileSync(new URL(`${fixture}bid-stream-localhost-key.pem`, import.meta.url));
+    const context = createSecureContext({cert, key});
+    const tls = createServer({
+      cert,
+      key,
+      SNICallback(_name, callback) {
+        onHandshake?.();
+        const timer = setTimeout(() => {
+          handshakeTimers.delete(timer);
+          callback(null, context);
+        }, delayMs);
+        handshakeTimers.add(timer);
+      },
+    });
+    tls.on("connection", (socket) => {
+      tlsSockets.add(socket);
+      socket.on("error", () => {});
+    });
+    tls.on("secureConnection", (socket) => {
+      tlsSockets.add(socket);
+      const upstream = createConnection({host: target.hostname, port: Number(target.port)});
+      tlsSockets.add(upstream);
+      upstream.on("error", () => socket.destroy());
+      socket.on("error", () => upstream.destroy());
+      socket.on("close", () => upstream.destroy());
+      upstream.on("close", () => socket.destroy());
+      socket.pipe(upstream).pipe(socket);
+    });
+    tls.listen(0, "127.0.0.1");
+    await once(tls, "listening");
+    tlsServers.push(tls);
+    const address = tls.address();
+    if (!address || typeof address === "string") throw Error("Expected TCP listener");
+    const agent = new Agent({ca: cert, servername: "localhost", keepAlive: true});
+    agents.push(agent);
+    return {url: `https://127.0.0.1:${address.port}`, agent};
+  }
+
+  function streamRequest(url: string, agent: Agent, timeoutMs = 600, requestTimeoutMs = timeoutMs + 250) {
+    return {
+      url,
+      agent,
+      slot,
+      parentHash,
+      parentRoot,
+      proposerPubkey,
+      requestAuth: signedAuth(),
+      startedAt: performance.now(),
+      timeoutMs,
+      requestTimeoutMs,
+      msFromSlot: () => 0,
+    };
+  }
+
+  it("serves an already retained bid after cold TLS setup without renewing the original request budget", async () => {
+    await start();
+    const {url, agent} = await delayedTls(400);
+    const request = streamRequest(url, agent);
+    const startedAt = Date.now();
+    const end = vi.spyOn(ClientRequest.prototype, "end");
+    const result = await getExecutionPayloadBidStream(request);
+
+    expect(result).toMatchObject({upgraded: true, opened: true, updates: 1});
+    if (!result.bid) throw Error("Expected the retained bid");
+    assertSignedBid(result.bid.signedBid, bid(10));
+    expect(streamOpen).toHaveBeenCalledOnce();
+    const sent = streamOpen.mock.calls[0][0];
+    expect(sent.dateMilliseconds - startedAt).toBeGreaterThanOrEqual(350);
+    expect(sent.timeoutMs).toBeGreaterThan(0);
+    expect(sent.timeoutMs).toBeLessThan(250);
+    // Refreshing the timestamp must not grant another complete 600ms after connection setup.
+    expect(sent.dateMilliseconds + sent.timeoutMs).toBeLessThanOrEqual(startedAt + 605);
+    expect(end).toHaveBeenCalledOnce();
+    expect(httpBid).not.toHaveBeenCalled();
+  });
+
+  it("sends no upgrade request when TLS setup has consumed the nominal response budget", async () => {
+    await start();
+    const {url, agent} = await delayedTls(200);
+    const end = vi.spyOn(ClientRequest.prototype, "end");
+    const result = await getExecutionPayloadBidStream(streamRequest(url, agent, 100, 350));
+    expect(result).toMatchObject({upgraded: false, opened: false, reason: "deadline"});
+    expect(streamOpen).not.toHaveBeenCalled();
+    expect(end).not.toHaveBeenCalled();
+  });
+
+  it.each(["abort", "deadline"])("stops during cold TLS setup on %s without sending a request", async (reason) => {
+    await start();
+    const abort = new AbortController();
+    const {url, agent} = await delayedTls(400, reason === "abort" ? () => abort.abort() : undefined);
+    const end = vi.spyOn(ClientRequest.prototype, "end");
+    const began = performance.now();
+    const result = await getExecutionPayloadBidStream({
+      ...streamRequest(url, agent, 600, reason === "deadline" ? 80 : 850),
+      signal: abort.signal,
+    });
+    expect(result.upgraded).toBe(false);
+    expect([reason === "abort" ? "aborted" : "deadline", "error"]).toContain(result.reason);
+    expect(performance.now() - began).toBeLessThan(350);
+    expect(streamOpen).not.toHaveBeenCalled();
+    expect(end).not.toHaveBeenCalled();
+  });
 
   it("streams increasing revisions and then a lower eligible replacement without losing prior signed bids", async () => {
     await start();
