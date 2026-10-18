@@ -186,16 +186,24 @@ export function bidWaitBudget(
   transitMs: number,
   timeoutMs: number
 ): number {
+  return bidResponseBudgets(clock, config, slot, transitMs, timeoutMs).waitMs;
+}
+
+export function bidResponseBudgets(
+  clock: IClock,
+  config: BeaconConfig,
+  slot: number,
+  transitMs: number,
+  timeoutMs: number
+): {waitMs: number; hardStopMs: number} {
   const currentSlot = clock.getCurrentSlot();
-  return transitMs >= 0 && slot >= currentSlot && slot <= currentSlot + 1
-    ? Math.max(
-        0,
-        Math.min(
-          timeoutMs - 2 * transitMs - BID_RESPONSE_MARGIN_MS,
-          clock.msToSlot(slot) + config.getSlotDurationMs(config.getForkName(slot))
-        )
-      )
-    : 0;
+  if (!(transitMs >= 0 && slot >= currentSlot && slot <= currentSlot + 1)) return {waitMs: 0, hardStopMs: 0};
+  const slotRemaining = clock.msToSlot(slot) + config.getSlotDurationMs(config.getForkName(slot));
+  const requestRemaining = timeoutMs - transitMs - BID_RESPONSE_MARGIN_MS;
+  return {
+    waitMs: Math.max(0, Math.min(requestRemaining - transitMs, slotRemaining)),
+    hardStopMs: Math.max(0, Math.min(requestRemaining, slotRemaining)),
+  };
 }
 
 export async function assertValidRequestAuth(

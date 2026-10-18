@@ -60,6 +60,7 @@ export type IBuilderCliArgs = LogArgs & {
   "builderApi.publicUrl"?: string;
   "builderApi.authData"?: string;
   "builderApi.bidStream"?: boolean;
+  "builderApi.bidStreamAdaptiveTiming"?: boolean;
 
   metrics?: boolean;
   "metrics.port"?: number;
@@ -377,6 +378,14 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
 
   "builderApi.bidStream": {
     description: "Enable the experimental authenticated Gloas WebSocket bid stream alongside the HTTP builder API",
+    type: "boolean",
+    default: false,
+    group: "builderApi",
+  },
+
+  "builderApi.bidStreamAdaptiveTiming": {
+    description:
+      "Adapt bid-stream send deadlines to measured RTT; requires bid streaming and verified end-to-end pong forwarding",
     type: "boolean",
     default: false,
     group: "builderApi",

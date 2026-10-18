@@ -44,7 +44,7 @@ class InteropServer extends BuilderRestApiServer {
 }
 
 // Both peers are the production Lodestar implementations; all keys and endpoints are local fixtures.
-describe("native Lodestar proposer / builder bid stream interoperability", () => {
+describe.each([false, true])("native Lodestar stream interop, adaptive timing %s", (adaptiveTiming) => {
   let server: InteropServer | undefined;
   let controller: AbortController;
   let bidStore: BidStore;
@@ -99,7 +99,12 @@ describe("native Lodestar proposer / builder bid stream interoperability", () =>
       return streamApi.open(request);
     });
     server = new InteropServer(
-      {address: "127.0.0.1", port: 0, bidStream: streamEnabled},
+      {
+        address: "127.0.0.1",
+        port: 0,
+        bidStream: streamEnabled,
+        bidStreamAdaptiveTiming: streamEnabled && adaptiveTiming,
+      },
       {
         config,
         logger: modules.logger,
