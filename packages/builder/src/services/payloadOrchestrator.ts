@@ -287,7 +287,7 @@ export class PayloadOrchestrator {
     // also expire abandoned handles if transport fails during release.
     const release = this.source.release;
     if (!release) return;
-    const timeout = this.supportsBoundedAlternates ? 6000 : 1000;
+    const timeout = this.supportsBoundedAlternates || this.source.getResources?.() !== undefined ? 6000 : 1000;
     await withTimeout(
       (signal = AbortSignal.timeout(timeout)) => release.call(this.source, handle, signal),
       timeout

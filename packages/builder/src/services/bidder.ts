@@ -24,6 +24,9 @@ const GWEI_TO_WEI = 1_000_000_000n;
 const MAX_ALTERNATE_ATTEMPTS_PER_SLOT = 4;
 const MAX_ALTERNATE_DIAGNOSTICS_PER_SLOT = 16;
 const MAX_ALTERNATE_RECEIVED_DIAGNOSTICS_PER_SLOT = 4;
+const ALTERNATE_RETENTION_BUDGET_MS = 150;
+const ALTERNATE_JOURNAL_RECHECK_MS = 10;
+const ALTERNATE_JOURNAL_RECHECK_HEADROOM_MS = 100;
 
 type AlternateDiagnosticReason =
   | "received"
@@ -61,7 +64,9 @@ type AlternateBuild = {
   controller: AbortController;
   signal: AbortSignal;
   deadline: number;
+  getPayloadAt: number;
   retentionStarted: boolean;
+  journalRecheckStarted: boolean;
   preemptedBy?: PrimaryBuild;
 };
 
@@ -478,7 +483,16 @@ export class Bidder {
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, primary.controller.signal, this.modules.signal]);
     const deadline = Date.now() + duration;
-    const alternate: AlternateBuild = {event, primary, controller, signal, deadline, retentionStarted: false};
+    const alternate: AlternateBuild = {
+      event,
+      primary,
+      controller,
+      signal,
+      deadline,
+      getPayloadAt: deadline - Math.min(ALTERNATE_RETENTION_BUDGET_MS, Math.floor(duration / 2)),
+      retentionStarted: false,
+      journalRecheckStarted: false,
+    };
     this.alternateBuild = alternate;
     const timer = setTimeout(() => controller.abort(), duration);
     let preempted = false;
@@ -521,6 +535,7 @@ export class Bidder {
           !replacement.controller.signal.aborted &&
           !this.modules.signal.aborted &&
           !alternate.retentionStarted &&
+          !alternate.journalRecheckStarted &&
           attempts.filter((attemptedId) => attemptedId === id).length === 1 &&
           attempts.length < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
           clock.getCurrentSlot() < primary.slot &&
@@ -547,7 +562,7 @@ export class Bidder {
   }
 
   private async buildAlternate(id: string, alternate: AlternateBuild): Promise<void> {
-    const {primary, event, deadline, signal} = alternate;
+    const {primary, event, deadline, getPayloadAt, signal} = alternate;
     const {data} = event;
     const dependentRoot = toRootHex(event.context.dependentRoot);
     signal.throwIfAborted();
@@ -581,11 +596,58 @@ export class Bidder {
             targetGasLimit: preferences.message.targetGasLimit,
           },
         },
-        getPayloadAt: deadline - 50,
+        getPayloadAt,
       },
       async (payload) => {
         signal.throwIfAborted();
         if (this.primary !== primary || payload.offerEligibility) return;
+        if (this.modules.canRetainAlternate?.() !== true) {
+          alternate.journalRecheckStarted = true;
+          const started = performance.now();
+          let outcome = "headroom";
+          try {
+            if (deadline - Date.now() >= ALTERNATE_JOURNAL_RECHECK_MS + ALTERNATE_JOURNAL_RECHECK_HEADROOM_MS) {
+              await sleep(ALTERNATE_JOURNAL_RECHECK_MS, signal);
+              signal.throwIfAborted();
+              const resources = this.modules.orchestrator.getResources();
+              if (this.primary !== primary || dependentRoot !== primary.dependentRoot) outcome = "context_changed";
+              else if (!primary.ready) outcome = "primary_not_ready";
+              else if (!resources) outcome = "source_resources_unavailable";
+              else if (resources.alternatesDisabled) outcome = "source_disabled";
+              else if (resources.uncertain > 0) outcome = "source_uncertain";
+              else if (deadline - Date.now() < ALTERNATE_JOURNAL_RECHECK_HEADROOM_MS) outcome = "headroom";
+              else outcome = this.modules.canRetainAlternate?.() === true ? "idle" : "busy";
+            }
+          } catch (error) {
+            outcome = signal.aborted ? "aborted" : "error";
+            throw error;
+          } finally {
+            try {
+              this.modules.logger.debug("Alternate parent journal recheck", {
+                code: "BUILDER_ALTERNATE_JOURNAL_RECHECK",
+                slot: data.proposalSlot,
+                parentBlockRoot: toRootHex(data.parentBlockRoot),
+                parentBlockHash: toRootHex(data.parentBlockHash),
+                outcome,
+                elapsedMs: performance.now() - started,
+                remainingMs: deadline - Date.now(),
+              });
+            } catch {
+              // Diagnostic failures must not change admission or session ownership.
+            }
+          }
+          if (outcome !== "idle") {
+            this.modules.logger.debug("Skipping alternate parent bid", {
+              slot: data.proposalSlot,
+              parentBlockRoot: toRootHex(data.parentBlockRoot),
+              parentBlockHash: toRootHex(data.parentBlockHash),
+              reason: outcome === "busy" ? "journal_busy" : `journal_recheck_${outcome}`,
+            });
+            return;
+          }
+        }
+        signal.throwIfAborted();
+        if (this.primary !== primary || dependentRoot !== primary.dependentRoot) return;
         const coverableGwei = this.getAlternateLimit(event, primary);
         if (coverableGwei === null) return;
         await this.bidOnPayload(payload, data, preferences.message.feeRecipient, signal, true, this.modules, -1, {
