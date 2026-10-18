@@ -1,13 +1,13 @@
 import {getEventListeners} from "node:events";
 import {Socket, createConnection} from "node:net";
-import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
+import {MockInstance, afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {WebSocket} from "ws";
 import {ApiError} from "@lodestar/api/server";
 import {BuilderBidStreamApi, RetainedBidStream} from "@lodestar/builder";
 import {config} from "@lodestar/config/default";
 import {ForkName} from "@lodestar/params";
 import {gloas, ssz} from "@lodestar/types";
-import {toHex} from "@lodestar/utils";
+import {LogLevel, Logger, toHex} from "@lodestar/utils";
 import {BuilderRestApiServer} from "../../../../src/cmds/builder/apiServer.js";
 import {testLogger} from "../../../utils.js";
 
@@ -39,6 +39,9 @@ describe("builder bid stream", () => {
   let current: gloas.SignedExecutionPayloadBid | null;
   let allowed: boolean;
   let duration: number;
+  let hardDuration: number | undefined;
+  let adaptiveTiming: boolean | undefined;
+  let logger: ReturnType<typeof testLogger>;
   let controller: AbortController;
   let listeners: Set<() => void>;
   const sockets: WebSocket[] = [];
@@ -48,6 +51,9 @@ describe("builder bid stream", () => {
     current = bid(10);
     allowed = true;
     duration = 2000;
+    hardDuration = undefined;
+    adaptiveTiming = undefined;
+    logger = testLogger();
     controller = new AbortController();
     listeners = new Set();
     api = {
@@ -55,6 +61,9 @@ describe("builder bid stream", () => {
       open: vi.fn(
         async (): Promise<RetainedBidStream> => ({
           deadline: performance.now() + duration,
+          ...(hardDuration !== undefined
+            ? {hardDeadline: {monotonic: performance.now() + hardDuration, unixMs: Date.now() + hardDuration}}
+            : {}),
           signal: controller.signal,
           current: () => (allowed ? current : null),
           canOffer: () => allowed && !controller.signal.aborted,
@@ -77,10 +86,10 @@ describe("builder bid stream", () => {
 
   async function start(enabled = true, ready = true, holdRouting = false): Promise<void> {
     server = new TestServer(
-      {address: "127.0.0.1", port: 0, bidStream: enabled},
+      {address: "127.0.0.1", port: 0, bidStream: enabled, bidStreamAdaptiveTiming: adaptiveTiming},
       {
         config: holdRouting ? {...config, SLOT_DURATION_MS: 50} : config,
-        logger: testLogger(),
+        logger,
         metrics: null,
         getBidStreamApi: () => (ready ? api : null),
         api: {
@@ -104,10 +113,13 @@ describe("builder bid stream", () => {
     };
   }
 
-  async function connect(overrides: Record<string, string | undefined> = {}, requestPath = path) {
-    const socket = new WebSocket(server.url() + requestPath, {headers: {...headers(), ...overrides}});
+  async function connect(overrides: Record<string, string | undefined> = {}, requestPath = path, autoPong = true) {
+    const options = {headers: {...headers(), ...overrides}, autoPong};
+    const socket = new WebSocket(server.url() + requestPath, options);
     sockets.push(socket);
     const messages: Buffer[] = [];
+    const pings: Buffer[] = [];
+    socket.on("ping", (data) => pings.push(Buffer.from(data)));
     socket.on("message", (data, binary) => {
       expect(binary).toBe(true);
       messages.push(Buffer.from(data as Buffer));
@@ -118,7 +130,7 @@ describe("builder bid stream", () => {
       socket.once("error", reject);
     });
     socket.on("error", () => {});
-    return {socket, messages, closed};
+    return {socket, messages, pings, closed};
   }
 
   async function rawUpgrade(requestPath: string, overrides: Record<string, string> = {}) {
@@ -176,6 +188,40 @@ describe("builder bid stream", () => {
     expect((await server.inject({method: "GET", url: "/eth/v1/builder/status"})).statusCode).toBe(200);
     expect(api.open).not.toHaveBeenCalled();
   });
+
+  it("requires streaming before adaptive timing can be enabled", async () => {
+    adaptiveTiming = true;
+    await expect(start(false)).rejects.toThrow("bidStreamAdaptiveTiming requires bidStream");
+    expect(api.open).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, false, "false", "true", 1])(
+    "preserves the original send and close deadline when adaptive timing is %s",
+    async (value) => {
+      // Exercise the runtime boundary for untyped configuration callers too.
+      adaptiveTiming = value as unknown as boolean | undefined;
+      duration = 80;
+      hardDuration = 400;
+      const info = vi.spyOn(logger, LogLevel.info).mockImplementation(() => {});
+      await start();
+      const client = await connect();
+      expect(await client.closed).toBe(1000);
+      await vi.waitFor(() =>
+        expect(info).toHaveBeenCalledWith("Builder bid stream closed", expect.objectContaining({adaptiveTiming: false}))
+      );
+      const fields = info.mock.calls.find(([message]) => message === "Builder bid stream closed")?.[1] as Record<
+        string,
+        unknown
+      >;
+      expect(fields.initialSendWindowMs).toBe(fields.finalSendWindowMs);
+      expect(fields.hardStopWindowMs).toBe(fields.initialSendWindowMs);
+      expect(fields.probeWindowMs).toBe(fields.initialSendWindowMs);
+      expect(fields.roundTripMs).toEqual(expect.any(Number));
+      expect(fields.durationMs).toBeLessThan(200);
+      expect(client.messages).toHaveLength(1);
+      expect(listeners.size).toBe(0);
+    }
+  );
 
   it.each(["/eth/v1/builder/status", "/not-a-builder-route"])(
     "closes raw upgrades on nonstream route %s",
@@ -345,6 +391,315 @@ describe("builder bid stream", () => {
     duration = -1;
     await start();
     await expect(connect()).rejects.toThrow("204");
+    expect(listeners.size).toBe(0);
+  });
+
+  describe("measured return reservation", () => {
+    beforeEach(() => {
+      adaptiveTiming = true;
+    });
+    async function closedLog(info: MockInstance<Logger[LogLevel.info]>) {
+      await vi.waitFor(() =>
+        expect(info.mock.calls.some(([message]) => message === "Builder bid stream closed")).toBe(true)
+      );
+      const call = info.mock.calls.find(([message]) => message === "Builder bid stream closed");
+      expect(call).toBeDefined();
+      return call?.[1] as {
+        initialSendWindowMs: number;
+        finalSendWindowMs: number;
+        probeWindowMs: number;
+        hardStopWindowMs: number;
+        roundTripMs?: number;
+        durationMs: number;
+        updates: number;
+      };
+    }
+
+    it("pauses at the old cutoff, then sends the latest revision only after a matching pong", async () => {
+      duration = 100;
+      hardDuration = 700;
+      const info = vi.spyOn(logger, LogLevel.info).mockImplementation(() => {});
+      await start();
+      const client = await connect({}, path, false);
+      await vi.waitFor(() => expect(client.pings).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      publish(20);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(client.messages).toHaveLength(1);
+      expect(client.socket.readyState).toBe(WebSocket.OPEN);
+      publish(30);
+      client.socket.pong(client.pings[0]);
+      await vi.waitFor(() => expect(client.messages).toHaveLength(2));
+      expect(client.messages.map((frame) => decode(frame).message.value)).toEqual([10, 30]);
+      expect(await client.closed).toBe(1000);
+      const log = await closedLog(info);
+      expect(log.finalSendWindowMs).toBeGreaterThan(log.initialSendWindowMs);
+      expect(log.roundTripMs).toBeGreaterThanOrEqual(150);
+      expect(log.hardStopWindowMs - log.finalSendWindowMs).toBeGreaterThanOrEqual((log.roundTripMs ?? 0) - 1);
+      expect(log.hardStopWindowMs - log.finalSendWindowMs).toBeLessThanOrEqual((log.roundTripMs ?? 0) + 2);
+      expect(listeners.size).toBe(0);
+    });
+
+    it.each([false, true])(
+      "does not send while paused or extend the hard stop with mismatched pong=%s",
+      async (wrong) => {
+        duration = 80;
+        hardDuration = 400;
+        const info = vi.spyOn(logger, LogLevel.info).mockImplementation(() => {});
+        await start();
+        const client = await connect({}, path, false);
+        await vi.waitFor(() => expect(client.pings).toHaveLength(1));
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        publish(20);
+        if (wrong) {
+          const mismatched = Buffer.from(client.pings[0]);
+          mismatched[0] ^= 1;
+          client.socket.pong(mismatched);
+        }
+        expect(await client.closed).toBe(1000);
+        expect(client.messages).toHaveLength(1);
+        const log = await closedLog(info);
+        expect(log.finalSendWindowMs).toBe(log.initialSendWindowMs);
+        expect(log.roundTripMs).toBeUndefined();
+        expect(log.probeWindowMs).toBeLessThan(log.hardStopWindowMs);
+        expect(log.durationMs).toBeLessThan(350);
+        expect(listeners.size).toBe(0);
+      }
+    );
+
+    it("reserves the full measured RTT even when it shortens the initial send window", async () => {
+      duration = 500;
+      hardDuration = 600;
+      const info = vi.spyOn(logger, LogLevel.info).mockImplementation(() => {});
+      await start();
+      const client = await connect({}, path, false);
+      await vi.waitFor(() => expect(client.pings).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 330));
+      client.socket.pong(client.pings[0]);
+      expect(await client.closed).toBe(1000);
+      publish(20);
+      expect(client.messages).toHaveLength(1);
+      const log = await closedLog(info);
+      expect(log.finalSendWindowMs).toBeLessThan(log.initialSendWindowMs);
+      expect(log.finalSendWindowMs).toBeLessThan(300);
+      expect(log.hardStopWindowMs - log.finalSendWindowMs).toBeGreaterThanOrEqual((log.roundTripMs ?? 0) - 1);
+    });
+
+    it("does not shorten the initial send window when it exceeds the useful probe midpoint", async () => {
+      duration = 400;
+      hardDuration = 500;
+      const info = vi.spyOn(logger, LogLevel.info).mockImplementation(() => {});
+      await start();
+      const client = await connect({}, path, false);
+      await vi.waitFor(() => expect(client.pings).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      publish(20);
+      await vi.waitFor(() => expect(client.messages).toHaveLength(2));
+      expect(await client.closed).toBe(1000);
+      const log = await closedLog(info);
+      expect(log.probeWindowMs).toBe(log.initialSendWindowMs);
+      expect(log.finalSendWindowMs).toBe(log.initialSendWindowMs);
+      expect(log.roundTripMs).toBeUndefined();
+    });
+
+    it("rounds a fractional RTT up without extending the original hard stop", async () => {
+      duration = 80;
+      hardDuration = 200;
+      let monotonic = 1000;
+      vi.spyOn(performance, "now").mockImplementation(() => monotonic);
+      const info = vi.spyOn(logger, LogLevel.info).mockImplementation(() => {});
+      await start();
+      const timeouts = vi.spyOn(globalThis, "setTimeout");
+      const client = await connect({}, path, false);
+      await vi.waitFor(() => expect(client.pings).toHaveLength(1));
+      monotonic += 0.25;
+      client.socket.pong(client.pings[0]);
+      await vi.waitFor(() => expect(timeouts.mock.calls.some(([, delay]) => delay === 198.75)).toBe(true));
+      monotonic = 1199;
+      publish(20);
+      expect(await client.closed).toBe(1000);
+      expect(client.messages).toHaveLength(1);
+      const log = await closedLog(info);
+      expect(log.hardStopWindowMs).toBe(200);
+      expect(log.finalSendWindowMs).toBe(199);
+    });
+
+    it("does not retime an established cutoff with duplicate pong replies", async () => {
+      duration = 80;
+      hardDuration = 400;
+      const info = vi.spyOn(logger, LogLevel.info).mockImplementation(() => {});
+      await start();
+      const client = await connect({}, path, false);
+      await vi.waitFor(() => expect(client.pings).toHaveLength(1));
+      client.socket.pong(client.pings[0]);
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      client.socket.pong(client.pings[0]);
+      publish(20);
+      await vi.waitFor(() => expect(client.messages).toHaveLength(2));
+      expect(await client.closed).toBe(1000);
+      const log = await closedLog(info);
+      expect(log.roundTripMs).toBeLessThan(100);
+      expect(log.finalSendWindowMs).toBeGreaterThan(290);
+    });
+
+    it("closes on a late pong without sending or granting a new timeout", async () => {
+      duration = 100;
+      hardDuration = 400;
+      const info = vi.spyOn(logger, LogLevel.info).mockImplementation(() => {});
+      await start();
+      const client = await connect({}, path, false);
+      await vi.waitFor(() => expect(client.pings).toHaveLength(1));
+      vi.spyOn(performance, "now").mockReturnValue(performance.now() + 1000);
+      client.socket.pong(client.pings[0]);
+      expect(await client.closed).toBe(1000);
+      expect(client.messages).toHaveLength(1);
+      expect((await closedLog(info)).roundTripMs).toBeUndefined();
+      expect(listeners.size).toBe(0);
+    });
+
+    it.each(["forward", "backward"])(
+      "does not extend original bounds after a %s wall-clock change",
+      async (direction) => {
+        duration = 80;
+        hardDuration = 250;
+        await start();
+        const client = await connect({}, path, false);
+        await vi.waitFor(() => expect(client.pings).toHaveLength(1));
+        vi.spyOn(Date, "now").mockReturnValue(Date.now() + (direction === "forward" ? 1000 : -1000));
+        if (direction === "forward") publish(20);
+        const waitingAt = performance.now();
+        expect(await client.closed).toBe(1000);
+        expect(performance.now() - waitingAt).toBeLessThan(500);
+        expect(client.messages).toHaveLength(1);
+      }
+    );
+
+    it("releases a paused stream on abort and ignores a delayed in-flight send callback", async () => {
+      duration = 100;
+      hardDuration = 1000;
+      await start();
+      const timeouts = vi.spyOn(globalThis, "setTimeout");
+      const intervals = vi.spyOn(globalThis, "setInterval");
+      const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+      const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+      const client = await connect({}, path, false);
+      await vi.waitFor(() => expect(client.messages).toHaveLength(1));
+      let finish: (() => void) | undefined;
+      vi.spyOn(WebSocket.prototype, "send").mockImplementation((_data, _options, callback) => {
+        finish = () => callback?.();
+      });
+      publish(20);
+      await vi.waitFor(() => expect(finish).toBeDefined());
+      publish(30);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      controller.abort();
+      expect(await client.closed).toBe(1001);
+      finish?.();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(client.messages).toHaveLength(1);
+      expect(listeners.size).toBe(0);
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+      const probeTimer = timeouts.mock.calls.findIndex(
+        ([, delay]) => delay !== undefined && delay > 450 && delay <= 510
+      );
+      expect(probeTimer).toBeGreaterThanOrEqual(0);
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(timeouts.mock.results[probeTimer].value);
+      const eligibilityTimer = intervals.mock.calls.findIndex(([, delay]) => delay === 25);
+      expect(eligibilityTimer).toBeGreaterThanOrEqual(0);
+      expect(clearIntervalSpy).toHaveBeenCalledWith(intervals.mock.results[eligibilityTimer].value);
+    });
+
+    it("releases paused capacity on disconnect instead of waiting for the probe timer", async () => {
+      duration = 80;
+      hardDuration = 1000;
+      await start();
+      const clients = await Promise.all(Array.from({length: 4}, () => connect({}, path, false)));
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await expect(connect()).rejects.toThrow("429");
+      clients[0].socket.close();
+      await clients[0].closed;
+      await vi.waitFor(() => expect(listeners.size).toBe(3));
+      const replacement = await connect({}, path, false);
+      expect(replacement.socket.readyState).toBe(WebSocket.OPEN);
+      expect(listeners.size).toBe(4);
+    });
+
+    it("rechecks the fixed deadline after serialization before sending a revision", async () => {
+      duration = 100;
+      hardDuration = 500;
+      await start();
+      const client = await connect();
+      await vi.waitFor(() => expect(client.messages).toHaveLength(1));
+      const serialize = ssz.gloas.SignedExecutionPayloadBid.serialize.bind(ssz.gloas.SignedExecutionPayloadBid);
+      vi.spyOn(ssz.gloas.SignedExecutionPayloadBid, "serialize").mockImplementation((value) => {
+        vi.spyOn(performance, "now").mockReturnValue(performance.now() + 1000);
+        return serialize(value);
+      });
+      publish(20);
+      expect(await client.closed).toBe(1000);
+      expect(client.messages).toHaveLength(1);
+      expect(listeners.size).toBe(0);
+    });
+
+    it("keeps close cleanup and capacity release independent of diagnostic failures", async () => {
+      duration = 80;
+      hardDuration = 200;
+      await start();
+      const info = vi.spyOn(logger, LogLevel.info).mockImplementation((message) => {
+        if (message === "Builder bid stream closed") throw Error("logger failure");
+      });
+      const client = await connect({}, path, false);
+      expect(await client.closed).toBe(1000);
+      await vi.waitFor(() =>
+        expect(info.mock.calls.some(([message]) => message === "Builder bid stream closed")).toBe(true)
+      );
+      expect(listeners.size).toBe(0);
+      const replacement = await connect({}, path, false);
+      expect(replacement.socket.readyState).toBe(WebSocket.OPEN);
+    });
+  });
+
+  it.each([false, true])("records the effective pre-upgrade expiry with adaptive timing %s", async (enabled) => {
+    adaptiveTiming = enabled;
+    duration = -1;
+    hardDuration = 500;
+    const info = vi.spyOn(logger, LogLevel.info).mockImplementation(() => {});
+    await start();
+    await expect(connect()).rejects.toThrow("204");
+    expect(info).toHaveBeenCalledWith(
+      "Builder bid stream admission expired",
+      expect.objectContaining({code: "BID_STREAM_DEADLINE_BEFORE_UPGRADE", slot: 5, timeoutMs: 2000})
+    );
+    const fields = info.mock.calls.find(
+      ([message]) => message === "Builder bid stream admission expired"
+    )?.[1] as Record<string, unknown>;
+    expect(fields.adaptiveTiming).toBe(enabled);
+    if (enabled) expect(fields.hardStopFromAuthStartMs).toBeGreaterThan(400);
+    else expect(fields.hardStopFromAuthStartMs).toBe(fields.deadlineFromAuthStartMs);
+    expect(Object.keys(fields ?? {}).sort()).toEqual(
+      [
+        "code",
+        "slot",
+        "parentHash",
+        "parentRoot",
+        "timeoutMs",
+        "adaptiveTiming",
+        "transitMs",
+        "authenticationMs",
+        "deadlineFromAuthStartMs",
+        "hardStopFromAuthStartMs",
+      ].sort()
+    );
+    expect(listeners.size).toBe(0);
+  });
+
+  it("preserves 204 and releases capacity even if the diagnostic logger throws", async () => {
+    duration = -1;
+    await start();
+    vi.spyOn(logger, LogLevel.info).mockImplementation(() => {
+      throw Error("logger failure");
+    });
+    for (let i = 0; i < 5; i++) await expect(connect()).rejects.toThrow("204");
     expect(listeners.size).toBe(0);
   });
 

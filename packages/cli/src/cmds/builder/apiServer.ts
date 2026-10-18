@@ -64,7 +64,7 @@ export function getBuilderApiBeforeInit(config: ChainForkConfig, getBuilderApi: 
   };
 }
 
-export type BuilderRestApiServerOpts = RestApiServerOpts & {bidStream?: boolean};
+export type BuilderRestApiServerOpts = RestApiServerOpts & {bidStream?: boolean; bidStreamAdaptiveTiming?: boolean};
 
 export class BuilderRestApiServer extends RestApiServer {
   constructor(optsArg: Partial<BuilderRestApiServerOpts>, modules: BuilderRestApiServerModules) {
@@ -72,7 +72,11 @@ export class BuilderRestApiServer extends RestApiServer {
       ...builderRestApiServerOptsDefault,
       // optsArg is a Partial type, any of its properties can be undefined
       ...Object.fromEntries(Object.entries(optsArg).filter(([_, v]) => v != null)),
+      bidStreamAdaptiveTiming: optsArg.bidStreamAdaptiveTiming === true,
     };
+    if (opts.bidStreamAdaptiveTiming && !opts.bidStream) {
+      throw Error("bidStreamAdaptiveTiming requires bidStream");
+    }
 
     super(opts, modules);
 
@@ -100,7 +104,8 @@ export class BuilderRestApiServer extends RestApiServer {
           server,
           modules.getBidStreamApi ?? (() => null),
           this.logger,
-          modules.config.SLOT_DURATION_MS
+          modules.config.SLOT_DURATION_MS,
+          opts.bidStreamAdaptiveTiming
         );
       });
     }

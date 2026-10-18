@@ -326,9 +326,43 @@ Commit-Boost opens one stream per bid request and can fall back to HTTP if the u
 fails. A repeated proposer request opens a new stream and can return a newer bid.
 
 The stream sends an eligible retained bid immediately, then updates after durable
-retention. It reserves the same transit and 50 ms response margin as HTTP and closes
-before the caller's deadline. Ping/pong RTT is logged for diagnosis; it does not change
-that margin or assume symmetric network latency. There are at most 64 pending or open
+retention. By default it keeps the same inbound transit reservation and 50 ms margin
+as HTTP; ping/pong RTT is diagnostic only and does not change its send or close deadline.
+
+Adaptive timing is separately opt-in with `--builderApi.bidStreamAdaptiveTiming`,
+which defaults to false and requires `--builderApi --builderApi.bidStream`. Enable
+it only after verifying end-to-end pong forwarding through the exact deployment path.
+It does not assume that Cloudflare or another intermediary forwards control frames.
+
+In adaptive mode, before authentication it fixes a hard stop at the earlier of the requested
+slot's end and the caller's timeout minus observed inbound age and a 50 ms margin.
+The initial send cutoff also reserves that inbound age for the return path, as HTTP
+does. One matching pong can set the send cutoff to reserve the full measured RTT,
+rounded up, before the fixed hard stop. It never grants a new timeout or assumes a symmetric path.
+
+If the initial send cutoff passes before the pong arrives, the stream pauses bid
+frames while retaining the single probe only while its full RTT could leave send
+time, and never beyond the fixed hard stop. This probe bound cannot shorten the
+initial send window. A matching pong
+can resume frames only if time remains after reserving its full RTT. Missing,
+unmatched, repeated or late pongs cannot extend the hard stop. A future request
+timestamp disables waiting. The conservative pre-upgrade check remains unchanged:
+authentication that exhausts the initial budget returns HTTP 204, even if the hard
+stop is later. This adaptation does not resolve those 204 responses or infer clock
+offsets from request headers.
+
+The measured RTT must reach the authenticated proposer connection. Use direct or
+transparent WebSocket proxying; an intermediary that answers pings instead of
+forwarding them measures only the path to that intermediary. Verify control-frame
+forwarding before enabling this mode behind a proxy. The reserved RTT is a measured
+sample, not a guarantee of future return-path latency.
+The sample conservatively includes local setup and queuing of the first bid frame
+before the ping is sent. Pongs received after the hard stop or after the stream has
+stopped are not recorded.
+
+Close logs distinguish the initial and final send windows from the hard stop and
+socket lifetime. `durationMs` includes the closing handshake and is not the active
+send window. There are at most 64 pending or open
 streams, four per authenticated proposer, one write in flight and one coalesced update indication per
 connection. A 25 ms local eligibility check observes lease renewal without fetching or
 building a payload. Client data frames are rejected; compression is disabled. A peer
