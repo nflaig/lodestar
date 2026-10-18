@@ -2,23 +2,49 @@ import {ApiClient, routes} from "@lodestar/api";
 import {ChainForkConfig} from "@lodestar/config";
 import {ForkName, MIN_DEPOSIT_AMOUNT, isForkPostGloas} from "@lodestar/params";
 import {IClock, computeEpochAtSlot} from "@lodestar/state-transition";
-import {BuilderIndex, BuilderStatus, Epoch, ExecutionAddress, RootHex, gloas} from "@lodestar/types";
+import {BLSPubkey, BuilderIndex, BuilderStatus, ExecutionAddress, RootHex, gloas} from "@lodestar/types";
 import {Logger, isErrorAborted, prettyGweiToEth, sleep, toHex, toRootHex} from "@lodestar/utils";
 import {BidResult, Metrics} from "../metrics.js";
+import {getAlternateBuilderBidLimit} from "./alternateBuilderEligibility.js";
 import {BidLedger, BidLedgerError, BidLedgerErrorCode} from "./bidLedger.js";
 import {BidPolicy} from "./bidPolicy.js";
 import {BidPublisher} from "./bidPublisher.js";
 import {BidStore} from "./bidStore.js";
 import {MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
+import {GossipStage, getMinGossipBidValue, validateGossipStages} from "./gossipStages.js";
+import {isOfferEligible} from "./offerEligibility.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuiltPayload} from "./payloadSource.js";
 import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
+import type {ProposerDutiesTracker} from "./proposerDutiesTracker.js";
 import {ProposerPreferencesTracker} from "./proposerPreferencesTracker.js";
 
 const GWEI_TO_WEI = 1_000_000_000n;
+const MAX_ALTERNATE_ATTEMPTS_PER_SLOT = 4;
+
+type PrimaryBuild = {
+  id: string;
+  slot: number;
+  data: gloas.SSEPayloadAttributes;
+  controller: AbortController;
+  ready: boolean;
+  dependentRoot?: RootHex;
+  feeRecipient?: ExecutionAddress;
+};
+
+type AlternateBuild = {
+  event: AlternatePayloadAttributesEvent;
+  primary: PrimaryBuild;
+  controller: AbortController;
+  signal: AbortSignal;
+  deadline: number;
+  retentionStarted: boolean;
+  preemptedBy?: PrimaryBuild;
+};
 
 export type PayloadAttributesEvent = routes.events.EventData[routes.events.EventType.payloadAttributes];
+export type AlternatePayloadAttributesEvent = routes.events.AlternatePayloadAttributesEvent;
 
 export type BidderOptions = {
   dryRun?: boolean;
@@ -28,6 +54,9 @@ export type BidderOptions = {
   updateCutoffBps?: number;
   /** Limit new offers across all parents without reducing recovery capacity for existing commitments. */
   maxRevisionsPerSlot?: number;
+  /** Build one bounded API/stream snapshot for each supported alternate parent tuple. */
+  alternateBranches?: boolean;
+  alternateBuildDurationMs?: number;
   /** Point within the slot before the proposal slot at which the payload is retrieved and bid on, in basis points */
   deadlineBps: number;
   /** Do not bid while the builder balance is below this value */
@@ -46,11 +75,16 @@ export type BidderModules = {
   bidPublisher: BidPublisher;
   bidStore: BidStore;
   proposerPreferencesTracker: ProposerPreferencesTracker;
+  proposerDutiesTracker?: ProposerDutiesTracker;
+  /** Alternates may only enter an idle durable writer; primary offers retain its full capacity. */
+  canRetainAlternate?: () => boolean;
   getBuilderStatus: () => {status: BuilderStatus | undefined; balance: number | undefined};
   builderIndex: BuilderIndex;
+  builderPubkey?: BLSPubkey;
   executionFeeRecipient: ExecutionAddress;
   metrics: Metrics | null;
   signal: AbortSignal;
+  gossipStages?: GossipStage[];
 };
 
 /**
@@ -59,18 +93,52 @@ export type BidderModules = {
  */
 export class Bidder {
   private readonly activeBuilds = new Map<string, {slot: number; controller: AbortController}>();
+  private primary: PrimaryBuild | undefined;
+  private readonly alternateQueue = new Map<
+    string,
+    {event: AlternatePayloadAttributesEvent; retryFor?: PrimaryBuild}
+  >();
+  private readonly alternateAttempts = new Map<number, string[]>();
+  private alternateBuild: AlternateBuild | undefined;
+  private alternateTask: Promise<void> | undefined;
+  private alternateWake: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private readonly modules: BidderModules,
     private readonly opts: BidderOptions
   ) {
+    const stages = modules.gossipStages ?? [];
+    if (
+      stages.length &&
+      (!(opts.updateIntervalMs && opts.updateIntervalMs > 0) || !modules.orchestrator.supportsUpdates)
+    )
+      throw Error("GOSSIP_STAGES_REQUIRE_PAYLOAD_UPDATES");
+    validateGossipStages(
+      {builderIndex: modules.builderIndex, deadlineBps: opts.deadlineBps},
+      stages,
+      opts.updateCutoffBps ?? 1000
+    );
     const limit = opts.maxRevisionsPerSlot ?? MAX_BID_REVISIONS_PER_SLOT;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_BID_REVISIONS_PER_SLOT) {
       throw new RangeError(`maxRevisionsPerSlot must be between 1 and ${MAX_BID_REVISIONS_PER_SLOT}`);
     }
+    const duration = opts.alternateBuildDurationMs ?? 500;
+    if (!Number.isSafeInteger(duration) || duration < 250 || duration > 1000)
+      throw new RangeError("alternateBuildDurationMs must be between 250 and 1000");
+    if (
+      opts.alternateBranches &&
+      (!(opts.updateIntervalMs && opts.updateIntervalMs > 0) ||
+        !modules.orchestrator.supportsUpdates ||
+        !modules.orchestrator.supportsBoundedAlternates)
+    )
+      throw Error("ALTERNATE_BRANCHES_REQUIRE_BOUNDED_SESSION_UPDATES");
   }
 
   async onPayloadAttributes(event: PayloadAttributesEvent): Promise<void> {
+    if (event.context !== undefined) {
+      if (event.context.role === "alternate") this.onAlternatePayloadAttributes(event);
+      return;
+    }
     const {clock, config, ledger, logger, metrics, orchestrator, proposerPreferencesTracker} = this.modules;
     if (!isForkPostGloas(event.version)) {
       return;
@@ -89,18 +157,46 @@ export class Bidder {
     // The beacon node emits attributes before the slot for the parent variant it would build on. With
     // `--chain.emitPayloadAttributesEarly` it also emits on block and payload import, so one slot may see
     // the empty tuple, then the full one, then a repeat. Builds are keyed by tuple to absorb that.
-    // TODO: bid on both variants instead of cancelling the empty build once the full tuple arrives
     const buildId = `${slot}:${parentBlockRoot}:${parentBlockHash}`;
     const updates = (this.opts.updateIntervalMs ?? 0) > 0 && orchestrator.supportsUpdates;
     if (this.activeBuilds.has(buildId) || (!updates && ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot))) {
       return;
     }
+    // A delayed event must not displace a newer primary or its reserved native worker.
+    if (this.primary && this.primary.slot > slot) return;
+    const controller = new AbortController();
+    const primary: PrimaryBuild = {id: buildId, slot, data, controller, ready: false};
+    const alternate = this.alternateBuild;
+    if (
+      alternate &&
+      !alternate.signal.aborted &&
+      Date.now() < alternate.deadline &&
+      alternate.primary === this.primary &&
+      alternate.event.data.proposalSlot === slot &&
+      alternate.event.data.proposerIndex === data.proposerIndex
+    )
+      alternate.preemptedBy = primary;
     for (const [id, active] of this.activeBuilds) {
       if (id !== buildId && active.slot <= slot) active.controller.abort();
     }
-    const controller = new AbortController();
+    alternate?.controller.abort();
+    clearTimeout(this.alternateWake);
+    this.alternateWake = undefined;
+    for (const [id, queued] of this.alternateQueue) {
+      if (
+        queued.retryFor ||
+        id === buildId ||
+        queued.event.data.proposalSlot !== slot ||
+        queued.event.data.proposerIndex !== data.proposerIndex
+      )
+        this.alternateQueue.delete(id);
+    }
+    for (const attemptedSlot of this.alternateAttempts.keys()) {
+      if (attemptedSlot < slot) this.alternateAttempts.delete(attemptedSlot);
+    }
     const active = {slot, controller};
     this.activeBuilds.set(buildId, active);
+    this.primary = primary;
     const signal = AbortSignal.any([controller.signal, this.modules.signal]);
 
     try {
@@ -110,7 +206,8 @@ export class Bidder {
         return;
       }
 
-      const dependentRoot = await this.getDependentRoot(computeEpochAtSlot(slot), signal);
+      this.modules.proposerDutiesTracker?.invalidate(computeEpochAtSlot(slot));
+      const dependentRoot = await this.getDependentRoot(data, signal);
       signal.throwIfAborted();
       const proposerPreferences = proposerPreferencesTracker.get(slot, dependentRoot);
       if (proposerPreferences === null) {
@@ -119,6 +216,9 @@ export class Bidder {
         return;
       }
       const {feeRecipient, targetGasLimit} = proposerPreferences.message;
+      primary.dependentRoot = dependentRoot;
+      primary.feeRecipient = feeRecipient;
+      signal.throwIfAborted();
 
       const msToDeadline =
         clock.msToSlot(slot) - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(this.opts.deadlineBps);
@@ -142,7 +242,7 @@ export class Bidder {
         getPayloadAt: Date.now() + msToDeadline,
       };
       if (updates) {
-        await this.runUpdates(job, data, feeRecipient, signal);
+        await this.runUpdates(job, data, feeRecipient, signal, primary);
       } else {
         const payload = await orchestrator.run(job, signal);
         await this.bidOnPayload(payload, data, feeRecipient, signal, false);
@@ -155,14 +255,243 @@ export class Bidder {
     } finally {
       controller.abort();
       if (this.activeBuilds.get(buildId) === active) this.activeBuilds.delete(buildId);
+      if (this.primary === primary) {
+        this.primary = undefined;
+        this.alternateBuild?.controller.abort();
+        this.alternateQueue.clear();
+        clearTimeout(this.alternateWake);
+        this.alternateWake = undefined;
+      }
     }
+  }
+
+  onAlternatePayloadAttributes(event: AlternatePayloadAttributesEvent): void {
+    if (!this.opts.alternateBranches || event.version !== ForkName.gloas) return;
+    const data = event.data as gloas.SSEPayloadAttributes;
+    const primary = this.primary;
+    if (
+      !primary ||
+      primary.controller.signal.aborted ||
+      data.proposalSlot !== primary.slot ||
+      data.proposerIndex !== primary.data.proposerIndex ||
+      data.proposalSlot <= this.modules.clock.getCurrentSlot()
+    )
+      return;
+    const id = `${data.proposalSlot}:${toRootHex(data.parentBlockRoot)}:${toRootHex(data.parentBlockHash)}`;
+    if (
+      id === primary.id ||
+      this.alternateAttempts.get(data.proposalSlot)?.includes(id) ||
+      this.alternateQueue.has(id) ||
+      this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
+      this.modules.bidStore.get(data.proposalSlot, toRootHex(data.parentBlockHash), toRootHex(data.parentBlockRoot))
+    )
+      return;
+    this.alternateQueue.set(id, {event});
+    this.tryAlternate();
+  }
+
+  /** One short-lived alternate owns the spare worker, including its confirmed cleanup. */
+  private tryAlternate(): void {
+    clearTimeout(this.alternateWake);
+    this.alternateWake = undefined;
+    const {clock, config, orchestrator} = this.modules;
+    const primary = this.primary;
+    const resources = orchestrator.getResources();
+    const duration = this.opts.alternateBuildDurationMs ?? 500;
+    if (
+      !this.opts.alternateBranches ||
+      this.alternateTask ||
+      this.alternateQueue.size === 0 ||
+      !primary?.ready ||
+      primary.controller.signal.aborted ||
+      this.modules.signal.aborted ||
+      primary.feeRecipient === undefined ||
+      primary.dependentRoot === undefined ||
+      !resources ||
+      resources.alternatesDisabled ||
+      (this.alternateAttempts.get(primary.slot)?.length ?? 0) >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
+      clock.msToSlot(primary.slot) <= duration + 50
+    )
+      return;
+    const retry = (): void => {
+      this.alternateWake = setTimeout(() => this.tryAlternate(), 50);
+    };
+    if (
+      this.activeBuilds.size !== 1 ||
+      resources.active !== 1 ||
+      resources.preparing + resources.releasing + resources.uncertain !== 0 ||
+      this.modules.canRetainAlternate?.() !== true
+    ) {
+      retry();
+      return;
+    }
+    // Leave the writer and event loop free around scheduled primary/staged gossip.
+    const slotStart = Date.now() + clock.msToSlot(primary.slot);
+    if (
+      [this.opts.deadlineBps, ...(this.modules.gossipStages ?? []).map((stage) => stage.deadlineBps)].some((bps) => {
+        const remaining = slotStart - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(bps) - Date.now();
+        return remaining >= -50 && remaining <= duration + 50;
+      })
+    ) {
+      retry();
+      return;
+    }
+    for (const [id, queued] of this.alternateQueue) {
+      const {event, retryFor} = queued;
+      if (
+        id === primary.id ||
+        event.data.proposalSlot !== primary.slot ||
+        event.data.proposerIndex !== primary.data.proposerIndex ||
+        toRootHex(event.context.dependentRoot) !== primary.dependentRoot ||
+        (retryFor !== undefined && retryFor !== primary) ||
+        this.hasRetainedAlternate(event)
+      )
+        this.alternateQueue.delete(id);
+    }
+    const next = this.alternateQueue.entries().next().value;
+    if (!next) return;
+    const [id, {event}] = next;
+    const attempts = this.alternateAttempts.get(primary.slot) ?? [];
+    if (attempts.length >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT) return;
+    attempts.push(id);
+    this.alternateAttempts.set(primary.slot, attempts);
+    this.alternateQueue.delete(id);
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, primary.controller.signal, this.modules.signal]);
+    const deadline = Date.now() + duration;
+    const alternate: AlternateBuild = {event, primary, controller, signal, deadline, retentionStarted: false};
+    this.alternateBuild = alternate;
+    const timer = setTimeout(() => controller.abort(), duration);
+    let preempted = false;
+    this.alternateTask = this.buildAlternate(id, alternate)
+      .catch((error: unknown) => {
+        const aborted = signal.aborted && (isErrorAborted(error) || error === signal.reason);
+        preempted = alternate.preemptedBy !== undefined && aborted;
+        if (
+          aborted &&
+          !preempted &&
+          !primary.controller.signal.aborted &&
+          !this.modules.signal.aborted &&
+          !alternate.retentionStarted &&
+          Date.now() >= deadline
+        )
+          this.modules.logger.debug("Skipping alternate parent bid", {
+            slot: event.data.proposalSlot,
+            parentBlockRoot: toRootHex(event.data.parentBlockRoot),
+            parentBlockHash: toRootHex(event.data.parentBlockHash),
+            reason: "deadline_before_retention",
+          });
+        if (!signal.aborted && !isErrorAborted(error))
+          this.modules.logger.debug(
+            "Skipping alternate parent bid",
+            {slot: event.data.proposalSlot, id},
+            error as Error
+          );
+      })
+      .finally(() => {
+        clearTimeout(timer);
+        controller.abort();
+        this.alternateBuild = undefined;
+        this.alternateTask = undefined;
+        const replacement = alternate.preemptedBy;
+        if (
+          preempted &&
+          replacement &&
+          id !== replacement.id &&
+          this.primary === replacement &&
+          !replacement.controller.signal.aborted &&
+          !this.modules.signal.aborted &&
+          !alternate.retentionStarted &&
+          attempts.filter((attemptedId) => attemptedId === id).length === 1 &&
+          attempts.length < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
+          clock.getCurrentSlot() < primary.slot &&
+          this.alternateQueue.size < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
+          !this.hasRetainedAlternate(event)
+        ) {
+          this.alternateQueue.set(id, {event, retryFor: replacement});
+          this.modules.logger.debug("Retrying preempted alternate parent bid", {
+            slot: primary.slot,
+            parentBlockRoot: toRootHex(event.data.parentBlockRoot),
+            parentBlockHash: toRootHex(event.data.parentBlockHash),
+          });
+        }
+        this.tryAlternate();
+      });
+  }
+
+  private hasRetainedAlternate(event: AlternatePayloadAttributesEvent): boolean {
+    const parentBlockRoot = toRootHex(event.data.parentBlockRoot);
+    const parentBlockHash = toRootHex(event.data.parentBlockHash);
+    return this.modules.ledger
+      .getBidsForSlot(event.data.proposalSlot)
+      .some((bid) => bid.parentBlockRoot === parentBlockRoot && bid.parentBlockHash === parentBlockHash);
+  }
+
+  private async buildAlternate(id: string, alternate: AlternateBuild): Promise<void> {
+    const {primary, event, deadline, signal} = alternate;
+    const {data} = event;
+    const dependentRoot = toRootHex(event.context.dependentRoot);
+    signal.throwIfAborted();
+    if (this.primary !== primary || dependentRoot !== primary.dependentRoot) return;
+    const preferences = this.modules.proposerPreferencesTracker.get(data.proposalSlot, dependentRoot);
+    if (!preferences) return;
+    if (this.getAlternateLimit(event, primary) === null) return;
+    await this.modules.orchestrator.runSnapshot(
+      {
+        id: `alt:${id}`,
+        request: {
+          fork: ForkName.gloas,
+          requireUnleased: true,
+          forkchoiceState: {
+            headBlockHash: toRootHex(data.parentBlockHash),
+            safeBlockHash: toRootHex(data.safeBlockHash),
+            finalizedBlockHash: toRootHex(data.finalizedBlockHash),
+          },
+          payloadAttributes: {
+            ...data.payloadAttributes,
+            suggestedFeeRecipient: toHex(this.modules.executionFeeRecipient),
+            targetGasLimit: preferences.message.targetGasLimit,
+          },
+        },
+        getPayloadAt: deadline - 50,
+      },
+      async (payload) => {
+        signal.throwIfAborted();
+        if (this.primary !== primary || payload.offerEligibility) return;
+        const coverableGwei = this.getAlternateLimit(event, primary);
+        if (coverableGwei === null) return;
+        await this.bidOnPayload(payload, data, preferences.message.feeRecipient, signal, true, this.modules, -1, {
+          coverableGwei,
+          deadline,
+          onRetentionAttempted: () => {
+            alternate.retentionStarted = true;
+          },
+        });
+      },
+      signal
+    );
+  }
+
+  private getAlternateLimit(event: AlternatePayloadAttributesEvent, primary: PrimaryBuild): number | null {
+    if (!this.modules.builderPubkey || primary.dependentRoot === undefined) return null;
+    return getAlternateBuilderBidLimit(event, {
+      slot: primary.slot,
+      parentBlockRoot: toRootHex(event.data.parentBlockRoot),
+      parentBlockHash: toRootHex(event.data.parentBlockHash),
+      dependentRoot: primary.dependentRoot,
+      proposerIndex: primary.data.proposerIndex,
+      builderIndex: this.modules.builderIndex,
+      builderPubkey: this.modules.builderPubkey,
+      unsettledGwei: this.modules.ledger.getUnsettledValueGwei(computeEpochAtSlot(primary.slot)),
+    });
   }
 
   private async runUpdates(
     job: PayloadBuildJob,
     data: gloas.SSEPayloadAttributes,
     feeRecipient: ExecutionAddress,
-    signal: AbortSignal
+    signal: AbortSignal,
+    primary: PrimaryBuild
   ): Promise<void> {
     const {clock, config, orchestrator, ledger, logger, metrics} = this.modules;
     const slot = data.proposalSlot;
@@ -172,11 +501,26 @@ export class Bidder {
       Date.now() + clock.msToSlot(slot) + config.getSlotComponentDurationMs(this.opts.updateCutoffBps ?? 1000);
     let best: gloas.SignedExecutionPayloadBid | null = null;
     let publication: Promise<void> | undefined;
+    let publicationPending = false;
+    let highestAttemptedValue = Math.max(
+      -1,
+      ...[ledger, ...(this.modules.gossipStages ?? []).map((stage) => stage.ledger)]
+        .flatMap((item) => item.getBidsForSlot(slot))
+        .filter((bid) => bid.parentBlockHash === parentBlockHash && bid.parentBlockRoot === parentBlockRoot)
+        .map((bid) => bid.valueGwei)
+    );
+    const stages = this.modules.gossipStages ?? [];
+    const slotStart = Date.now() + clock.msToSlot(slot);
+    const stageTime = (deadlineBps: number): number =>
+      slotStart - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(deadlineBps);
+    const primaryUntil = stages.length ? stageTime(stages[0].deadlineBps) : until;
     const gossipBest = (): void => {
       if (
         !best ||
+        !this.modules.bidStore.canOffer(best) ||
         publication ||
         Date.now() < job.getPayloadAt ||
+        Date.now() >= primaryUntil ||
         signal.aborted ||
         this.opts.dryRun ||
         ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)
@@ -184,8 +528,10 @@ export class Bidder {
         return;
       // Reserve synchronously in gossip(), before the transport can become uncertain.
       const signed = best;
+      highestAttemptedValue = Math.max(highestAttemptedValue, signed.message.value);
+      publicationPending = true;
       publication = this.modules.bidPublisher
-        .gossip(signed, signal)
+        .gossip(signed, signal, this.modules.bidStore.getOfferEligibility(signed))
         .then(() => {
           metrics?.bids.total.inc({result: BidResult.published});
           logger.info("Gossiped execution payload bid", {
@@ -194,6 +540,7 @@ export class Bidder {
             parentBlockRoot,
             blockHash: toRootHex(signed.message.blockHash),
             value: prettyGweiToEth(signed.message.value),
+            builderIndex: signed.message.builderIndex,
           });
         })
         .catch((error: unknown) => {
@@ -203,6 +550,9 @@ export class Bidder {
               {slot, parentBlockHash, parentBlockRoot},
               error as Error
             );
+        })
+        .finally(() => {
+          publicationPending = false;
         });
     };
     const timerController = new AbortController();
@@ -211,6 +561,83 @@ export class Bidder {
       .catch((error: unknown) => {
         if (!isErrorAborted(error)) throw error;
       });
+    // A stage gets one attempt at its deadline. Missed windows never catch up in a burst.
+    const stagesStartedAt = Date.now();
+    const stagedPublications = stages.map((stage, index) =>
+      sleep(stageTime(stage.deadlineBps) - Date.now(), AbortSignal.any([signal, timerController.signal]))
+        .then(async () => {
+          const stageStarted = performance.now();
+          const timerLatenessMs = Date.now() - stageTime(stage.deadlineBps);
+          const expires = index + 1 < stages.length ? stageTime(stages[index + 1].deadlineBps) : until;
+          if (
+            signal.aborted ||
+            this.opts.dryRun ||
+            publicationPending ||
+            stagesStartedAt >= stageTime(stage.deadlineBps) ||
+            Date.now() >= expires ||
+            !best ||
+            !this.modules.bidStore.canOffer(best)
+          )
+            return;
+          if (stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)) return;
+          const stored = this.modules.payloadStore.get(toRootHex(best.message.blockHash));
+          if (!stored) return;
+          publicationPending = true;
+          try {
+            const minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
+            const signed = await this.bidOnPayload(
+              {
+                ...stored.payload,
+                fork: ForkName.gloas,
+                // The same immutable hash can be re-admitted in a new order
+                // generation. Its durable snapshot may carry an older lease.
+                offerEligibility: this.modules.bidStore.getOfferEligibility(best),
+              },
+              data,
+              feeRecipient,
+              signal,
+              true,
+              stage,
+              minimum - 1
+            );
+            // Persistence may finish after a parent switch, shutdown, or this stage's window.
+            if (
+              !signed ||
+              signal.aborted ||
+              Date.now() >= expires ||
+              signed.message.value <= highestAttemptedValue ||
+              !stage.bidStore.canOffer(signed)
+            )
+              return;
+            highestAttemptedValue = signed.message.value;
+            const preparedAt = performance.now();
+            await stage.bidPublisher.gossip(signed, signal, stage.bidStore.getOfferEligibility(signed));
+            const publishedAt = performance.now();
+            metrics?.bids.total.inc({result: BidResult.published});
+            logger.info("Gossiped execution payload bid", {
+              slot,
+              parentBlockHash,
+              parentBlockRoot,
+              blockHash: toRootHex(signed.message.blockHash),
+              builderIndex: stage.builderIndex,
+              value: prettyGweiToEth(signed.message.value),
+              timerLatenessMs,
+              prepareMs: preparedAt - stageStarted,
+              publishMs: publishedAt - preparedAt,
+            });
+          } finally {
+            publicationPending = false;
+          }
+        })
+        .catch((error: unknown) => {
+          if (!isErrorAborted(error) && !signal.aborted)
+            logger.error(
+              "Failed to gossip execution payload bid",
+              {slot, parentBlockHash, parentBlockRoot, builderIndex: stage.builderIndex},
+              error as Error
+            );
+        })
+    );
     try {
       await orchestrator.runUpdates(
         job,
@@ -219,6 +646,8 @@ export class Bidder {
           const signed = await this.bidOnPayload(payload, data, feeRecipient, signal, true);
           if (signed) best = signed;
           gossipBest();
+          primary.ready = signed !== null && payload.offerEligibility === undefined;
+          if (this.primary === primary) this.tryAlternate();
         },
         signal
       );
@@ -244,10 +673,12 @@ export class Bidder {
       });
       // Exhausting update capacity must not cancel the already retained bid's scheduled gossip.
       await timer;
+      await Promise.all(stagedPublications);
       await publication;
     } finally {
       timerController.abort();
       await timer;
+      await Promise.all(stagedPublications);
       await publication;
     }
   }
@@ -257,14 +688,26 @@ export class Bidder {
     data: gloas.SSEPayloadAttributes,
     feeRecipient: ExecutionAddress,
     signal: AbortSignal,
-    apiRevision: boolean
+    apiRevision: boolean,
+    identity: Pick<BidderModules, "ledger" | "bidPublisher" | "bidStore" | "getBuilderStatus" | "builderIndex"> = this
+      .modules,
+    minimumValue = -1,
+    alternateAdmission?: {coverableGwei: number; deadline: number; onRetentionAttempted: () => void}
   ): Promise<gloas.SignedExecutionPayloadBid | null> {
-    const {clock, ledger, logger, metrics} = this.modules;
+    const {clock, logger, metrics} = this.modules;
+    const {ledger, bidPublisher, bidStore, builderIndex} = identity;
+    const alternate = alternateAdmission !== undefined;
+    const additional = identity !== this.modules;
     const slot = data.proposalSlot;
     const parentBlockRoot = toRootHex(data.parentBlockRoot);
     const parentBlockHash = toRootHex(data.parentBlockHash);
     const logCtx = {slot, parentBlockRoot, parentBlockHash};
     signal.throwIfAborted();
+    if (alternateAdmission && Date.now() >= alternateAdmission.deadline) {
+      logger.debug("Skipping alternate parent bid", {...logCtx, reason: "deadline_before_retention"});
+      return null;
+    }
+    if (!isOfferEligible(payload.offerEligibility)) return null;
     if (this.opts.dryRun) {
       metrics?.bids.total.inc({result: BidResult.dryRun});
       logger.info("Built payload without bidding", {
@@ -275,7 +718,7 @@ export class Bidder {
       return null;
     }
 
-    const {status, balance} = this.modules.getBuilderStatus();
+    const {status, balance} = identity.getBuilderStatus();
     if (status !== "active" || balance === undefined) {
       logger.warn("Builder is not active, not bidding", {...logCtx, status});
       metrics?.bids.total.inc({result: BidResult.inactive});
@@ -292,7 +735,10 @@ export class Bidder {
     }
 
     const unsettledGwei = ledger.getUnsettledValueGwei(computeEpochAtSlot(slot));
-    const coverableGwei = Math.max(balance - MIN_DEPOSIT_AMOUNT - unsettledGwei, 0);
+    const coverableGwei = Math.min(
+      Math.max(balance - MIN_DEPOSIT_AMOUNT - unsettledGwei, 0),
+      alternateAdmission?.coverableGwei ?? Number.POSITIVE_INFINITY
+    );
     const payloadValueGwei = Number(payload.executionPayloadValue / GWEI_TO_WEI);
     const value = this.modules.policy.computeValue({payloadValueGwei, coverableGwei});
     if (value === null) {
@@ -301,49 +747,100 @@ export class Bidder {
       return null;
     }
 
-    const previous = this.modules.bidStore.get(slot, parentBlockHash, parentBlockRoot);
-    if (apiRevision && previous && value <= previous.message.value) return null;
+    if (value <= minimumValue) return null;
+    const previous = bidStore.get(slot, parentBlockHash, parentBlockRoot);
+    if (apiRevision && previous && value <= previous.message.value) return previous;
     signal.throwIfAborted();
     const {executionPayload} = payload;
     const blockHash = toRootHex(executionPayload.blockHash);
-    ledger.assertCanRecordRevision({slot, parentBlockHash, parentBlockRoot}, this.opts.maxRevisionsPerSlot);
-    this.modules.payloadStore.add({slot, parentBlockRoot: data.parentBlockRoot, blockHash, payload});
+    if (alternate && this.modules.canRetainAlternate?.() !== true) {
+      logger.debug("Skipping alternate parent bid", {...logCtx, reason: "journal_busy"});
+      return null;
+    }
+    const revisionLimit = Math.floor(
+      (this.opts.maxRevisionsPerSlot ?? MAX_BID_REVISIONS_PER_SLOT) / (alternate ? 2 : 1)
+    );
+    if (revisionLimit === 0) return null;
+    ledger.assertCanRecordRevision({slot, parentBlockHash, parentBlockRoot}, revisionLimit);
+    this.modules.payloadStore.add(
+      {slot, parentBlockRoot: data.parentBlockRoot, blockHash, payload},
+      alternate ? "alternate" : "offer"
+    );
 
     const bid = createExecutionPayloadBid({
       slot,
       parentBlockRoot: data.parentBlockRoot,
       prevRandao: data.payloadAttributes.prevRandao,
-      builderIndex: this.modules.builderIndex,
+      builderIndex,
       feeRecipient,
       value,
       payload: {...payload, fork: ForkName.gloas},
     });
-    const signedBid = apiRevision
-      ? await this.modules.bidPublisher.prepare(bid)
-      : await this.modules.bidPublisher.publish(bid, signal);
+    signal.throwIfAborted();
+    if (alternateAdmission && Date.now() >= alternateAdmission.deadline) {
+      logger.debug("Skipping alternate parent bid", {...logCtx, reason: "deadline_before_retention"});
+      return null;
+    }
+    alternateAdmission?.onRetentionAttempted();
+    const signedBid = await bidPublisher.prepare(bid, revisionLimit);
+    // Retain before exposure, including when transport completion is uncertain
+    // or arrives after cancellation. Reveal ownership does not expire with offers.
+    const deadlineExpired = alternateAdmission !== undefined && Date.now() >= alternateAdmission.deadline;
+    const alternateExpired = alternateAdmission && (signal.aborted || deadlineExpired);
+    bidStore.add(signedBid, alternateExpired ? "recovery" : payload.offerEligibility);
+    if (alternateExpired) {
+      logger.debug("Skipping alternate parent bid", {
+        ...logCtx,
+        reason: deadlineExpired ? "deadline_after_retention" : "aborted_after_retention",
+      });
+      return null;
+    }
     if (apiRevision) signal.throwIfAborted();
-    this.modules.bidStore.add(signedBid);
+    // Disk persistence can outlive a cancellation, lease, parent or shutdown.
+    // The signature remains retained even when it is no longer a new offer.
+    if (!isOfferEligible(payload.offerEligibility)) return null;
+    if (!apiRevision) await bidPublisher.gossip(signedBid, signal, payload.offerEligibility);
 
     metrics?.bids.total.inc({result: apiRevision ? BidResult.prepared : BidResult.published});
-    logger.info(apiRevision ? "Prepared API execution payload bid" : "Published execution payload bid", {
-      ...logCtx,
-      blockHash,
-      value: prettyGweiToEth(value),
-      payloadValue: prettyGweiToEth(payloadValueGwei),
-      feeRecipient: toHex(feeRecipient),
-      gasLimit: executionPayload.gasLimit,
-      transactions: executionPayload.transactions.length,
-      blobs: bid.blobKzgCommitments.length,
-      slotBidRevisions: ledger.getRevisionCount(slot),
-      retainedPayloads: this.modules.payloadStore.size,
-      retainedPayloadBytes: this.modules.payloadStore.bytes,
-      secFromSlot: clock.secFromSlot(slot - 1),
-    });
+    logger.info(
+      additional
+        ? "Prepared staged execution payload bid"
+        : apiRevision
+          ? "Prepared API execution payload bid"
+          : "Published execution payload bid",
+      {
+        ...logCtx,
+        blockHash,
+        builderIndex,
+        value: prettyGweiToEth(value),
+        payloadValue: prettyGweiToEth(payloadValueGwei),
+        feeRecipient: toHex(feeRecipient),
+        gasLimit: executionPayload.gasLimit,
+        transactions: executionPayload.transactions.length,
+        blobs: bid.blobKzgCommitments.length,
+        slotBidRevisions: ledger.getRevisionCount(slot),
+        retainedPayloads: this.modules.payloadStore.size,
+        retainedPayloadBytes: this.modules.payloadStore.bytes,
+        alternate,
+        secFromSlot: clock.secFromSlot(slot - 1),
+      }
+    );
     return signedBid;
   }
 
   /** A reorg can change the dependent root within an epoch. Active builds already coalesce repeated attributes. */
-  private async getDependentRoot(epoch: Epoch, signal: AbortSignal): Promise<RootHex> {
-    return (await this.modules.api.validator.getProposerDutiesV2({epoch}, {signal})).meta().dependentRoot;
+  private async getDependentRoot(data: gloas.SSEPayloadAttributes, signal: AbortSignal): Promise<RootHex> {
+    const epoch = computeEpochAtSlot(data.proposalSlot);
+    const response = await this.modules.api.validator.getProposerDutiesV2({epoch}, {signal});
+    signal.throwIfAborted();
+    const dependentRoot = response.meta().dependentRoot;
+    const duties = response.value();
+    if (
+      this.opts.alternateBranches &&
+      duties.find((duty) => duty.slot === data.proposalSlot)?.validatorIndex !== data.proposerIndex
+    )
+      throw Error("ALTERNATE_PRIMARY_PROPOSER_DUTY_MISMATCH");
+    this.modules.proposerDutiesTracker?.update(epoch, dependentRoot, duties);
+    return dependentRoot;
   }
 }

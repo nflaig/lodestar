@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {routes} from "@lodestar/api";
@@ -10,7 +13,9 @@ import {Builder, BuilderModules} from "../../src/builder.js";
 import {AsyncCommitmentJournal} from "../../src/services/asyncCommitmentJournal.js";
 import {BlockObserver, ObservedBlock} from "../../src/services/blockObserver.js";
 import {BuilderSigner} from "../../src/services/builderSigner.js";
+import {BuilderSigningGuard} from "../../src/services/builderSigningGuard.js";
 import {BuilderStatusTracker} from "../../src/services/builderStatusTracker.js";
+import {GossipStage} from "../../src/services/gossipStages.js";
 import {PayloadStore} from "../../src/services/payloadStore.js";
 import {ProposerPreferencesRecovery} from "../../src/services/proposerPreferencesRecovery.js";
 import {ProposerPreferencesTracker} from "../../src/services/proposerPreferencesTracker.js";
@@ -88,9 +93,149 @@ describe("Builder", () => {
     };
   });
 
+  it.each([false, true])(
+    "routes interleaved primary and alternate contexts through one standard handler (enabled=%s)",
+    async (alternateBranches) => {
+      modules.opts.bidding = {...modules.opts.bidding, alternateBranches};
+      const alternate = vi.spyOn(modules.bidder, "onAlternatePayloadAttributes").mockImplementation(() => {});
+      const attributes = vi.spyOn(modules.bidder, "onPayloadAttributes").mockResolvedValue();
+      const builder = new Builder(modules);
+      const subscription = api.events.eventstream.mock.calls[0][0];
+      expect(subscription.topics).toEqual(topics);
+      const primaryEvent = {version: ForkName.gloas, data: ssz.gloas.SSEPayloadAttributes.defaultValue()};
+      const message: routes.events.AlternatePayloadAttributesEvent = {
+        ...primaryEvent,
+        version: ForkName.gloas,
+        context: {role: "alternate", dependentRoot: Buffer.alloc(32), builders: []},
+      };
+      for (let i = 0; i < 3; i++) {
+        subscription.onEvent({type: EventType.payloadAttributes, message: primaryEvent});
+        subscription.onEvent({type: EventType.payloadAttributes, message});
+      }
+      expect(attributes.mock.calls.map(([event]) => event)).toEqual([
+        primaryEvent,
+        message,
+        primaryEvent,
+        message,
+        primaryEvent,
+        message,
+      ]);
+      expect(alternate).not.toHaveBeenCalled();
+      await builder.close();
+    }
+  );
+
   afterEach(() => {
     controller.abort();
     vi.restoreAllMocks();
+  });
+
+  it("routes block events and lifecycle work to every configured identity", async () => {
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 2));
+    const extra = createBiddingModules({
+      api,
+      config: modules.opts.config,
+      logger,
+      clock,
+      builderSigner: new BuilderSigner(createBeaconConfig(modules.opts.config, Buffer.alloc(32)), {
+        secretKey,
+        publicKey: secretKey.toPublicKey(),
+      }),
+      proposerPreferencesTracker: modules.proposerPreferencesTracker,
+      payloadStore: modules.payloadStore,
+      payloadSource: modules.opts.payloadSource,
+      signal: controller.signal,
+      index: 2,
+    });
+    const status = new BuilderStatusTracker(api, logger, 2, null);
+    const stage: GossipStage = {
+      deadlineBps: 9750,
+      builderIndex: 2,
+      ledger: extra.ledger,
+      bidStore: extra.bidStore,
+      bidPublisher: extra.bidPublisher,
+      getBuilderStatus: () => status.getStatus(),
+    };
+    const journal = Object.create(AsyncCommitmentJournal.prototype) as AsyncCommitmentJournal;
+    const prune = vi.spyOn(journal, "prune").mockResolvedValue();
+    const close = vi.spyOn(journal, "close").mockResolvedValue();
+    const poll = vi.spyOn(status, "poll").mockResolvedValue();
+    modules.gossipIdentities = [{stage, builderStatusTracker: status, revealer: extra.revealer, journal}];
+    const primaryReveal = vi.spyOn(modules.revealer, "onBlock").mockRejectedValue(Error("failed primary"));
+    const extraReveal = vi.spyOn(extra.revealer, "onBlock").mockResolvedValue();
+    const block = ssz.gloas.SignedBeaconBlock.defaultValue();
+    api.beacon.getBlockV2.mockResolvedValue(
+      mockApiResponse({data: block, meta: {version: ForkName.gloas, executionOptimistic: false, finalized: false}})
+    );
+    const builder = new Builder(modules);
+    api.events.eventstream.mock.calls[0][0].onEvent({
+      type: EventType.block,
+      message: {slot: 0, block: toRootHex(Buffer.alloc(32, 8)), executionOptimistic: false},
+    });
+    await vi.waitFor(() => expect(extraReveal).toHaveBeenCalledOnce());
+    expect(primaryReveal).toHaveBeenCalledOnce();
+    await clock.tickSlotFns(1, controller.signal);
+    expect(prune).toHaveBeenCalledWith(1);
+    await clock.tickEpochFns(1, controller.signal);
+    expect(poll).toHaveBeenCalledWith(1);
+    await builder.close();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("rejects additional identities without durable storage before opening network connections", async () => {
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 2));
+    await expect(
+      Builder.init({
+        ...modules.opts,
+        gossipIdentities: [{keypair: {secretKey, publicKey: secretKey.toPublicKey()}, deadlineBps: 9750}],
+      })
+    ).rejects.toThrow("GOSSIP_STAGES_REQUIRE_COMMITMENT_DIRECTORY");
+    expect(api.events.eventstream).not.toHaveBeenCalled();
+  });
+
+  it("releases signer ownership when initialization fails before serving offers", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "builder-startup-guard-"));
+    try {
+      await expect(
+        Builder.init({
+          ...modules.opts,
+          commitmentDir: directory,
+          payloadSource: {...modules.opts.payloadSource, supportsUpdates: true},
+          bidding: {...biddingOptions, updateIntervalMs: 25},
+          gossipIdentities: [{keypair: modules.opts.keypair, deadlineBps: 9750}],
+        })
+      ).rejects.toThrow("GOSSIP_STAGE_DUPLICATE_IDENTITY");
+      expect(api.events.eventstream).not.toHaveBeenCalled();
+      const next = await BuilderSigningGuard.acquire(directory);
+      await next.close();
+    } finally {
+      fs.rmSync(directory, {recursive: true, force: true});
+    }
+  });
+
+  it("revokes signing at shutdown but keeps ownership until pending journal work drains", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "builder-drain-guard-"));
+    const guard = await BuilderSigningGuard.acquire(directory);
+    modules.signingGuard = guard;
+    modules.journal = Object.create(AsyncCommitmentJournal.prototype) as AsyncCommitmentJournal;
+    const disk = defer<void>();
+    vi.spyOn(modules.journal, "close").mockReturnValue(disk.promise);
+    const builder = new Builder(modules);
+    const closing = builder.close();
+    try {
+      expect(controller.signal.aborted).toBe(true);
+      expect(() => guard.assertActive()).toThrow("BUILDER_SIGNER_OWNERSHIP_RELEASED");
+      await expect(BuilderSigningGuard.acquire(directory)).rejects.toThrow("BUILDER_SIGNER_OWNERSHIP_UNAVAILABLE");
+      disk.resolve();
+      await closing;
+      const next = await BuilderSigningGuard.acquire(directory);
+      await next.close();
+    } finally {
+      disk.resolve();
+      await closing;
+      await guard.close();
+      fs.rmSync(directory, {recursive: true, force: true});
+    }
   });
 
   it("starts one shared stream after the clock and preserves slot pruning", async () => {

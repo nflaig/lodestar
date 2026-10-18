@@ -1,10 +1,12 @@
-import {beforeEach, describe, expect, it} from "vitest";
+import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
 import {DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, ForkName} from "@lodestar/params";
 import {ZERO_HASH, computeDomain, computeSigningRoot} from "@lodestar/state-transition";
 import {gloas, ssz} from "@lodestar/types";
+import * as utils from "@lodestar/utils";
+import {BuilderBidStreamApi, getBuilderBidStreamApi} from "../../../src/api/bidStream.js";
 import {BuilderApi, getBuilderApi} from "../../../src/api/impl.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {ProposerDutiesTracker} from "../../../src/services/proposerDutiesTracker.js";
@@ -28,7 +30,9 @@ describe("builder api", () => {
   let clock: ClockMock;
   let bidStore: BidStore;
   let builderApi: BuilderApi;
+  let streamApi: BuilderBidStreamApi;
   let signedBid: gloas.SignedExecutionPayloadBid;
+  let controller: AbortController;
 
   beforeEach(() => {
     api = getApiClientStub();
@@ -42,6 +46,7 @@ describe("builder api", () => {
     clock = new ClockMock();
     clock.currentSlot = slot;
     bidStore = new BidStore();
+    controller = new AbortController();
     builderApi = getBuilderApi(
       {
         config,
@@ -52,6 +57,22 @@ describe("builder api", () => {
         proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
         builderIndex,
         metrics: null,
+        signal: controller.signal,
+      },
+      {authData}
+    );
+
+    streamApi = getBuilderBidStreamApi(
+      {
+        config,
+        logger: getMockedLogger(),
+        clock,
+        api,
+        bidStore,
+        proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
+        builderIndex,
+        metrics: null,
+        signal: controller.signal,
       },
       {authData}
     );
@@ -99,7 +120,74 @@ describe("builder api", () => {
     return block;
   }
 
+  describe("retained bid stream", () => {
+    it("authenticates the exact request context and observes later retained revisions", async () => {
+      const started = performance.now();
+      const stream = await streamApi.open(bidRequest({dateMilliseconds: Date.now(), timeoutMs: 500}));
+      expect(stream.deadline).toBeGreaterThan(started);
+      expect(stream.deadline).toBeLessThanOrEqual(started + 451);
+      expect(stream.current()).toBe(signedBid);
+      const notify = vi.fn();
+      const unsubscribe = stream.subscribe(notify);
+      const later = structuredClone(signedBid);
+      later.message.value += 1;
+      later.message.blockHash = Buffer.alloc(32, 8);
+      bidStore.add(later);
+      expect(notify).toHaveBeenCalledOnce();
+      expect(stream.current()).toBe(later);
+      expect(stream.canOffer(later)).toBe(true);
+      const different = await streamApi.open(bidRequest({parentRoot: Buffer.alloc(32, 9)}));
+      expect(different.current()).toBeNull();
+      unsubscribe();
+      controller.abort();
+      expect(stream.canOffer(later)).toBe(false);
+    });
+
+    it.each([
+      {requestAuth: signAuth({data: authData, slot: slot + 1}), statusCode: 400},
+      {requestAuth: signAuth({data: new Uint8Array([1]), slot}), statusCode: 400},
+      {requestAuth: signAuth(undefined, otherKey), statusCode: 401},
+    ])("uses the HTTP authentication rules ($statusCode)", async ({requestAuth, statusCode}) => {
+      await expect(streamApi.open(bidRequest({requestAuth}))).rejects.toMatchObject({statusCode});
+    });
+
+    it("withdraws future stream offers without losing previously signed reveal obligations", async () => {
+      const lease = {
+        generation: "0x0",
+        ready: true,
+        validUntil: performance.now() + 1000,
+        validUntilUnixMs: Date.now() + 1000,
+      };
+      bidStore.add(signedBid, {generation: "0x0", lease});
+      const stream = await streamApi.open(bidRequest());
+      expect(stream.current()).toBe(signedBid);
+      lease.generation = "0x1";
+      expect(stream.current()).toBeNull();
+      expect(stream.canOffer(signedBid)).toBe(false);
+      expect(bidStore.has(signedBid)).toBe(true);
+      await expect(builderApi.submitSignedBeaconBlock({signedBlock: {data: signBlock()}})).resolves.toEqual({
+        status: 202,
+      });
+    });
+  });
+
   describe("getExecutionPayloadBid", () => {
+    it("stops offering an expired generation while accepting its already committed signed block", async () => {
+      const lease = {
+        generation: "0x2",
+        ready: true,
+        validUntil: performance.now() + 10000,
+        validUntilUnixMs: Date.now() + 10000,
+      };
+      bidStore.add(signedBid, {generation: "0x2", lease});
+      expect((await builderApi.getExecutionPayloadBid(bidRequest())).data).toBe(signedBid);
+      const committed = signBlock();
+      lease.generation = "0x3";
+      expect((await builderApi.getExecutionPayloadBid(bidRequest())).status).toBe(204);
+      await expect(builderApi.submitSignedBeaconBlock({signedBlock: {data: committed}})).resolves.toEqual({
+        status: 202,
+      });
+    });
     it("returns the published bid of the requested slot and parent", async () => {
       const response = await builderApi.getExecutionPayloadBid(bidRequest());
 
@@ -132,6 +220,309 @@ describe("builder api", () => {
       });
 
       await expect(builderApi.getExecutionPayloadBid(request)).rejects.toMatchObject({statusCode: 400});
+    });
+
+    describe("response timing", () => {
+      beforeEach(() => {
+        vi.useFakeTimers({toFake: ["Date", "performance", "setTimeout", "clearTimeout"]});
+        vi.setSystemTime(1_700_000_000_000);
+      });
+
+      afterEach(() => {
+        vi.restoreAllMocks();
+        vi.useRealTimers();
+      });
+
+      function addRevision(value: number, hash = value): gloas.SignedExecutionPayloadBid {
+        const revision = {...signedBid, message: {...signedBid.message, value, blockHash: Buffer.alloc(32, hash)}};
+        bidStore.add(revision);
+        return revision;
+      }
+
+      it("uses the remaining request budget and returns the best bid at response time", async () => {
+        const resolved = vi.fn();
+        const response = builderApi
+          .getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now() - 100, timeoutMs: 500}))
+          .then(resolved);
+
+        await vi.advanceTimersByTimeAsync(150);
+        addRevision(7);
+        await vi.advanceTimersByTimeAsync(99);
+        const best = addRevision(10);
+        expect(resolved).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await response;
+
+        expect(resolved).toHaveBeenCalledExactlyOnceWith({data: best, meta: {version: ForkName.gloas}});
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("counts authentication time against the budget without treating it as network latency", async () => {
+        const duties: Awaited<ReturnType<typeof api.validator.getProposerDutiesV2>> = mockApiResponse({
+          data: [{slot, validatorIndex: proposerIndex, pubkey: proposerPubkey}],
+          meta: {executionOptimistic: false, dependentRoot: "0x00"},
+        });
+        api.validator.getProposerDutiesV2.mockImplementation(
+          () => new Promise((resolve) => setTimeout(() => resolve(duties), 200))
+        );
+        const resolved = vi.fn();
+        const response = builderApi
+          .getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now() - 100, timeoutMs: 500}))
+          .then(resolved);
+
+        await vi.advanceTimersByTimeAsync(249);
+        const best = addRevision(10);
+        expect(resolved).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await response;
+        expect(resolved).toHaveBeenCalledExactlyOnceWith({data: best, meta: {version: ForkName.gloas}});
+      });
+
+      it("does not add a wait when authentication already exhausted the budget", async () => {
+        const duties: Awaited<ReturnType<typeof api.validator.getProposerDutiesV2>> = mockApiResponse({
+          data: [{slot, validatorIndex: proposerIndex, pubkey: proposerPubkey}],
+          meta: {executionOptimistic: false, dependentRoot: "0x00"},
+        });
+        api.validator.getProposerDutiesV2.mockImplementation(
+          () => new Promise((resolve) => setTimeout(() => resolve(duties), 300))
+        );
+        const response = builderApi.getExecutionPayloadBid(
+          bidRequest({dateMilliseconds: Date.now() - 100, timeoutMs: 500})
+        );
+        await vi.advanceTimersByTimeAsync(300);
+        expect((await response).data).toBe(signedBid);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("can return a first bid that becomes ready while the request waits", async () => {
+        const request = bidRequest({dateMilliseconds: Date.now(), parentHash: Buffer.alloc(32, 9), timeoutMs: 300});
+        const response = builderApi.getExecutionPayloadBid(request);
+        await vi.advanceTimersByTimeAsync(100);
+        const bid = {...signedBid, message: {...signedBid.message, parentBlockHash: request.parentHash}};
+        bidStore.add(bid);
+        await vi.advanceTimersByTimeAsync(150);
+
+        expect((await response).data).toBe(bid);
+      });
+
+      it("returns no content at the deadline if only other parents have bids", async () => {
+        const response = builderApi.getExecutionPayloadBid(
+          bidRequest({dateMilliseconds: Date.now(), parentRoot: Buffer.alloc(32, 9), timeoutMs: 300})
+        );
+        await vi.advanceTimersByTimeAsync(100);
+        addRevision(10);
+        await vi.advanceTimersByTimeAsync(150);
+        expect(await response).toEqual({data: undefined, meta: {version: ForkName.gloas}, status: 204});
+      });
+
+      it("returns higher bids on successive requests while retaining every earlier offer", async () => {
+        const first = builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now(), timeoutMs: 200}));
+        await vi.advanceTimersByTimeAsync(150);
+        expect((await first).data).toBe(signedBid);
+        const oldBlock = signBlock();
+
+        const second = builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now(), timeoutMs: 300}));
+        await vi.advanceTimersByTimeAsync(100);
+        const better = addRevision(10);
+        addRevision(6);
+        await vi.advanceTimersByTimeAsync(150);
+
+        expect((await second).data).toBe(better);
+        await expect(builderApi.submitSignedBeaconBlock({signedBlock: {data: oldBlock}})).resolves.toEqual({
+          status: 202,
+        });
+      });
+
+      it("gives overlapping requests independent deadlines and does not pin a bid at request arrival", async () => {
+        const slow = builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now(), timeoutMs: 500}));
+        await vi.advanceTimersByTimeAsync(50);
+        const fast = builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now(), timeoutMs: 200}));
+        await vi.advanceTimersByTimeAsync(150);
+        expect((await fast).data).toBe(signedBid);
+        const better = addRevision(10);
+        await vi.advanceTimersByTimeAsync(250);
+        expect((await slow).data).toBe(better);
+      });
+
+      it.each([
+        {id: "expired request", age: 600, timeoutMs: 500},
+        {id: "no time left for a reply", age: 240, timeoutMs: 500},
+        {id: "exactly the reply reservation remaining", age: 225, timeoutMs: 500},
+        {id: "future send timestamp", age: -1, timeoutMs: 500},
+        {id: "zero timeout", age: 0, timeoutMs: 0},
+      ])("returns immediately for $id", async ({age, timeoutMs}) => {
+        const response = await builderApi.getExecutionPayloadBid(
+          bidRequest({dateMilliseconds: Date.now() - age, timeoutMs})
+        );
+        expect(response.data).toBe(signedBid);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("does not wait on a retained bid for a past slot", async () => {
+        clock.currentSlot = slot + 1;
+        const response = await builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now()}));
+        expect(response.data).toBe(signedBid);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("does not wait for a slot whose construction window has not begun", async () => {
+        clock.currentSlot = slot - 2;
+        const response = await builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now()}));
+        expect(response.data).toBe(signedBid);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("bounds even huge timeouts by the end of the proposal slot", async () => {
+        const resolved = vi.fn();
+        const response = builderApi
+          .getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now(), timeoutMs: Number.MAX_SAFE_INTEGER}))
+          .then(resolved);
+        await vi.advanceTimersByTimeAsync(11_999);
+        expect(resolved).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await response;
+        expect(resolved).toHaveBeenCalledOnce();
+      });
+
+      it("only waits for the remaining part of the proposal slot", async () => {
+        vi.spyOn(clock, "msToSlot").mockReturnValue(-11_900);
+        const resolved = vi.fn();
+        const response = builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now()})).then(resolved);
+        await vi.advanceTimersByTimeAsync(99);
+        const best = addRevision(10);
+        expect(resolved).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await response;
+        expect(resolved).toHaveBeenCalledExactlyOnceWith({data: best, meta: {version: ForkName.gloas}});
+      });
+
+      it("serves the best retained bid immediately if the slot's window has already elapsed", async () => {
+        vi.spyOn(clock, "msToSlot").mockReturnValue(-12_001);
+        const response = await builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now()}));
+        expect(response.data).toBe(signedBid);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("does not wait on an unauthenticated request with a valid timing budget", async () => {
+        await expect(
+          builderApi.getExecutionPayloadBid(
+            bidRequest({dateMilliseconds: Date.now(), requestAuth: signAuth(undefined, otherKey)})
+          )
+        ).rejects.toMatchObject({statusCode: 401});
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("cancels the wait when the builder shuts down", async () => {
+        const response = builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now()}));
+        const rejected = expect(response).rejects.toMatchObject({statusCode: 503});
+        await vi.advanceTimersByTimeAsync(100);
+        controller.abort();
+        await rejected;
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("does not offer a new bid after shutdown", async () => {
+        controller.abort();
+        await expect(
+          builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now()}))
+        ).rejects.toMatchObject({
+          statusCode: 503,
+        });
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("checks shutdown again when a completed wait resumes", async () => {
+        vi.spyOn(utils, "sleep").mockImplementationOnce(async () => {
+          controller.abort();
+        });
+        await expect(
+          builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now()}))
+        ).rejects.toMatchObject({
+          statusCode: 503,
+        });
+      });
+
+      it("waits for an in-flight revision whose retention finishes after construction stops", async () => {
+        vi.spyOn(clock, "msToSlot").mockReturnValue(-1100);
+        const resolved = vi.fn();
+        const response = builderApi
+          .getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now() - 50, timeoutMs: 500}))
+          .then(resolved);
+        await vi.advanceTimersByTimeAsync(150);
+        const best = addRevision(10);
+        await vi.advanceTimersByTimeAsync(199);
+        expect(resolved).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await response;
+        expect(resolved).toHaveBeenCalledExactlyOnceWith({data: best, meta: {version: ForkName.gloas}});
+      });
+
+      it("uses a request's own timeout before the proposal slot begins", async () => {
+        clock.currentSlot = slot - 1;
+        const resolved = vi.fn();
+        const response = builderApi
+          .getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now() - 100, timeoutMs: 5000}))
+          .then(resolved);
+        await vi.advanceTimersByTimeAsync(4749);
+        expect(resolved).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await response;
+        expect(resolved).toHaveBeenCalledOnce();
+      });
+
+      it("uses a small remaining budget without consuming the reply reservation", async () => {
+        const resolved = vi.fn();
+        const response = builderApi
+          .getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now() - 224, timeoutMs: 500}))
+          .then(resolved);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(resolved).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await response;
+        expect(resolved).toHaveBeenCalledOnce();
+      });
+
+      it("bounds concurrent waits and serves overflow immediately without blocking subsequent requests", async () => {
+        const resolved = vi.fn();
+        const request = bidRequest({dateMilliseconds: Date.now()});
+        const responses = Array.from({length: 65}, () => builderApi.getExecutionPayloadBid(request).then(resolved));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(resolved).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(64);
+        expect((await builderApi.getExecutionPayloadBid(bidRequest())).data).toBe(signedBid);
+        expect(vi.getTimerCount()).toBe(64);
+        await vi.advanceTimersByTimeAsync(450);
+        await Promise.all(responses);
+        expect(resolved).toHaveBeenCalledTimes(65);
+        expect(vi.getTimerCount()).toBe(0);
+
+        const next = builderApi.getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now()})).then(resolved);
+        await vi.advanceTimersByTimeAsync(449);
+        expect(resolved).toHaveBeenCalledTimes(65);
+        await vi.advanceTimersByTimeAsync(1);
+        await next;
+        expect(resolved).toHaveBeenCalledTimes(66);
+      });
+
+      it("uses a monotonic budget if the wall clock moves while authenticating", async () => {
+        const duties: Awaited<ReturnType<typeof api.validator.getProposerDutiesV2>> = mockApiResponse({
+          data: [{slot, validatorIndex: proposerIndex, pubkey: proposerPubkey}],
+          meta: {executionOptimistic: false, dependentRoot: "0x00"},
+        });
+        api.validator.getProposerDutiesV2.mockImplementation(async () => {
+          vi.setSystemTime(Date.now() - 60_000);
+          return duties;
+        });
+        const resolved = vi.fn();
+        const response = builderApi
+          .getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now(), timeoutMs: 300}))
+          .then(resolved);
+        await vi.advanceTimersByTimeAsync(249);
+        expect(resolved).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await response;
+        expect(resolved).toHaveBeenCalledOnce();
+      });
     });
   });
 

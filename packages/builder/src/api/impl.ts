@@ -12,10 +12,13 @@ import {
   verifySignatureSet,
 } from "@lodestar/state-transition";
 import {BLSPubkey, BuilderIndex, gloas, ssz} from "@lodestar/types";
-import {Logger, byteArrayEquals, prettyGweiToEth, toPubkeyHex, toRootHex} from "@lodestar/utils";
+import {Logger, byteArrayEquals, isErrorAborted, prettyGweiToEth, sleep, toPubkeyHex, toRootHex} from "@lodestar/utils";
 import {BidRequestResult, Metrics} from "../metrics.js";
 import {BidStore} from "../services/bidStore.js";
 import {ProposerDutiesTracker} from "../services/proposerDutiesTracker.js";
+
+const BID_RESPONSE_MARGIN_MS = 50;
+const MAX_WAITING_BID_REQUESTS = 64;
 
 /** Routes of the builder API that apply from Gloas onwards */
 export type BuilderApi = Pick<
@@ -37,52 +40,66 @@ export type BuilderApiModules = {
   proposerDutiesTracker: ProposerDutiesTracker;
   builderIndex: BuilderIndex;
   metrics: Metrics | null;
+  signal?: AbortSignal;
 };
 
-/** Serves the published bids to proposers that request them directly and accepts their signed blocks */
+/** Serves retained bids to proposers that request them directly and accepts their signed blocks */
 export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOptions): BuilderApi {
   const {api, bidStore, builderIndex, clock, config, logger, metrics, proposerDutiesTracker} = modules;
-
-  async function assertValidRequestAuth(
-    auth: gloas.SignedBuilderRequestAuth,
-    proposerPubkey: BLSPubkey
-  ): Promise<void> {
-    if (!byteArrayEquals(auth.message.data, opts.authData)) {
-      throw new ApiError(
-        400,
-        "Invalid SignedBuilderRequestAuth: auth.message.data does not match the value agreed with this builder"
-      );
-    }
-
-    const proposer = await proposerDutiesTracker.getProposer(auth.message.slot);
-    if (proposer === null || !byteArrayEquals(proposer.pubkey, proposerPubkey)) {
-      throw new ApiError(400, `Invalid request: proposer_pubkey is not the proposer of slot ${auth.message.slot}`);
-    }
-
-    const domain = computeDomain(DOMAIN_BUILDER_REQUEST_AUTH, config.GENESIS_FORK_VERSION, ZERO_HASH);
-    const signingRoot = computeSigningRoot(ssz.gloas.BuilderRequestAuth, auth.message, domain);
-    if (!isValidSignature(proposerPubkey, signingRoot, auth.signature)) {
-      throw new ApiError(401, "Invalid SignedBuilderRequestAuth: signature verification failed");
-    }
-  }
+  let waitingBidRequests = 0;
 
   return {
     async status() {
       // The builder is ready to serve requests once it is started
     },
 
-    async getExecutionPayloadBid({slot, parentHash, parentRoot, proposerPubkey, requestAuth}) {
+    async getExecutionPayloadBid(
+      {slot, parentHash, parentRoot, proposerPubkey, requestAuth, dateMilliseconds, timeoutMs},
+      context
+    ) {
+      if (modules.signal?.aborted) throw new ApiError(503, "Builder is stopping");
+      const started = performance.now();
+      const transitMs = Date.now() - dateMilliseconds;
+      // The request timeout includes inbound transit. Reserve the same amount for the reply,
+      // plus serialization/scheduling headroom. A future timestamp disables waiting because of clock skew.
+      // Use the slot end to bound long waits: a revision can finish retention after construction stops.
+      const waitBudget = bidWaitBudget(clock, config, slot, transitMs, timeoutMs);
       if (requestAuth.message.slot !== slot) {
         throw new ApiError(
           400,
           "Invalid SignedBuilderRequestAuth: auth.message.slot does not match the proposal slot in the request path"
         );
       }
-      await assertValidRequestAuth(requestAuth, proposerPubkey);
+      await assertValidRequestAuth(modules, opts, requestAuth, proposerPubkey);
+
+      if (modules.signal?.aborted) throw new ApiError(503, "Builder is stopping");
+      const waitMs = Math.max(0, waitBudget - (performance.now() - started));
+      const waitStarted = performance.now();
+      const waitCapacityExceeded = waitMs > 0 && waitingBidRequests >= MAX_WAITING_BID_REQUESTS;
+      if (waitMs > 0 && !waitCapacityExceeded) {
+        waitingBidRequests++;
+        try {
+          await sleep(waitMs, modules.signal);
+        } catch (error) {
+          if (isErrorAborted(error)) throw new ApiError(503, "Builder is stopping");
+          throw error;
+        } finally {
+          waitingBidRequests--;
+        }
+      }
+      if (modules.signal?.aborted) throw new ApiError(503, "Builder is stopping");
 
       const parentBlockHash = toRootHex(parentHash);
       const parentBlockRoot = toRootHex(parentRoot);
-      const logCtx = {slot, parentBlockHash, parentBlockRoot, proposer: toPubkeyHex(proposerPubkey)};
+      const logCtx = {
+        slot,
+        parentBlockHash,
+        parentBlockRoot,
+        proposer: toPubkeyHex(proposerPubkey),
+        requestTransitMs: transitMs,
+        bidWaitMs: Math.round(performance.now() - waitStarted),
+        waitCapacityExceeded,
+      };
       const version = config.getForkName(slot);
 
       const signedBid = bidStore.get(slot, parentBlockHash, parentBlockRoot);
@@ -91,6 +108,8 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
         logger.debug("No execution payload bid to serve", logCtx);
         return {data: undefined, meta: {version}, status: 204};
       }
+
+      context?.setResponseGuard?.(() => bidStore.canOffer(signedBid));
 
       metrics?.api.bidRequests.inc({result: BidRequestResult.served});
       logger.info("Served execution payload bid", {
@@ -143,7 +162,7 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
       if (slot < clock.getCurrentSlot()) {
         throw new ApiError(400, "Invalid SignedBuilderRequestAuth: auth.message.slot has already passed");
       }
-      await assertValidRequestAuth(auth, proposerPubkey);
+      await assertValidRequestAuth(modules, opts, auth, proposerPubkey);
 
       // Bids only pay via their value, there is no execution payment the preferences could cap
       logger.debug("Received builder preferences", {
@@ -155,6 +174,45 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
       return {status: 202};
     },
   };
+}
+
+export function bidWaitBudget(
+  clock: IClock,
+  config: BeaconConfig,
+  slot: number,
+  transitMs: number,
+  timeoutMs: number
+): number {
+  const currentSlot = clock.getCurrentSlot();
+  return transitMs >= 0 && slot >= currentSlot && slot <= currentSlot + 1
+    ? Math.max(
+        0,
+        Math.min(timeoutMs - 2 * transitMs - BID_RESPONSE_MARGIN_MS, clock.msToSlot(slot) + config.SLOT_DURATION_MS)
+      )
+    : 0;
+}
+
+export async function assertValidRequestAuth(
+  {config, proposerDutiesTracker}: BuilderApiModules,
+  opts: BuilderApiOptions,
+  auth: gloas.SignedBuilderRequestAuth,
+  proposerPubkey: BLSPubkey
+): Promise<void> {
+  if (!byteArrayEquals(auth.message.data, opts.authData)) {
+    throw new ApiError(
+      400,
+      "Invalid SignedBuilderRequestAuth: auth.message.data does not match the value agreed with this builder"
+    );
+  }
+  const proposer = await proposerDutiesTracker.getProposer(auth.message.slot);
+  if (proposer === null || !byteArrayEquals(proposer.pubkey, proposerPubkey)) {
+    throw new ApiError(400, `Invalid request: proposer_pubkey is not the proposer of slot ${auth.message.slot}`);
+  }
+  const domain = computeDomain(DOMAIN_BUILDER_REQUEST_AUTH, config.GENESIS_FORK_VERSION, ZERO_HASH);
+  const signingRoot = computeSigningRoot(ssz.gloas.BuilderRequestAuth, auth.message, domain);
+  if (!isValidSignature(proposerPubkey, signingRoot, auth.signature)) {
+    throw new ApiError(401, "Invalid SignedBuilderRequestAuth: signature verification failed");
+  }
 }
 
 function isValidSignature(pubkey: BLSPubkey, signingRoot: Uint8Array, signature: Uint8Array): boolean {
