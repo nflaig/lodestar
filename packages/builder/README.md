@@ -135,6 +135,8 @@ uses its own prepared state, withdrawals and execution requests. The event inclu
 the proposer dependent root and branch-specific identity/collateral metadata for at
 most 16 configured builder indices. A differing proposer or dependent root, a missing
 cached state, or missing/ineligible builder metadata causes that alternate to be skipped.
+Keep `chain.fastConfirmation` disabled (the default). Alternate events are suppressed
+with fast confirmation because its safe execution hash can be ahead of an alternate parent.
 
 Alternates start only after an unleased primary snapshot is retained. One spare native
 worker produces one alternate snapshot at a time, with at most four attempts per slot.
