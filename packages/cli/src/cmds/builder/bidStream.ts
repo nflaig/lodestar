@@ -40,7 +40,8 @@ export async function registerBidStream(
   server: FastifyInstance,
   getApi: () => BuilderBidStreamApi | null,
   logger: Logger,
-  slotDurationMs: number
+  slotDurationMs: number,
+  adaptiveTiming = false
 ): Promise<void> {
   const requests = new WeakMap<FastifyRequest, Admission>();
   const proposers = new Map<string, number>();
@@ -203,6 +204,7 @@ export async function registerBidStream(
       pending.add(admission);
       removeAbort = subscribeAbort(api.signal, () => admission.terminate());
       request.raw.socket.once("close", onDisconnect);
+      const authStarted = performance.now();
       try {
         admission.authenticated = await api.open(args);
       } finally {
@@ -212,6 +214,25 @@ export async function registerBidStream(
       clearTimeout(admission.timer);
       if (performance.now() >= admission.authenticated.deadline) {
         release();
+        const adaptiveDeadline = adaptiveTiming ? admission.authenticated.hardDeadline : undefined;
+        try {
+          logger.info("Builder bid stream admission expired", {
+            code: "BID_STREAM_DEADLINE_BEFORE_UPGRADE",
+            slot: args.slot,
+            parentHash: toHex(args.parentHash),
+            parentRoot: toHex(args.parentRoot),
+            timeoutMs: args.timeoutMs,
+            adaptiveTiming: adaptiveDeadline !== undefined,
+            transitMs: admission.transitMs,
+            authenticationMs: Math.round(performance.now() - authStarted),
+            deadlineFromAuthStartMs: Math.round(admission.authenticated.deadline - authStarted),
+            hardStopFromAuthStartMs: Math.round(
+              (adaptiveDeadline?.monotonic ?? admission.authenticated.deadline) - authStarted
+            ),
+          });
+        } catch {
+          // Diagnostics must not change admission or retain its capacity.
+        }
         return reply.code(204).send();
       }
       const count = proposers.get(proposer) ?? 0;
@@ -231,7 +252,15 @@ export async function registerBidStream(
       }
       finishUpgrade(request.raw.socket);
       admission.upgrade();
-      serveBidStream(socket, admission.authenticated, admission.release, logger, admission, subscribeAbort);
+      serveBidStream(
+        socket,
+        admission.authenticated,
+        admission.release,
+        logger,
+        admission,
+        subscribeAbort,
+        adaptiveTiming
+      );
     },
   });
 }
@@ -285,11 +314,16 @@ function serveBidStream(
   release: () => void,
   logger: Logger,
   admission: Admission,
-  subscribeAbort: SubscribeAbort
+  subscribeAbort: SubscribeAbort,
+  adaptiveTiming: boolean
 ): void {
   const request = admission.request;
   const started = performance.now();
-  const expiresAt = Date.now() + Math.max(0, stream.deadline - started);
+  const adaptiveDeadline = adaptiveTiming ? stream.hardDeadline : undefined;
+  const hardDeadline = adaptiveDeadline?.monotonic ?? stream.deadline;
+  const hardDeadlineUnixMs = adaptiveDeadline?.unixMs ?? Date.now() + Math.max(0, hardDeadline - started);
+  let sendDeadline = Math.min(stream.deadline, hardDeadline);
+  let sendDeadlineUnixMs = hardDeadlineUnixMs - (hardDeadline - sendDeadline);
   let stopped = false;
   let sending = false;
   let scheduled = false;
@@ -305,7 +339,8 @@ function serveBidStream(
   let clientPings = 0;
   let pongSending = false;
   let pendingPong: Buffer | undefined;
-  const expired = (): boolean => performance.now() >= stream.deadline || Date.now() >= expiresAt;
+  const hardExpired = (): boolean => performance.now() >= hardDeadline || Date.now() >= hardDeadlineUnixMs;
+  const sendExpired = (): boolean => performance.now() >= sendDeadline || Date.now() >= sendDeadlineUnixMs;
   const close = (code = 1000): void => {
     if (stopped) return;
     stopped = true;
@@ -327,10 +362,11 @@ function serveBidStream(
     scheduled = false;
     if (stopped || sending) return;
     dirty = false;
-    if (expired() || stream.signal?.aborted) {
+    if (hardExpired() || stream.signal?.aborted) {
       close();
       return;
     }
+    if (sendExpired()) return;
     const bid = stream.current();
     if (!bid || bid === lastOfferedBid) return;
     try {
@@ -345,7 +381,7 @@ function serveBidStream(
         return;
       }
       // Fastify's HTTP onSend guard does not run for WebSocket messages.
-      if (expired() || !stream.canOffer(bid) || socket.readyState !== WebSocket.OPEN) return;
+      if (sendExpired() || !stream.canOffer(bid) || socket.readyState !== WebSocket.OPEN) return;
       sending = true;
       socket.send(frame, {binary: true, compress: false}, (error) => {
         sending = false;
@@ -360,7 +396,12 @@ function serveBidStream(
       close(1011);
     }
   };
-  const deadlineTimer = setTimeout(close, Math.max(0, stream.deadline - performance.now()));
+  const ping = randomBytes(8);
+  const pingStarted = performance.now();
+  // Beyond the midpoint, a new pong's full RTT leaves no send time. Never shorten the initial
+  // approved window merely because this probe is still pending.
+  const probeDeadline = Math.max(sendDeadline, Math.min(hardDeadline, (hardDeadline + pingStarted) / 2));
+  let deadlineTimer = setTimeout(close, Math.max(0, probeDeadline - performance.now()));
   // A constructor heartbeat can renew a retained bid's lease without adding a revision.
   // This only rereads local eligibility; it never asks the constructor to build or fetch.
   const eligibilityTimer = setInterval(schedule, ELIGIBILITY_RECHECK_MS);
@@ -389,28 +430,44 @@ function serveBidStream(
     close();
     clearTimeout(terminateTimer);
     release();
-    logger.info("Builder bid stream closed", {
-      slot: request.slot,
-      parentHash: toHex(request.parentHash),
-      parentRoot: toHex(request.parentRoot),
-      proposer: toHex(request.proposerPubkey),
-      userAgent: admission.userAgent,
-      timeoutMs: request.timeoutMs,
-      transitMs: admission.transitMs,
-      updates,
-      ...lastBid,
-      durationMs: Math.round(performance.now() - started),
-      ...(roundTripMs !== undefined ? {roundTripMs: Math.round(roundTripMs)} : {}),
-    });
+    try {
+      logger.info("Builder bid stream closed", {
+        slot: request.slot,
+        parentHash: toHex(request.parentHash),
+        parentRoot: toHex(request.parentRoot),
+        proposer: toHex(request.proposerPubkey),
+        userAgent: admission.userAgent,
+        timeoutMs: request.timeoutMs,
+        adaptiveTiming: adaptiveDeadline !== undefined,
+        transitMs: admission.transitMs,
+        updates,
+        ...lastBid,
+        durationMs: Math.round(performance.now() - started),
+        initialSendWindowMs: Math.max(0, Math.round(stream.deadline - started)),
+        finalSendWindowMs: Math.max(0, Math.round(sendDeadline - started)),
+        probeWindowMs: Math.max(0, Math.round(probeDeadline - started)),
+        hardStopWindowMs: Math.max(0, Math.round(hardDeadline - started)),
+        ...(roundTripMs !== undefined ? {roundTripMs: Math.round(roundTripMs)} : {}),
+      });
+    } catch {
+      // Socket cleanup and capacity release must survive a diagnostic failure.
+    }
   });
   removeAbort = subscribeAbort(stream.signal, abort);
   if (stopped) return;
   unsubscribe = stream.subscribe(schedule);
   pump();
-  const ping = randomBytes(8);
-  const pingStarted = performance.now();
   socket.on("pong", (payload: Buffer) => {
-    if (payload.equals(ping) && roundTripMs === undefined) roundTripMs = performance.now() - pingStarted;
+    if (stopped || roundTripMs !== undefined || !payload.equals(ping)) return;
+    if (hardExpired()) return close();
+    roundTripMs = performance.now() - pingStarted;
+    if (!adaptiveDeadline) return;
+    sendDeadline = hardDeadline - Math.ceil(roundTripMs);
+    sendDeadlineUnixMs = hardDeadlineUnixMs - Math.ceil(roundTripMs);
+    clearTimeout(deadlineTimer);
+    if (sendExpired()) return close();
+    deadlineTimer = setTimeout(close, Math.max(0, sendDeadline - performance.now()));
+    schedule();
   });
   if (!stopped && socket.readyState === WebSocket.OPEN) socket.ping(ping);
 }
