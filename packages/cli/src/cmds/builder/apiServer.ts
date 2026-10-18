@@ -4,6 +4,7 @@ import {ApiError, FastifyRoute, canSendResponse} from "@lodestar/api/server";
 import {RestApiServer, RestApiServerModules, RestApiServerOpts} from "@lodestar/beacon-node";
 import {BuilderApi, BuilderBidStreamApi} from "@lodestar/builder";
 import {ChainForkConfig} from "@lodestar/config";
+import {ForkName} from "@lodestar/params";
 import {registerBidStream} from "./bidStream.js";
 
 export const builderRestApiServerOptsDefault: RestApiServerOpts = {
@@ -100,7 +101,7 @@ export class BuilderRestApiServer extends RestApiServer {
           server,
           modules.getBidStreamApi ?? (() => null),
           this.logger,
-          modules.config.SLOT_DURATION_MS
+          modules.config.getSlotDurationMs(ForkName.gloas)
         );
       });
     }

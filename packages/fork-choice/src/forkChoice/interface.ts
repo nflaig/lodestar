@@ -7,6 +7,7 @@ import {
   PayloadStatus,
   ProtoBlock,
   ProtoNode,
+  PtcQuorum,
 } from "../protoArray/interface.js";
 import {IFastConfirmationSpecStore} from "./fastConfirmation/types.js";
 import {UpdateAndGetHeadOpt} from "./forkChoice.js";
@@ -30,6 +31,9 @@ export type CheckpointWithBalance = {
 export type CheckpointWithTotalBalance = CheckpointWithBalance & {
   totalBalance: number;
 };
+
+/** Emitted when the PTC verdict on a block is decided or flips, see getPtcVerdict */
+export type PtcQuorumEvent = PtcQuorum & {blockRoot: RootHex; slot: Slot; verdict: boolean};
 
 export enum EpochDifference {
   current = 0,
@@ -259,6 +263,8 @@ export interface IForkChoice {
     payloadPresentCount: number;
     dataAvailableCount: number;
   } | null;
+  /** Current PTC majority per vote field; `null` for pre-Gloas roots */
+  getPtcQuorum(blockRootHex: RootHex): PtcQuorum | null;
   getPayloadTimelinessVotes(blockRootHex: RootHex): (boolean | null)[] | null;
   getPayloadDataAvailabilityVotes(blockRootHex: RootHex): (boolean | null)[] | null;
 
@@ -273,6 +279,12 @@ export interface IForkChoice {
   shouldExtendPayload(blockRoot: RootHex): boolean;
   /** Spec: should_build_on_full(store, head, slot) */
   shouldBuildOnFull(head: ProtoBlock, slot: Slot): boolean;
+  /** Inclusion list verdict for the payload of `blockRoot`, as reported by the execution engine. True if it changed */
+  recordPayloadInclusionListSatisfaction(blockRoot: RootHex, satisfied: boolean): boolean;
+  /** True once the payload is delivered and not recorded unsatisfied */
+  isPayloadInclusionListSatisfied(blockRoot: RootHex): boolean;
+  /** Engine verdict recorded for the payload of `blockRoot`, null when none was recorded */
+  getPayloadInclusionListSatisfaction(blockRoot: RootHex): boolean | null;
   getFinalizedBlock(): ProtoBlock;
   getJustifiedBlock(): ProtoBlock;
   getFinalizedCheckpointSlot(): Slot;

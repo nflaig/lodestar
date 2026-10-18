@@ -1,12 +1,47 @@
-import {describe, expect, it} from "vitest";
+import {beforeEach, describe, expect, it, vi} from "vitest";
 import {pubkeyCache} from "@chainsafe/lodestar-z/pubkeys";
 import {createBeaconConfig} from "@lodestar/config";
 import {getConfig} from "@lodestar/config/test-utils";
 import {FAR_FUTURE_EPOCH, ForkName, MIN_DEPOSIT_AMOUNT, SLOTS_PER_EPOCH} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
+import {DataAvailabilityStatus, ExecutionPayloadStatus} from "../../../src/block/externalData.js";
+import type {CachedBeaconStateAllForks} from "../../../src/cache/stateCache.js";
 import {CachedBeaconStateGloas, createCachedBeaconState} from "../../../src/index.js";
-import {BeaconStateView} from "../../../src/stateView/beaconStateView.js";
+import type {StateTransitionModules, StateTransitionOpts} from "../../../src/stateTransition.js";
 import {generateState} from "../../utils/state.js";
+
+const stateTransitionMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../../../src/stateTransition.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../src/stateTransition.js")>();
+  return {...actual, stateTransition: stateTransitionMock};
+});
+
+const {BeaconStateView} = await import("../../../src/stateView/beaconStateView.js");
+
+describe("BeaconStateView", () => {
+  beforeEach(() => {
+    stateTransitionMock.mockReset();
+  });
+
+  it("uses the parsed block and ignores the serialized bytes", () => {
+    const preState = {config: {}} as unknown as CachedBeaconStateAllForks;
+    const postState = {config: {}} as unknown as CachedBeaconStateAllForks;
+    const signedBlock = ssz.phase0.SignedBeaconBlock.defaultValue();
+    const options: StateTransitionOpts = {
+      executionPayloadStatus: ExecutionPayloadStatus.valid,
+      dataAvailabilityStatus: DataAvailabilityStatus.Available,
+    };
+    const modules: StateTransitionModules = {};
+    stateTransitionMock.mockReturnValue(postState);
+
+    const result = new BeaconStateView(preState).stateTransition({block: signedBlock}, options, modules);
+
+    expect(stateTransitionMock).toHaveBeenCalledWith(preState, signedBlock, options, modules);
+    expect(result).toBeInstanceOf(BeaconStateView);
+    expect((result as InstanceType<typeof BeaconStateView>).cachedState).toBe(postState);
+  });
+});
 
 describe("BeaconStateView prepared builder liabilities", () => {
   const config = createBeaconConfig(getConfig(ForkName.gloas), new Uint8Array(32));

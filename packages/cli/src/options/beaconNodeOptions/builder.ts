@@ -6,6 +6,9 @@ export type ExecutionBuilderArgs = {
   builder: boolean;
   "builder.url"?: string;
   "builder.timeout"?: number;
+  "builder.bidDeadline"?: number;
+  "builder.bidDelay"?: number;
+  "builder.bidRequests"?: number;
   "builder.faultInspectionWindow"?: number;
   "builder.allowedFaults"?: number;
 };
@@ -20,10 +23,28 @@ export function parseArgs(args: ExecutionBuilderArgs): IBeaconNodeOptions["execu
     );
   }
 
+  const bidDeadline = args["builder.bidDeadline"];
+  if (bidDeadline !== undefined && (!Number.isInteger(bidDeadline) || bidDeadline <= 0)) {
+    throw new YargsError("builder.bidDeadline must be a positive integer");
+  }
+
+  const bidDelay = args["builder.bidDelay"];
+  if (bidDelay !== undefined && (!Number.isInteger(bidDelay) || bidDelay < 0)) {
+    throw new YargsError("builder.bidDelay must be a non-negative integer");
+  }
+
+  const bidRequests = args["builder.bidRequests"];
+  if (bidRequests !== undefined && (!Number.isInteger(bidRequests) || bidRequests <= 0)) {
+    throw new YargsError("builder.bidRequests must be a positive integer");
+  }
+
   return {
     enabled: args.builder,
     url: args["builder.url"] ?? defaultExecutionBuilderHttpOpts.url,
     timeout: args["builder.timeout"],
+    bidDeadline,
+    bidDelay,
+    bidRequests,
     faultInspectionWindow: args["builder.faultInspectionWindow"],
     allowedFaults: args["builder.allowedFaults"],
   };
@@ -51,6 +72,30 @@ export const options: CliCommandOptions<ExecutionBuilderArgs> = {
     description: "Timeout in milliseconds for builder API HTTP client",
     type: "number",
     defaultDescription: String(defaultExecutionBuilderHttpOpts.timeout),
+    group: "builder",
+  },
+
+  "builder.bidDeadline": {
+    description:
+      "Time in milliseconds builders are given to provide a bid once block production starts. Advertised to builder API endpoints via the `X-Timeout-Ms` header and applied to bids received via p2p. Post-Gloas only",
+    type: "number",
+    defaultDescription: String(defaultExecutionBuilderHttpOpts.bidDeadline),
+    group: "builder",
+  },
+
+  "builder.bidDelay": {
+    description:
+      "Delay in milliseconds from the start of the slot before the first bid request is sent to builder API endpoints, bids received via p2p are selected after the same delay. Post-Gloas only",
+    type: "number",
+    defaultDescription: String(defaultExecutionBuilderHttpOpts.bidDelay),
+    group: "builder",
+  },
+
+  "builder.bidRequests": {
+    description:
+      "Number of consecutive bid requests sent to builder API endpoints per proposal, each granting `builder.bidDeadline`, the highest bid is selected. Post-Gloas only",
+    type: "number",
+    defaultDescription: String(defaultExecutionBuilderHttpOpts.bidRequests),
     group: "builder",
   },
 

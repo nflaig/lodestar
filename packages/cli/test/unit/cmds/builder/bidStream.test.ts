@@ -4,6 +4,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {WebSocket} from "ws";
 import {ApiError} from "@lodestar/api/server";
 import {BuilderBidStreamApi, RetainedBidStream} from "@lodestar/builder";
+import {createChainForkConfig} from "@lodestar/config";
 import {config} from "@lodestar/config/default";
 import {ForkName} from "@lodestar/params";
 import {gloas, ssz} from "@lodestar/types";
@@ -79,7 +80,7 @@ describe("builder bid stream", () => {
     server = new TestServer(
       {address: "127.0.0.1", port: 0, bidStream: enabled},
       {
-        config: holdRouting ? {...config, SLOT_DURATION_MS: 50} : config,
+        config: holdRouting ? createChainForkConfig({...config, SLOT_DURATION_MS: 1000}) : config,
         logger: testLogger(),
         metrics: null,
         getBidStreamApi: () => (ready ? api : null),
@@ -198,7 +199,7 @@ describe("builder bid stream", () => {
   it("enforces a raw upgrade deadline even before request hooks reach authentication", async () => {
     await start(true, true, true);
     const client = await rawUpgrade(path, {"X-Timeout-Ms": "24000"});
-    await vi.waitFor(() => expect(client.isClosed()).toBe(true));
+    await vi.waitFor(() => expect(client.isClosed()).toBe(true), {timeout: 3000});
     expect(api.open).not.toHaveBeenCalled();
   });
 

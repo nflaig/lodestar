@@ -59,9 +59,32 @@ describe("PrepareNextSlot scheduler", () => {
   });
 
   afterEach(() => {
-    vi.clearAllMocks();
+    vi.restoreAllMocks();
     vi.clearAllTimers();
+    vi.useRealTimers();
   });
+
+  it.each([6000, 24000])(
+    "prepares at the current slot offset when the next duration is %i ms",
+    async (nextDuration) => {
+      const clockSlot = 2 * SLOTS_PER_EPOCH - 1;
+      // Anchor the fake clock to the start of clockSlot, else a wall time slot event from the real clock
+      // can trigger an extra prepareForNextSlot within the test window
+      vi.setSystemTime(clockSlot * config.SLOT_DURATION_MS);
+      getForkStub.mockImplementation((slot) => (slot <= clockSlot ? ForkName.phase0 : ForkName.altair));
+      vi.spyOn(config, "getSlotDurationMs").mockImplementation((fork) =>
+        fork === ForkName.phase0 ? 12000 : nextDuration
+      );
+      chainStub.recomputeForkChoiceHead.mockReturnValue({...zeroProtoBlock, slot: 0});
+
+      const preparing = scheduler.prepareForNextSlot(clockSlot);
+      await vi.advanceTimersByTimeAsync(7999);
+      expect(chainStub.recomputeForkChoiceHead).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(chainStub.recomputeForkChoiceHead).toHaveBeenCalledOnce();
+      await preparing;
+    }
+  );
 
   it("pre bellatrix - should not run due to not last slot of epoch", async () => {
     getForkStub.mockReturnValue(ForkName.phase0);
@@ -154,7 +177,8 @@ describe("PrepareNextSlot scheduler", () => {
     vi.spyOn(headState, "getBeaconProposer").mockReturnValue(proposerIndex);
     chainStub.getHeadState.mockReturnValue(headState);
     regenStub.getBlockSlotState.mockResolvedValue(makeState(SLOTS_PER_EPOCH - 1));
-    beaconProposerCacheStub.get.mockReturnValue("0x fee recipient address");
+    beaconProposerCacheStub.has.mockReturnValue(true);
+    beaconProposerCacheStub.getOrDefault.mockReturnValue("0x fee recipient address");
     (executionEngineStub as unknown as {payloadIdCache: PayloadIdCache}).payloadIdCache = new PayloadIdCache();
 
     await Promise.all([
@@ -225,7 +249,8 @@ describe("PrepareNextSlot scheduler", () => {
     vi.spyOn(headState, "getBeaconProposer").mockReturnValue(proposerIndex);
     chainStub.getHeadState.mockReturnValue(headState);
     regenStub.getBlockSlotState.mockResolvedValue(makeState(SLOTS_PER_EPOCH - 1));
-    beaconProposerCacheStub.get.mockReturnValue("0x fee recipient address");
+    beaconProposerCacheStub.has.mockReturnValue(true);
+    beaconProposerCacheStub.getOrDefault.mockReturnValue("0x fee recipient address");
     (executionEngineStub as unknown as {payloadIdCache: PayloadIdCache}).payloadIdCache = new PayloadIdCache();
 
     await Promise.all([
@@ -248,6 +273,65 @@ describe("PrepareNextSlot scheduler", () => {
     expect(loggerStub.error).not.toHaveBeenCalled();
   });
 
+  it("gloas - should prepare the payload with the fee recipient and gas limit of the pooled proposer preferences", async () => {
+    const pooledFeeRecipient = "0xcccccccccccccccccccccccccccccccccccccccc";
+    const spy = vi.fn();
+    chainStub.emitter.on(routes.events.EventType.payloadAttributes, spy);
+    getForkStub.mockReturnValue(ForkName.gloas);
+    const head = {
+      ...zeroProtoBlock,
+      slot: SLOTS_PER_EPOCH - 3,
+      parentBlockHash: zeroProtoBlock.blockRoot,
+    } as ProtoBlock;
+    chainStub.recomputeForkChoiceHead.mockReturnValue(head);
+    chainStub.predictProposerHead.mockReturnValue(head);
+    forkChoiceStub.getConfirmedBlock.mockReturnValue(head);
+    forkChoiceStub.getFinalizedBlock.mockReturnValue(head);
+    forkChoiceStub.getFinalizedCheckpoint.mockReturnValue({
+      epoch: 0,
+      root: new Uint8Array(32),
+      rootHex: zeroProtoBlock.blockRoot,
+    });
+    forkChoiceStub.getBlockHexDefaultStatus.mockReturnValue(head);
+    forkChoiceStub.getDependentRoot.mockReturnValue(zeroProtoBlock.blockRoot);
+    const preferences = ssz.gloas.SignedProposerPreferences.defaultValue();
+    preferences.message.feeRecipient = fromHex(pooledFeeRecipient);
+    preferences.message.targetGasLimit = 60_000_000n;
+    vi.mocked(chainStub.proposerPreferencesPool.get).mockReturnValue(preferences);
+    const gloasConfig = createBeaconConfig(getConfig(ForkName.gloas), new Uint8Array(32));
+    const makeState = (slot: number) =>
+      new BeaconStateView(
+        createCachedBeaconState(generateState({slot}, gloasConfig, true), {config: gloasConfig, pubkeyCache})
+      );
+    const headState = makeState(SLOTS_PER_EPOCH - 3);
+    vi.spyOn(headState, "getBeaconProposer").mockReturnValue(proposerIndex);
+    chainStub.getHeadState.mockReturnValue(headState);
+    regenStub.getBlockSlotState.mockResolvedValue(makeState(SLOTS_PER_EPOCH - 1));
+    beaconProposerCacheStub.has.mockReturnValue(true);
+    beaconProposerCacheStub.getOrDefault.mockReturnValue("0x fee recipient address");
+    (executionEngineStub as unknown as {payloadIdCache: PayloadIdCache}).payloadIdCache = new PayloadIdCache();
+
+    await Promise.all([
+      scheduler.prepareForNextSlot(SLOTS_PER_EPOCH - 2),
+      vi.advanceTimersByTimeAsync((config.SLOT_DURATION_MS * 2) / 3),
+    ]);
+
+    expect(chainStub.proposerPreferencesPool.get).toHaveBeenCalledWith(SLOTS_PER_EPOCH - 1, zeroProtoBlock.blockRoot);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0].data.payloadAttributes).toMatchObject({
+      suggestedFeeRecipient: pooledFeeRecipient,
+      targetGasLimit: 60_000_000n,
+    });
+    expect(executionEngineStub.notifyForkchoiceUpdate).toHaveBeenCalledWith(
+      ForkName.gloas,
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({suggestedFeeRecipient: pooledFeeRecipient})
+    );
+    expect(loggerStub.error).not.toHaveBeenCalled();
+  });
+
   it("post-fulu - should read proposer from head state and dial only the proposer head on reorg", async () => {
     getForkStub.mockReturnValue(ForkName.fulu);
     const headBlock = {...zeroProtoBlock, blockRoot: "0xhead", slot: SLOTS_PER_EPOCH - 3} as ProtoBlock;
@@ -262,7 +346,8 @@ describe("PrepareNextSlot scheduler", () => {
     vi.spyOn(headState.epochCtx, "getBeaconProposer").mockReturnValue(proposerIndex);
     chainStub.getHeadState.mockReturnValue(new BeaconStateView(headState));
     regenStub.getBlockSlotState.mockResolvedValue(new BeaconStateView(generateCachedBellatrixState()));
-    beaconProposerCacheStub.get.mockReturnValue("0x fee recipient address");
+    beaconProposerCacheStub.has.mockReturnValue(true);
+    beaconProposerCacheStub.getOrDefault.mockReturnValue("0x fee recipient address");
     (executionEngineStub as unknown as {payloadIdCache: PayloadIdCache}).payloadIdCache = new PayloadIdCache();
 
     await Promise.all([
@@ -297,7 +382,8 @@ describe("PrepareNextSlot scheduler", () => {
     // post-fulu (gloas): proposer is read from the head state, not from a dialed prepare state
     chainStub.getHeadState.mockReturnValue(new BeaconStateView(state));
     regenStub.getBlockSlotState.mockResolvedValue(new BeaconStateView(state));
-    beaconProposerCacheStub.get.mockReturnValue("0x fee recipient address");
+    beaconProposerCacheStub.has.mockReturnValue(true);
+    beaconProposerCacheStub.getOrDefault.mockReturnValue("0x fee recipient address");
     (executionEngineStub as unknown as {payloadIdCache: PayloadIdCache}).payloadIdCache = new PayloadIdCache();
 
     await Promise.all([
@@ -555,10 +641,10 @@ describe("PrepareNextSlot scheduler", () => {
           await vi.advanceTimersByTimeAsync(20);
         } else if (mode === "missed-slot fallback") {
           chainStub.clock.emit(ClockEvent.slot, clockSlot);
-          await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(1667) + 20);
+          await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(ForkName.gloas, 1667) + 20);
         } else {
           const regular = earlyScheduler.prepareForNextSlot(clockSlot);
-          await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(6667) + 20);
+          await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(ForkName.gloas, 6667) + 20);
           await regular;
         }
 
@@ -591,7 +677,8 @@ describe("PrepareNextSlot scheduler", () => {
       chainStub.getHeadState.mockReturnValue(prepareState);
       chainStub.recomputeForkChoiceHead.mockImplementation(() => forkChoiceStub.getHead());
       chainStub.predictProposerHead.mockImplementation(() => forkChoiceStub.getHead());
-      beaconProposerCacheStub.get.mockReturnValue(`0x${"11".repeat(20)}`);
+      beaconProposerCacheStub.has.mockReturnValue(true);
+      beaconProposerCacheStub.getOrDefault.mockReturnValue(`0x${"11".repeat(20)}`);
       (executionEngineStub as unknown as {payloadIdCache: PayloadIdCache}).payloadIdCache = new PayloadIdCache();
       let finish: ((payloadId: string) => void) | undefined;
       executionEngineStub.notifyForkchoiceUpdate.mockImplementation(
@@ -604,7 +691,7 @@ describe("PrepareNextSlot scheduler", () => {
       const regular = earlyScheduler.prepareForNextSlot(clockSlot).then(() => {
         completed = true;
       });
-      await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(6667) + 20);
+      await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(ForkName.gloas, 6667) + 20);
       expect(finish).toBeDefined();
       expect(completed).toBe(false);
       expect(payloadAttributesSpy).toHaveBeenCalledOnce();
@@ -676,7 +763,7 @@ describe("PrepareNextSlot scheduler", () => {
     });
 
     describe("missed-slot fallback", () => {
-      const grace = config.getSlotComponentDurationMs(1667);
+      const grace = config.getSlotComponentDurationMs(ForkName.gloas, 1667);
 
       function setPreviousHead(payloadStatus = PayloadStatus.FULL, slot = clockSlot - 1): ProtoBlock {
         const head = {...makeHead(payloadStatus), slot};
@@ -849,7 +936,7 @@ describe("PrepareNextSlot scheduler", () => {
           await vi.advanceTimersByTimeAsync(grace);
           expect(payloadAttributesSpy).toHaveBeenCalledTimes(1);
           const first = payloadAttributesSpy.mock.calls[0][0];
-          await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(6667) - grace);
+          await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(ForkName.gloas, 6667) - grace);
           expect(payloadAttributesSpy.mock.calls.length).toBeGreaterThan(1);
           for (const [event] of payloadAttributesSpy.mock.calls.slice(1)) expect(event).toEqual(first);
           expect(loggerStub.error).not.toHaveBeenCalled();

@@ -3,11 +3,19 @@ import {getHeapStatistics} from "node:v8";
 import {SignableENR} from "@chainsafe/enr";
 import {pubkeyCache} from "@chainsafe/lodestar-z/pubkeys";
 import {hasher} from "@chainsafe/persistent-merkle-tree";
-import {BeaconDb, BeaconNode} from "@lodestar/beacon-node";
+import {
+  BUILDER_BID_LAG_BUFFER_MS,
+  BeaconDb,
+  BeaconNode,
+  DEFAULT_BUILDER_BID_DEADLINE_MS,
+  DEFAULT_BUILDER_BID_DELAY_MS,
+  DEFAULT_BUILDER_BID_REQUESTS,
+} from "@lodestar/beacon-node";
+import {BLOCK_PRODUCTION_RACE_CUTOFF_GLOAS_BPS} from "@lodestar/beacon-node/api";
 import {ChainForkConfig} from "@lodestar/config";
 import {LevelDbController} from "@lodestar/db/controller/level";
 import {LoggerNode, getNodeLogger} from "@lodestar/logger/node";
-import {ACTIVE_PRESET, PresetName} from "@lodestar/params";
+import {ACTIVE_PRESET, PresetName, isForkPostGloas} from "@lodestar/params";
 import {ErrorAborted, bytesToInt, formatBytes} from "@lodestar/utils";
 import {ProcessShutdownCallback} from "@lodestar/validator";
 import {BeaconNodeOptions, getBeaconConfigFromArgs} from "../../config/index.js";
@@ -79,6 +87,7 @@ export async function beaconHandler(args: BeaconArgs & GlobalArgs): Promise<void
       anchorState,
       config: beaconConfig,
       isFinalized,
+      earliestAvailableSlot,
     } = await initBeaconState(args, beaconPaths.dataDir, beaconPaths.pubkeysFile, config, db, logger);
 
     const node = await BeaconNode.init({
@@ -94,6 +103,7 @@ export async function beaconHandler(args: BeaconArgs & GlobalArgs): Promise<void
       peerStoreDir: beaconPaths.peerStoreDir,
       anchorState,
       isAnchorStateFinalized: isFinalized,
+      earliestAvailableSlot,
     });
 
     // dev debug option to have access to the BN instance
@@ -229,6 +239,34 @@ export async function beaconHandlerInit(args: BeaconArgs & GlobalArgs) {
 
   // Render final options
   const options = beaconNodeOptions.getWithDefaults();
+
+  if (options.chain.nativeStateTransition && config.GLOAS_FORK_EPOCH !== Infinity) {
+    throw Error(
+      `--chain.nativeStateTransition does not support Gloas, which is scheduled at epoch ${config.GLOAS_FORK_EPOCH}`
+    );
+  }
+
+  // Bids received up to the end of the bid window plus the lag buffer must still have a chance to win the
+  // block production race, otherwise the local block is selected at the race cutoff before any bid.
+  // Only enforced on explicitly configured values, the defaults are used as is on short slots
+  if (
+    args["builder.bidDeadline"] !== undefined ||
+    args["builder.bidDelay"] !== undefined ||
+    args["builder.bidRequests"] !== undefined
+  ) {
+    const bidDeadline = options.executionBuilder.bidDeadline ?? DEFAULT_BUILDER_BID_DEADLINE_MS;
+    const bidDelay = options.executionBuilder.bidDelay ?? DEFAULT_BUILDER_BID_DELAY_MS;
+    const bidRequests = options.executionBuilder.bidRequests ?? DEFAULT_BUILDER_BID_REQUESTS;
+    const bidWindowMs = bidDelay + bidRequests * bidDeadline;
+    for (const {name: fork, epoch} of config.forksAscendingEpochOrder) {
+      const raceCutoffMs = config.getSlotComponentDurationMs(fork, BLOCK_PRODUCTION_RACE_CUTOFF_GLOAS_BPS);
+      if (isForkPostGloas(fork) && epoch !== Infinity && bidWindowMs + BUILDER_BID_LAG_BUFFER_MS >= raceCutoffMs) {
+        throw Error(
+          `Builder bid window of ${bidWindowMs}ms (bidDelay + bidRequests * bidDeadline) must be below ${raceCutoffMs - BUILDER_BID_LAG_BUFFER_MS}ms for fork ${fork}`
+        );
+      }
+    }
+  }
 
   return {config, options, beaconPaths, network, version, commit, privateKey, logger};
 }

@@ -127,7 +127,11 @@ async function waitForBuilder(
       // Builders deposited before the fork are onboarded by the fork upgrade, the beacon node only knows
       // them once the first Gloas block is the head. Compute the registry of the fork from the head state
       // of the last slot before it, to be able to bid for the first Gloas slot.
-      await sleep(config.getSlotComponentDurationMs(FORK_REGISTRY_LOOKUP_BPS) - clock.msFromSlot(currentSlot), signal);
+      await sleep(
+        config.getSlotComponentDurationMs(config.getForkName(currentSlot), FORK_REGISTRY_LOOKUP_BPS) -
+          clock.msFromSlot(currentSlot),
+        signal
+      );
       let builder: routes.beacon.BuilderResponse | null = null;
       try {
         builder = await fetchBuilderAtFork(api, config, forkSlot, id);
@@ -228,7 +232,7 @@ async function fetchBuilderAtFork(
   }
   // The view syncs pubkeys during construction, capacity must be reserved first
   pubkeyCache.ensureCapacity(validatorCount + MAX_PENDING_DEPOSITS_PER_EPOCH);
-  const forkState = createBeaconStateView({useNative: false, config, stateBytes}).processSlots(forkSlot);
+  const forkState = createBeaconStateView({nativeStateTransition: false, config, stateBytes}).processSlots(forkSlot);
   if (!isStatePostGloas(forkState)) {
     throw Error(`Expected gloas state at fork slot, got fork=${forkState.forkName}`);
   }

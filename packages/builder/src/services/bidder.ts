@@ -220,8 +220,11 @@ export class Bidder {
       primary.feeRecipient = feeRecipient;
       signal.throwIfAborted();
 
+      const preparationFork = config.getForkName(slot - 1);
       const msToDeadline =
-        clock.msToSlot(slot) - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(this.opts.deadlineBps);
+        clock.msToSlot(slot) -
+        config.getSlotDurationMs(preparationFork) +
+        config.getSlotComponentDurationMs(preparationFork, this.opts.deadlineBps);
       logger.verbose("Preparing payload build", {...logCtx, msToDeadline, targetGasLimit});
 
       const job: PayloadBuildJob = {
@@ -327,9 +330,14 @@ export class Bidder {
     }
     // Leave the writer and event loop free around scheduled primary/staged gossip.
     const slotStart = Date.now() + clock.msToSlot(primary.slot);
+    const preparationFork = config.getForkName(primary.slot - 1);
     if (
       [this.opts.deadlineBps, ...(this.modules.gossipStages ?? []).map((stage) => stage.deadlineBps)].some((bps) => {
-        const remaining = slotStart - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(bps) - Date.now();
+        const remaining =
+          slotStart -
+          config.getSlotDurationMs(preparationFork) +
+          config.getSlotComponentDurationMs(preparationFork, bps) -
+          Date.now();
         return remaining >= -50 && remaining <= duration + 50;
       })
     ) {
@@ -498,7 +506,9 @@ export class Bidder {
     const parentBlockHash = toRootHex(data.parentBlockHash);
     const parentBlockRoot = toRootHex(data.parentBlockRoot);
     const until =
-      Date.now() + clock.msToSlot(slot) + config.getSlotComponentDurationMs(this.opts.updateCutoffBps ?? 1000);
+      Date.now() +
+      clock.msToSlot(slot) +
+      config.getSlotComponentDurationMs(config.getForkName(slot), this.opts.updateCutoffBps ?? 1000);
     let best: gloas.SignedExecutionPayloadBid | null = null;
     let publication: Promise<void> | undefined;
     let publicationPending = false;
@@ -511,8 +521,11 @@ export class Bidder {
     );
     const stages = this.modules.gossipStages ?? [];
     const slotStart = Date.now() + clock.msToSlot(slot);
+    const preparationFork = config.getForkName(slot - 1);
     const stageTime = (deadlineBps: number): number =>
-      slotStart - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(deadlineBps);
+      slotStart -
+      config.getSlotDurationMs(preparationFork) +
+      config.getSlotComponentDurationMs(preparationFork, deadlineBps);
     const primaryUntil = stages.length ? stageTime(stages[0].deadlineBps) : until;
     const gossipBest = (): void => {
       if (

@@ -2,7 +2,7 @@ import {ApiClient, routes} from "@lodestar/api";
 import type {BuilderApiMethods} from "@lodestar/api/builder/server";
 import {ApiError} from "@lodestar/api/server";
 import {BeaconConfig} from "@lodestar/config";
-import {DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH} from "@lodestar/params";
+import {DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, ForkName} from "@lodestar/params";
 import {
   IClock,
   ZERO_HASH,
@@ -122,7 +122,10 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
     },
 
     async submitSignedBeaconBlock({signedBlock}) {
-      const block = signedBlock.data;
+      if (config.getForkName(signedBlock.data.message.slot) !== ForkName.gloas) {
+        throw new ApiError(400, "Signed beacon block submission requires Gloas");
+      }
+      const block = signedBlock.data as gloas.SignedBeaconBlock;
       const {slot, proposerIndex} = block.message;
       const bid = block.message.body.signedExecutionPayloadBid.message;
       const blockRoot = toRootHex(config.getForkTypes(slot).BeaconBlock.hashTreeRoot(block.message));
@@ -187,7 +190,10 @@ export function bidWaitBudget(
   return transitMs >= 0 && slot >= currentSlot && slot <= currentSlot + 1
     ? Math.max(
         0,
-        Math.min(timeoutMs - 2 * transitMs - BID_RESPONSE_MARGIN_MS, clock.msToSlot(slot) + config.SLOT_DURATION_MS)
+        Math.min(
+          timeoutMs - 2 * transitMs - BID_RESPONSE_MARGIN_MS,
+          clock.msToSlot(slot) + config.getSlotDurationMs(config.getForkName(slot))
+        )
       )
     : 0;
 }

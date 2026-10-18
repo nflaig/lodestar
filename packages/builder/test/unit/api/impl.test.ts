@@ -7,7 +7,7 @@ import {ZERO_HASH, computeDomain, computeSigningRoot} from "@lodestar/state-tran
 import {gloas, ssz} from "@lodestar/types";
 import * as utils from "@lodestar/utils";
 import {BuilderBidStreamApi, getBuilderBidStreamApi} from "../../../src/api/bidStream.js";
-import {BuilderApi, getBuilderApi} from "../../../src/api/impl.js";
+import {BuilderApi, bidWaitBudget, getBuilderApi} from "../../../src/api/impl.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {ProposerDutiesTracker} from "../../../src/services/proposerDutiesTracker.js";
 import {getApiClientStub, mockApiResponse} from "../utils/apiStub.js";
@@ -26,6 +26,19 @@ const proposerPubkey = proposerKey.toPublicKey().toBytes();
 const otherKey = SecretKey.fromBytes(Buffer.alloc(32, 3));
 
 describe("builder api", () => {
+  it.each([
+    [ForkName.gloas, 12_000],
+    [ForkName.heze, 6_000],
+  ] as const)("bounds bid waiting by the requested %s slot duration", (fork, expectedMs) => {
+    const forkConfig = createBeaconConfig(
+      {...getConfig(fork), SLOT_DURATION_MS: 12_000, SLOT_DURATION_MS_HEZE: 6_000},
+      Buffer.alloc(32)
+    );
+    const clock = new ClockMock();
+    clock.currentSlot = slot;
+    expect(bidWaitBudget(clock, forkConfig, slot, 0, 60_000)).toBe(expectedMs);
+  });
+
   let api: ReturnType<typeof getApiClientStub>;
   let clock: ClockMock;
   let bidStore: BidStore;
@@ -558,6 +571,30 @@ describe("builder api", () => {
   });
 
   describe("submitSignedBeaconBlock", () => {
+    it("rejects post-Gloas blocks before accessing fork-specific fields or publishing", async () => {
+      const hezeApi = getBuilderApi(
+        {
+          config: createBeaconConfig(getConfig(ForkName.heze), Buffer.alloc(32)),
+          logger: getMockedLogger(),
+          clock,
+          api,
+          bidStore,
+          proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
+          builderIndex,
+          metrics: null,
+        },
+        {authData}
+      );
+      const block = ssz.heze.SignedBeaconBlock.defaultValue();
+      block.message.slot = slot;
+      await expect(hezeApi.submitSignedBeaconBlock({signedBlock: {data: block}})).rejects.toMatchObject({
+        statusCode: 400,
+        message: "Signed beacon block submission requires Gloas",
+      });
+      expect(api.beacon.publishBlockV2).not.toHaveBeenCalled();
+      expect(api.validator.getProposerDutiesV2).not.toHaveBeenCalled();
+    });
+
     it("serves B but still accepts a proposer selecting an earlier A", async () => {
       const first = (await builderApi.getExecutionPayloadBid(bidRequest())).data;
       const oldBlock = signBlock();
