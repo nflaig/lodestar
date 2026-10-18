@@ -133,7 +133,7 @@ only that handle's reconciliation, while keeping its capacity occupied. Native a
 and halted-construction rejections back off from 200 ms to at most one second within
 the existing build deadline. These same-slot primary retries wait until every rejected
 reservation finishes cancellation. Received rejections have bounded, sanitized
-diagnostics; neither rejection messages nor backoff release uncertain capacity.
+diagnostics; neither rejection messages nor delayed retries release uncertain capacity.
 
 ## Experimental alternate parent bids
 
