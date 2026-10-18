@@ -24,6 +24,7 @@ const GWEI_TO_WEI = 1_000_000_000n;
 const MAX_ALTERNATE_ATTEMPTS_PER_SLOT = 4;
 const MAX_ALTERNATE_DIAGNOSTICS_PER_SLOT = 16;
 const MAX_ALTERNATE_RECEIVED_DIAGNOSTICS_PER_SLOT = 4;
+const ALTERNATE_RETENTION_BUDGET_MS = 150;
 
 type AlternateDiagnosticReason =
   | "received"
@@ -61,6 +62,7 @@ type AlternateBuild = {
   controller: AbortController;
   signal: AbortSignal;
   deadline: number;
+  getPayloadAt: number;
   retentionStarted: boolean;
   preemptedBy?: PrimaryBuild;
 };
@@ -478,7 +480,15 @@ export class Bidder {
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, primary.controller.signal, this.modules.signal]);
     const deadline = Date.now() + duration;
-    const alternate: AlternateBuild = {event, primary, controller, signal, deadline, retentionStarted: false};
+    const alternate: AlternateBuild = {
+      event,
+      primary,
+      controller,
+      signal,
+      deadline,
+      getPayloadAt: deadline - Math.min(ALTERNATE_RETENTION_BUDGET_MS, Math.floor(duration / 2)),
+      retentionStarted: false,
+    };
     this.alternateBuild = alternate;
     const timer = setTimeout(() => controller.abort(), duration);
     let preempted = false;
@@ -547,7 +557,7 @@ export class Bidder {
   }
 
   private async buildAlternate(id: string, alternate: AlternateBuild): Promise<void> {
-    const {primary, event, deadline, signal} = alternate;
+    const {primary, event, deadline, getPayloadAt, signal} = alternate;
     const {data} = event;
     const dependentRoot = toRootHex(event.context.dependentRoot);
     signal.throwIfAborted();
@@ -581,7 +591,7 @@ export class Bidder {
             targetGasLimit: preferences.message.targetGasLimit,
           },
         },
-        getPayloadAt: deadline - 50,
+        getPayloadAt,
       },
       async (payload) => {
         signal.throwIfAborted();
