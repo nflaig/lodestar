@@ -101,6 +101,7 @@ Quickstart
 README
 READMEs
 RPC
+RTT
 Reth
 Ryzen
 SFTP
@@ -122,6 +123,7 @@ VM
 Vitalik
 Vitest
 Wagyu
+WebSocket
 Zig
 addons
 api
@@ -268,6 +270,7 @@ trustless
 typesafe
 udp
 uint
+unleased
 unpkg
 util
 utils
