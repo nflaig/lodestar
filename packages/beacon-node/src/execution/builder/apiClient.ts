@@ -1,8 +1,9 @@
+import {Agent} from "node:https";
 import {routes} from "@lodestar/api";
 import {ApiClient as BuilderApi, getClient} from "@lodestar/api/builder";
 import {ChainForkConfig} from "@lodestar/config";
 import {Logger} from "@lodestar/logger";
-import {DOMAIN_BUILDER_REQUEST_AUTH, ForkPostGloas} from "@lodestar/params";
+import {DOMAIN_BUILDER_REQUEST_AUTH, ForkName, ForkPostGloas} from "@lodestar/params";
 import {
   ZERO_HASH,
   computeDomain,
@@ -14,6 +15,9 @@ import {ErrorAborted, isValidAsciiHttpUrl, sleep, toHex, toPrintableUrl} from "@
 import type {IBlsVerifier} from "../../chain/bls/index.js";
 import {Metrics} from "../../metrics/metrics.js";
 import {IClock} from "../../util/clock.js";
+import {StreamedBuilderBid, getExecutionPayloadBidStream} from "./bidStream.js";
+
+const MAX_CONCURRENT_BID_STREAMS = 64;
 
 /**
  * Additional duration to account for potential event loop lag which causes
@@ -41,6 +45,8 @@ export type BuilderApiClientOpts = {
   bidDelay?: number;
   /** Number of consecutive bid requests per proposal, each granting `bidDeadline` */
   bidRequests?: number;
+  /** Prefer the Gloas WebSocket bid stream, falling back to HTTP before an upgrade */
+  bidStream?: boolean;
   // Add User-Agent header to all requests
   userAgent?: string;
 };
@@ -105,6 +111,8 @@ export class BuilderApiClient {
   readonly bidDelay: number;
   readonly bidRequests: number;
   private readonly clients = new Map<BuilderUrl, BuilderApi>();
+  private activeStreams = 0;
+  private streamAgent?: Agent;
 
   constructor(
     private readonly opts: BuilderApiClientOpts,
@@ -112,11 +120,13 @@ export class BuilderApiClient {
     private readonly clock: IClock,
     private readonly bls: IBlsVerifier,
     private readonly metrics: Metrics | null = null,
-    private readonly logger?: Logger
+    private readonly logger?: Logger,
+    private readonly signal?: AbortSignal
   ) {
     this.bidDeadline = opts.bidDeadline ?? DEFAULT_BUILDER_BID_DEADLINE_MS;
     this.bidDelay = opts.bidDelay ?? DEFAULT_BUILDER_BID_DELAY_MS;
     this.bidRequests = opts.bidRequests ?? DEFAULT_BUILDER_BID_REQUESTS;
+    signal?.addEventListener("abort", () => this.streamAgent?.destroy(), {once: true});
   }
 
   /** Time from now until the last bid request of the slot reaches its deadline */
@@ -141,6 +151,11 @@ export class BuilderApiClient {
     proposerPubkey: BLSPubkey,
     signal?: AbortSignal
   ): Promise<BuilderApiBid[]> {
+    const streamController = new AbortController();
+    const streamSignal = this.signal
+      ? AbortSignal.any([streamController.signal, this.signal])
+      : streamController.signal;
+    const roundSignal = signal && this.signal ? AbortSignal.any([signal, this.signal]) : (signal ?? this.signal);
     const seenRequests = new Set<string>();
     const requests: {requestKey: string; url: BuilderUrl; entry: routes.validator.BuilderEntry}[] = [];
 
@@ -173,54 +188,50 @@ export class BuilderApiClient {
       requests.push({requestKey, url, entry});
     }
 
-    // Collected in arrival order so an earlier received bid wins ties during candidate ranking,
-    // a bid returned unchanged to the same request in a later round is not collected again
-    const bids: BuilderApiBid[] = [];
-    const seenBids = new Set<string>();
+    // Snapshot each round synchronously on receipt so a cutoff cannot lose a revision while its
+    // stream is closing. A lower replacement supersedes the previous revision in that round.
+    const candidates = new Map<string, {requestKey: string; bid: BuilderApiBid}>();
     const rounds = getBidRounds(this.clock.msFromSlot(slot), this.bidDelay, this.bidDeadline, this.bidRequests);
     const collection = Promise.all(
-      rounds.map(async (round) => {
+      rounds.map(async (round, roundIndex) => {
         // A round due now is sent even if the signal is about to abort, it is the last fallback
         const waitMs = round.startMs - this.clock.msFromSlot(slot);
         if (waitMs > 0) {
           try {
-            await sleep(waitMs, signal);
+            await sleep(waitMs, roundSignal);
           } catch (e) {
             if (e instanceof ErrorAborted) return;
             throw e;
           }
-          if (signal?.aborted) return;
+          if (roundSignal?.aborted) return;
         }
         await Promise.all(
           requests.map(async ({requestKey, url, entry}) => {
             this.metrics?.builderApi.bidRequests.inc();
             try {
+              const key = `${roundIndex}-${requestKey}`;
+              const collect = (bid: StreamedBuilderBid): void => {
+                if (!streamSignal.aborted) candidates.set(key, {requestKey, bid: {url, entry, ...bid}});
+              };
               const client = await this.getOrCreateClient(url, proposerPubkey, entry.auth);
-              const res = await client.getExecutionPayloadBid(
-                {
-                  slot,
-                  parentHash,
-                  parentRoot,
-                  proposerPubkey,
-                  requestAuth: entry.auth,
-                  dateMilliseconds: Date.now(),
-                  timeoutMs: this.bidDeadline,
-                },
-                // Event loop lag must not discard bids that arrived in time
-                {timeoutMs: this.bidDeadline + BUILDER_BID_LAG_BUFFER_MS}
+              const bid = await this.requestBid(
+                client,
+                url,
+                entry,
+                slot,
+                parentHash,
+                parentRoot,
+                proposerPubkey,
+                streamSignal,
+                collect,
+                signal
               );
-              const signedBid = res.value();
-              if (signedBid === undefined) {
+              if (bid === undefined) {
                 this.logger?.debug("No bid received from builder", {slot, builder: toPrintableUrl(url)});
                 return;
               }
               this.metrics?.builderApi.bidsReceived.inc();
-              const bidKey = `${requestKey}-${toHex(signedBid.signature)}`;
-              if (seenBids.has(bidKey)) {
-                return;
-              }
-              seenBids.add(bidKey);
-              bids.push({url, entry, signedBid, receivedMs: this.clock.msFromSlot(slot)});
+              collect(bid);
             } catch (e) {
               this.metrics?.builderApi.bidRequestErrors.inc();
               this.logger?.warn("Failed to get bid from builder", {slot, builder: toPrintableUrl(url)}, e as Error);
@@ -230,22 +241,123 @@ export class BuilderApiClient {
       })
     );
 
-    if (signal === undefined) {
-      await collection;
-    } else {
-      await Promise.race([
-        collection,
-        new Promise<void>((resolve) => {
-          if (signal.aborted) resolve();
-          else signal.addEventListener("abort", () => resolve(), {once: true});
-        }),
-      ]);
-      if (bids.length === 0) {
+    let onAbort: (() => void) | undefined;
+    try {
+      if (signal === undefined) {
         await collection;
+      } else {
+        await Promise.race([
+          collection,
+          new Promise<void>((resolve) => {
+            onAbort = resolve;
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", onAbort, {once: true});
+          }),
+        ]);
+        if (candidates.size === 0) await collection;
+      }
+      const bids = new Map<string, BuilderApiBid>();
+      for (const {requestKey, bid} of candidates.values()) {
+        const key = `${requestKey}-${toHex(bid.signedBid.signature)}`;
+        const previous = bids.get(key);
+        if (!previous || bid.receivedMs < previous.receivedMs) bids.set(key, bid);
+      }
+      return [...bids.values()].sort((a, b) => a.receivedMs - b.receivedMs);
+    } finally {
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+      streamController.abort();
+    }
+  }
+
+  private async requestBid(
+    client: BuilderApi,
+    url: BuilderUrl,
+    entry: routes.validator.BuilderEntry,
+    slot: Slot,
+    parentHash: Root,
+    parentRoot: Root,
+    proposerPubkey: BLSPubkey,
+    signal: AbortSignal,
+    onBid: (bid: StreamedBuilderBid) => void,
+    stopSignal?: AbortSignal
+  ): Promise<StreamedBuilderBid | undefined> {
+    if (signal.aborted) return undefined;
+    const started = performance.now();
+    let timeoutMs = this.bidDeadline;
+    let requestTimeoutMs = timeoutMs + BUILDER_BID_LAG_BUFFER_MS;
+    if (
+      this.opts.bidStream &&
+      this.config.getForkName(slot) === ForkName.gloas &&
+      this.activeStreams < MAX_CONCURRENT_BID_STREAMS
+    ) {
+      this.activeStreams++;
+      try {
+        const result = await getExecutionPayloadBidStream({
+          url,
+          slot,
+          parentHash,
+          parentRoot,
+          proposerPubkey,
+          requestAuth: entry.auth,
+          dateMilliseconds: Date.now(),
+          timeoutMs,
+          requestTimeoutMs,
+          userAgent: this.opts.userAgent,
+          agent: new URL(url).protocol === "https:" ? this.getStreamAgent() : undefined,
+          signal,
+          stopSignal,
+          msFromSlot: () => this.clock.msFromSlot(slot),
+          onBid,
+        });
+        const elapsed = performance.now() - started;
+        timeoutMs = Math.floor(this.bidDeadline - elapsed);
+        requestTimeoutMs = Math.floor(this.bidDeadline + BUILDER_BID_LAG_BUFFER_MS - elapsed);
+        this.logger?.info("Builder bid stream received", {
+          slot,
+          builder: toPrintableUrl(url),
+          parentHash: toHex(parentHash),
+          parentRoot: toHex(parentRoot),
+          upgraded: result.upgraded,
+          opened: result.opened,
+          updates: result.updates,
+          discarded: result.discarded,
+          reason: result.reason,
+          statusCode: result.statusCode,
+          durationMs: Math.round(elapsed),
+          fallback: !result.upgraded && !signal.aborted && timeoutMs > 0,
+          ...(result.bid
+            ? {
+                receivedMs: result.bid.receivedMs,
+                blockHash: toHex(result.bid.signedBid.message.blockHash),
+                builderIndex: result.bid.signedBid.message.builderIndex,
+                value: result.bid.signedBid.message.value,
+              }
+            : {}),
+        });
+        if (result.upgraded || signal.aborted || timeoutMs <= 0) return result.bid;
+      } finally {
+        this.activeStreams--;
       }
     }
+    if (signal.aborted) return undefined;
+    const res = await client.getExecutionPayloadBid(
+      {slot, parentHash, parentRoot, proposerPubkey, requestAuth: entry.auth, dateMilliseconds: Date.now(), timeoutMs},
+      {timeoutMs: requestTimeoutMs, signal, redirect: "manual"}
+    );
+    const signedBid = res.value();
+    return signedBid ? {signedBid, receivedMs: this.clock.msFromSlot(slot)} : undefined;
+  }
 
-    return bids;
+  private getStreamAgent(): Agent {
+    // ws supplies createConnection, bypassing Node's global agent and its TLS session cache.
+    this.streamAgent ??= new Agent({
+      keepAlive: true,
+      maxSockets: MAX_CONCURRENT_BID_STREAMS,
+      maxTotalSockets: MAX_CONCURRENT_BID_STREAMS,
+      maxFreeSockets: 16,
+      maxCachedSessions: 64,
+    });
+    return this.streamAgent;
   }
 
   /** Forward a proposer's builder preferences to the builder at the given url */
@@ -339,6 +451,7 @@ export class BuilderApiClient {
           baseUrl: url,
           globalInit: {
             timeoutMs: this.opts.timeout,
+            redirect: "manual",
             headers: this.opts.userAgent ? {"User-Agent": this.opts.userAgent} : undefined,
           },
         },

@@ -18,7 +18,7 @@ import {
 } from "@lodestar/builder";
 import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB, ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {ErrorAborted, LodestarError, isFetchError, toHex, withTimeout} from "@lodestar/utils";
+import {ErrorAborted, LodestarError, type Logger, isFetchError, sleep, toHex, withTimeout} from "@lodestar/utils";
 
 type Rpc = Pick<JsonRpcHttpClient, "fetch">;
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
@@ -45,7 +45,14 @@ type SessionEntry = {
   lease?: OfferLease;
   state: "active" | "releasing" | "uncertain";
   release?: Promise<void>;
+  reserved?: boolean;
 };
+
+type AlternateDisabledReason =
+  | "ambiguous_begin"
+  | "invalid_begin_handle"
+  | "unsupported_alternate_method"
+  | "unconfirmed_alternate_capability";
 
 /** Private constructor RPC; the constructor validates seals before publishing a ready snapshot. */
 export class SessionPayloadSource implements PayloadSource {
@@ -59,15 +66,23 @@ export class SessionPayloadSource implements PayloadSource {
   constructor(
     readonly id: string,
     private readonly rpc: (signal: AbortSignal) => Rpc,
-    private readonly options: {boundedAlternates?: boolean} = {}
+    private readonly options: {
+      boundedAlternates?: boolean;
+      beginReservations?: boolean;
+      logger?: {warn: Logger["warn"]};
+    } = {}
   ) {}
 
   get supportsBoundedAlternates(): boolean {
     return this.options.boundedAlternates === true;
   }
 
+  private get tracksSessions(): boolean {
+    return this.supportsBoundedAlternates || this.options.beginReservations === true;
+  }
+
   getResources(): PayloadSourceResources | undefined {
-    if (!this.supportsBoundedAlternates) return undefined;
+    if (!this.tracksSessions) return undefined;
     const result: PayloadSourceResources = {
       capacity: 2,
       preparing: this.preparing,
@@ -80,8 +95,39 @@ export class SessionPayloadSource implements PayloadSource {
     return result;
   }
 
+  private warnAlternatesDisabled(
+    request: BuildRequest,
+    signal: AbortSignal,
+    reason: AlternateDisabledReason,
+    method = request.requireUnleased ? "zbuilder_beginAlternateV1" : "zbuilder_beginV1"
+  ): void {
+    try {
+      const logger = this.options.logger;
+      if (!logger) return;
+      const resources = this.getResources();
+      logger.warn("Constructor alternate admission disabled", {
+        code: "SESSION_PAYLOAD_ALTERNATES_DISABLED",
+        reason,
+        method,
+        slot: request.payloadAttributes.slotNumber,
+        parentBlockHash: request.forkchoiceState.headBlockHash,
+        parentBlockRoot: toHex(request.payloadAttributes.parentBeaconBlockRoot),
+        callerAborted: signal.aborted,
+        orphaned: this.orphaned,
+        capacity: resources?.capacity,
+        active: resources?.active,
+        preparing: resources?.preparing,
+        releasing: resources?.releasing,
+        uncertain: resources?.uncertain,
+        alternatesDisabled: resources?.alternatesDisabled,
+      });
+    } catch {
+      // Diagnostic failures must not change admission or session ownership.
+    }
+  }
+
   async reconcileResources(signal: AbortSignal): Promise<void> {
-    if (!this.supportsBoundedAlternates) return;
+    if (!this.tracksSessions) return;
     let pending = this.reconciliation;
     if (pending === undefined) {
       const cleanupSignal = AbortSignal.any([signal, AbortSignal.timeout(6000)]);
@@ -105,9 +151,9 @@ export class SessionPayloadSource implements PayloadSource {
     if (request.fork !== ForkName.gloas) {
       throw new SessionPayloadError({code: SessionPayloadErrorCode.UNSUPPORTED_FORK, reason: request.fork});
     }
-    const bounded = this.supportsBoundedAlternates;
+    const bounded = this.tracksSessions;
     const alternate = request.requireUnleased === true;
-    if (alternate && (!bounded || this.alternatesDisabled))
+    if (alternate && (!this.supportsBoundedAlternates || this.alternatesDisabled))
       throw new SessionPayloadError({
         code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED,
         reason: "Alternates unavailable",
@@ -137,9 +183,11 @@ export class SessionPayloadSource implements PayloadSource {
         code: SessionPayloadErrorCode.CAPACITY,
         reason: "Constructor resources occupied",
       });
+    if (this.options.beginReservations) return this.prepareReserved(request, signal);
     const beginRpc = this.rpc(bounded ? AbortSignal.timeout(BEGIN_RPC_TIMEOUT_MS) : signal);
     if (bounded) this.preparing++;
     let result: {sessionId: string; orderGenerationVersion?: number; alternateSessionVersion?: number};
+    let disabledReason: AlternateDisabledReason | undefined;
     try {
       // Cancelling the build must not discard a late allocation handle. Keep
       // one bounded request alive, then end any handle the caller no longer owns.
@@ -155,6 +203,7 @@ export class SessionPayloadSource implements PayloadSource {
         if (!definite) {
           this.orphaned++;
           this.alternatesDisabled = true;
+          disabledReason = "ambiguous_begin";
         } else if (
           alternate &&
           rejection &&
@@ -164,11 +213,13 @@ export class SessionPayloadSource implements PayloadSource {
             ))
         ) {
           this.alternatesDisabled = true;
+          disabledReason = "unsupported_alternate_method";
         }
       }
       throw error;
     } finally {
       if (bounded) this.preparing--;
+      if (disabledReason !== undefined) this.warnAlternatesDisabled(request, signal, disabledReason);
     }
     if (
       typeof result?.sessionId !== "string" ||
@@ -179,6 +230,7 @@ export class SessionPayloadSource implements PayloadSource {
       if (bounded) {
         this.orphaned++;
         this.alternatesDisabled = true;
+        this.warnAlternatesDisabled(request, signal, "invalid_begin_handle");
       }
       throw new SessionPayloadError({
         code: SessionPayloadErrorCode.INVALID_SESSION,
@@ -201,6 +253,7 @@ export class SessionPayloadSource implements PayloadSource {
     }
     if (alternate && (result.orderGenerationVersion !== 0 || result.alternateSessionVersion !== 1)) {
       this.alternatesDisabled = true;
+      this.warnAlternatesDisabled(request, signal, "unconfirmed_alternate_capability");
       await this.release(handle, AbortSignal.timeout(6000)).catch(() => {});
       throw new SessionPayloadError({
         code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED,
@@ -219,6 +272,114 @@ export class SessionPayloadSource implements PayloadSource {
       });
     }
     return handle;
+  }
+
+  /** Reserve an allocation identity before sending the non-idempotent begin.
+   * A lost reserve reply cannot allocate a worker. Once known, the ticket stays
+   * counted until the constructor proves neither queued nor attached work can
+   * survive. A timeout or a changed server instance is not that proof.
+   */
+  private async prepareReserved(request: BuildRequest, signal: AbortSignal): Promise<BuildHandle> {
+    this.preparing++;
+    let ticket: string | undefined;
+    let method = "zbuilder_reserveBeginV1";
+    let disabledReason: AlternateDisabledReason | undefined;
+    try {
+      const reservation = await this.rpc(signal).fetch<{reservationId: string; beginReservationVersion: number}>(
+        {method: "zbuilder_reserveBeginV1", params: [request.requireUnleased === true]},
+        {timeout: 1000}
+      );
+      if (
+        reservation?.beginReservationVersion !== 1 ||
+        typeof reservation.reservationId !== "string" ||
+        !/^begin-[0-9a-f]{32}-[1-9][0-9]{0,19}$/.test(reservation.reservationId) ||
+        BigInt(reservation.reservationId.slice(39)) > 0xffffffffffffffffn ||
+        this.requests.has(reservation.reservationId)
+      )
+        throw new SessionPayloadError({
+          code: SessionPayloadErrorCode.INVALID_SESSION,
+          reason: "Invalid constructor reservation",
+        });
+      ticket = reservation.reservationId;
+      if (signal.aborted) throw new ErrorAborted();
+      method = "zbuilder_beginReservedV1";
+      const result = await this.rpc(AbortSignal.timeout(BEGIN_RPC_TIMEOUT_MS)).fetch<{
+        sessionId: string;
+        beginReservationVersion: number;
+        orderGenerationVersion: number;
+        alternateSessionVersion: number;
+      }>(
+        {
+          method: "zbuilder_beginReservedV1",
+          params: [
+            ticket,
+            request.forkchoiceState.headBlockHash,
+            serializePayloadAttributes(request.payloadAttributes),
+          ],
+        },
+        {timeout: BEGIN_RPC_TIMEOUT_MS}
+      );
+      if (
+        result?.sessionId !== ticket ||
+        result.beginReservationVersion !== 1 ||
+        (result.orderGenerationVersion !== 0 && result.orderGenerationVersion !== 1) ||
+        (!request.requireUnleased && result.alternateSessionVersion !== 0) ||
+        (request.requireUnleased && (result.orderGenerationVersion !== 0 || result.alternateSessionVersion !== 1))
+      ) {
+        if (request.requireUnleased) disabledReason = "unconfirmed_alternate_capability";
+        throw new SessionPayloadError({
+          code: SessionPayloadErrorCode.INVALID_SESSION,
+          reason: "Constructor did not confirm reserved session capabilities",
+        });
+      }
+      this.requests.set(ticket, {
+        request,
+        state: "active",
+        reserved: true,
+        lease:
+          result.orderGenerationVersion === 1
+            ? {generation: "", validUntil: 0, validUntilUnixMs: 0, ready: false}
+            : undefined,
+      });
+      if (signal.aborted) throw new ErrorAborted();
+      return {sourceId: this.id, fork: request.fork, payloadId: ticket};
+    } catch (error) {
+      if (request.requireUnleased && error instanceof ErrorJsonRpcResponse) {
+        const rejection = error.response.error;
+        if (
+          rejection.code === -32601 ||
+          ["MethodNotSupported", "UnknownMethod", "MethodNotFound", "AlternateLeasesUnsupported"].includes(
+            rejection.message
+          )
+        )
+          disabledReason = "unsupported_alternate_method";
+      }
+      if (disabledReason !== undefined) {
+        this.alternatesDisabled = true;
+        this.warnAlternatesDisabled(request, signal, disabledReason, method);
+      }
+      if (ticket !== undefined) {
+        const entry: SessionEntry = this.requests.get(ticket) ?? {request, state: "uncertain", reserved: true};
+        entry.state = "uncertain";
+        this.requests.set(ticket, entry);
+        try {
+          this.options.logger?.warn("Constructor begin awaiting confirmed cancellation", {
+            code: "SESSION_PAYLOAD_BEGIN_UNCERTAIN",
+            slot: request.payloadAttributes.slotNumber,
+            sessionId: ticket,
+            callerAborted: signal.aborted,
+          });
+        } catch {
+          // Diagnostic failures cannot change ticket ownership.
+        }
+      }
+      throw error;
+    } finally {
+      this.preparing--;
+      if (ticket !== undefined && this.requests.get(ticket)?.state === "uncertain") {
+        void this.reconcileResources(AbortSignal.timeout(6000)).catch(() => {});
+      }
+    }
   }
 
   async getPayload(handle: BuildHandle, signal: AbortSignal): Promise<BuiltPayload> {
@@ -315,7 +476,7 @@ export class SessionPayloadSource implements PayloadSource {
 
   async release(handle: BuildHandle, signal: AbortSignal): Promise<void> {
     const entry = this.requests.get(handle.payloadId);
-    if (!this.supportsBoundedAlternates) {
+    if (!this.tracksSessions) {
       if (entry?.lease) entry.lease.ready = false;
       this.requests.delete(handle.payloadId);
       await this.rpc(signal).fetch({method: "zbuilder_endV1", params: [handle.payloadId]});
@@ -327,7 +488,24 @@ export class SessionPayloadSource implements PayloadSource {
     if (entry.release) return entry.release;
     entry.state = "releasing";
     entry.release = Promise.resolve()
-      .then(() => this.rpc(signal).fetch({method: "zbuilder_endV1", params: [handle.payloadId]}))
+      .then(async () => {
+        if (!entry.reserved) return this.rpc(signal).fetch({method: "zbuilder_endV1", params: [handle.payloadId]});
+        const cleanup = AbortSignal.any([signal, AbortSignal.timeout(6000)]);
+        while (true) {
+          cleanup.throwIfAborted();
+          const result = await this.rpc(cleanup).fetch<{released: boolean; beginReservationVersion: number}>({
+            method: "zbuilder_cancelBeginV1",
+            params: [handle.payloadId],
+          });
+          if (result?.beginReservationVersion !== 1 || typeof result.released !== "boolean")
+            throw new SessionPayloadError({
+              code: SessionPayloadErrorCode.RELEASE_UNCONFIRMED,
+              reason: handle.payloadId,
+            });
+          if (result.released) return true;
+          await sleep(100, cleanup);
+        }
+      })
       .then((result) => {
         if (result !== true)
           throw new SessionPayloadError({code: SessionPayloadErrorCode.RELEASE_UNCONFIRMED, reason: handle.payloadId});
@@ -335,6 +513,7 @@ export class SessionPayloadSource implements PayloadSource {
       })
       .catch((error: unknown) => {
         if (
+          !entry.reserved &&
           error instanceof ErrorJsonRpcResponse &&
           error.response.error.code === -32000 &&
           error.response.error.message === "UnknownSession" &&
