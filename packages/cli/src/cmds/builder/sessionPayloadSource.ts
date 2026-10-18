@@ -23,6 +23,9 @@ import {ErrorAborted, LodestarError, isFetchError, toHex, withTimeout} from "@lo
 type Rpc = Pick<JsonRpcHttpClient, "fetch">;
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
 type LeasedResponse = {generation: string; leaseMs: number; ready: boolean; payload: PayloadResponse | null};
+// Native operations allow up to 15s; retain the reply through bounded failure
+// cleanup too. The orchestrator's build deadline still detaches independently.
+const BEGIN_RPC_TIMEOUT_MS = 20_000;
 
 export enum SessionPayloadErrorCode {
   INVALID_SESSION = "SESSION_PAYLOAD_INVALID_SESSION",
@@ -134,13 +137,15 @@ export class SessionPayloadSource implements PayloadSource {
         code: SessionPayloadErrorCode.CAPACITY,
         reason: "Constructor resources occupied",
       });
-    const beginRpc = this.rpc(bounded ? AbortSignal.timeout(6000) : signal);
+    const beginRpc = this.rpc(bounded ? AbortSignal.timeout(BEGIN_RPC_TIMEOUT_MS) : signal);
     if (bounded) this.preparing++;
     let result: {sessionId: string; orderGenerationVersion?: number; alternateSessionVersion?: number};
     try {
       // Cancelling the build must not discard a late allocation handle. Keep
       // one bounded request alive, then end any handle the caller no longer owns.
-      result = await beginRpc.fetch<typeof result, typeof call.params>(call);
+      result = bounded
+        ? await beginRpc.fetch<typeof result, typeof call.params>(call, {timeout: BEGIN_RPC_TIMEOUT_MS})
+        : await beginRpc.fetch<typeof result, typeof call.params>(call);
     } catch (error) {
       if (bounded) {
         const rejection = error instanceof ErrorJsonRpcResponse ? error.response.error : undefined;

@@ -438,10 +438,13 @@ describe("SessionPayloadSource", () => {
       fetch.mockImplementationOnce(() => alternate.promise);
       const preparingAlternate = source.prepare({...request, requireUnleased: true}, signal);
       expect(source.getResources()).toMatchObject({preparing: 1, active: 1, uncertain: 0});
-      expect(fetch).toHaveBeenLastCalledWith({
-        method: "zbuilder_beginAlternateV1",
-        params: [request.forkchoiceState.headBlockHash, serializePayloadAttributes(request.payloadAttributes)],
-      });
+      expect(fetch).toHaveBeenLastCalledWith(
+        {
+          method: "zbuilder_beginAlternateV1",
+          params: [request.forkchoiceState.headBlockHash, serializePayloadAttributes(request.payloadAttributes)],
+        },
+        {timeout: 20_000}
+      );
       await expect(source.prepare(request, signal)).rejects.toMatchObject(errorCode(SessionPayloadErrorCode.CAPACITY));
       alternate.resolve({sessionId: "alternate", orderGenerationVersion: 0, alternateSessionVersion: 1});
       await preparingAlternate;
@@ -866,6 +869,73 @@ describe("SessionPayloadSource", () => {
       }
     });
 
+    it("keeps cancelled begin ownership beyond native operation time and overrides the factory timeout", async () => {
+      vi.useFakeTimers();
+      const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new DOMException("timeout", "TimeoutError")), milliseconds);
+        return controller.signal;
+      });
+      try {
+        const rpc = new JsonRpcHttpClient(["http://127.0.0.1:1"], {timeout: 8000});
+        const fetch = vi.spyOn(rpc, "fetch");
+        const signals: AbortSignal[] = [];
+        const source = new SessionPayloadSource(
+          "session",
+          (signal) => {
+            signals.push(signal);
+            return rpc;
+          },
+          {boundedAlternates: true}
+        );
+        const request = buildRequest();
+        const controller = new AbortController();
+        const ended = defer<boolean>();
+        fetch
+          .mockImplementationOnce((_call, opts) => {
+            expect(opts).toEqual({timeout: 20_000});
+            const callSignal = signals[0];
+            return new Promise((resolve, reject) => {
+              const reply = setTimeout(() => resolve({sessionId: "late-native-result"}), 16_000);
+              callSignal.addEventListener(
+                "abort",
+                () => {
+                  clearTimeout(reply);
+                  reject(new FetchError("http://constructor", callSignal.reason));
+                },
+                {once: true}
+              );
+            });
+          })
+          .mockImplementationOnce(() => ended.promise);
+        const preparing = source.prepare(request, controller.signal);
+        const cancelled = expect(preparing).rejects.toBeInstanceOf(ErrorAborted);
+        controller.abort();
+        await vi.advanceTimersByTimeAsync(6001);
+        expect(signals[0].aborted).toBe(false);
+        expect(source.getResources()).toMatchObject({preparing: 1, active: 0, uncertain: 0});
+        await vi.advanceTimersByTimeAsync(9000);
+        expect(signals[0].aborted).toBe(false);
+        expect(source.getResources()).toMatchObject({preparing: 1, active: 0, uncertain: 0});
+        await vi.advanceTimersByTimeAsync(999);
+        expect(source.getResources()).toMatchObject({preparing: 0, active: 0, releasing: 1, uncertain: 0});
+        expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_endV1", params: ["late-native-result"]});
+        expect(timeout.mock.calls.map(([milliseconds]) => milliseconds)).toEqual([20_000, 6000]);
+        ended.resolve(true);
+        await cancelled;
+        expect(source.getResources()).toMatchObject({
+          preparing: 0,
+          active: 0,
+          releasing: 0,
+          uncertain: 0,
+          alternatesDisabled: false,
+        });
+      } finally {
+        timeout.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
     it.each(["unsupported", "lost-response"])("tracks real HTTP alternate begin outcome: %s", async (fault) => {
       const request = buildRequest();
       const controller = new AbortController();
@@ -879,6 +949,7 @@ describe("SessionPayloadSource", () => {
           // The constructor received a non-idempotent allocation request.
           // Losing its reply cannot prove whether allocation took place.
           controller.abort();
+          req.socket.destroy();
           return;
         }
         res.setHeader("content-type", "application/json");
