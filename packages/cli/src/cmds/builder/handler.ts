@@ -40,6 +40,7 @@ import {SessionPayloadSource} from "./sessionPayloadSource.js";
 import {TestingPayloadSource} from "./testingPayloadSource.js";
 
 const ZERO_ADDRESS = "0x" + "0".repeat(40);
+const FORK_TRANSITION_SNAPSHOT_MARGIN_MS = 300;
 
 export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promise<void> {
   const {config, network} = getBeaconConfigFromArgs(args);
@@ -58,6 +59,14 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     (!constructorUrl || !Number.isSafeInteger(engineUntilSlot) || engineUntilSlot < 0)
   ) {
     throw new YargsError("--payload.engineUntilSlot requires --payload.constructorUrl and a non-negative safe slot");
+  }
+  if (
+    engineUntilSlot !== undefined &&
+    (!Number.isSafeInteger(args["bidding.deadlineBps"]) ||
+      args["bidding.deadlineBps"] <= 0 ||
+      args["bidding.deadlineBps"] > 10000)
+  ) {
+    throw new YargsError("--payload.engineUntilSlot requires --bidding.deadlineBps between 1 and 10000");
   }
   if (constructorUrl && (transactionsFile || testingUrl || args["payload.outputDir"])) {
     throw new YargsError("--payload.constructorUrl cannot be combined with controlled transaction file options");
@@ -230,7 +239,9 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
         payloadSource,
         createEngineSource(),
         engineUntilSlot,
-        config.SLOT_DURATION_MS - config.getSlotComponentDurationMs(args["bidding.deadlineBps"]) + 300
+        config.SLOT_DURATION_MS -
+          config.getSlotComponentDurationMs(args["bidding.deadlineBps"]) +
+          FORK_TRANSITION_SNAPSHOT_MARGIN_MS
       );
       logger.info("Execution client builds through the configured fork transition slot", {engineUntilSlot});
     }

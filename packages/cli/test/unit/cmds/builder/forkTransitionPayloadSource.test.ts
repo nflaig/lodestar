@@ -240,6 +240,7 @@ describe("ForkTransitionPayloadSource", () => {
     });
     await vi.advanceTimersByTimeAsync(900 + config.getSlotComponentDurationMs(2100));
     await bidding;
+    expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
     expect(engine.getPayload).toHaveBeenCalledOnce();
     expect(engine.release).toHaveBeenCalledOnce();
     expect(sessions.prepare).not.toHaveBeenCalled();

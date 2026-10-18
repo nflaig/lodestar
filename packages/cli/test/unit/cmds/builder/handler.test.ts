@@ -158,6 +158,20 @@ describe("cmds / builder / args handler", () => {
     ).rejects.toThrow("--payload.engineUntilSlot requires --payload.constructorUrl");
   });
 
+  it.each([undefined, NaN, Infinity, -1, 0, 0.5, 10001])(
+    "rejects invalid Engine snapshot deadlines %s before loading keys",
+    async (deadline) => {
+      await expect(
+        runBuilderHandler({
+          "params.GLOAS_FORK_EPOCH": "0",
+          "payload.constructorUrl": "http://127.0.0.1:8547",
+          "payload.engineUntilSlot": 4_235_264,
+          "bidding.deadlineBps": deadline,
+        })
+      ).rejects.toThrow("--payload.engineUntilSlot requires --bidding.deadlineBps between 1 and 10000");
+    }
+  );
+
   it("rejects alternate branches without a session source and updates", async () => {
     await expect(
       runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateBranches": true})
