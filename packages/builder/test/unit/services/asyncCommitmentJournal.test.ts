@@ -35,6 +35,26 @@ function setup() {
 }
 
 describe("AsyncCommitmentJournal", () => {
+  it("admits alternate retention only while the initialized journal is idle", async () => {
+    const thread = new Thread();
+    const journal = new AsyncCommitmentJournal(thread);
+    expect(journal.canRetainAlternate()).toBe(false);
+    thread.emit("message", {id: 0});
+    expect(journal.canRetainAlternate()).toBe(true);
+    const {bid, stored} = setup();
+    const offer = journal.retain(bid, stored);
+    expect(journal.canRetainAlternate()).toBe(false);
+    const queued = journal.prune(2);
+    thread.finish();
+    await offer;
+    expect(journal.canRetainAlternate()).toBe(false);
+    thread.finish();
+    await queued;
+    expect(journal.canRetainAlternate()).toBe(true);
+    await journal.close();
+    expect(journal.canRetainAlternate()).toBe(false);
+  });
+
   it("falls back to the retained snapshot only when reference linking is unavailable", async () => {
     const {thread, journal, bid, stored} = setup();
     const reference = {

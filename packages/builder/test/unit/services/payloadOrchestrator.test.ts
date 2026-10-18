@@ -15,6 +15,7 @@ import {
   type PayloadSource,
   PayloadSourceError,
   PayloadSourceErrorCode,
+  type PayloadSourceResources,
 } from "../../../src/services/payloadSource.js";
 
 const NOW = 1_000;
@@ -86,6 +87,175 @@ describe("PayloadOrchestrator", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("refuses alternate jobs on an ordinary source before preparing", async () => {
+    const source = new StubPayloadSource();
+    const job = buildJob();
+    job.request.requireUnleased = true;
+    const orchestrator = createOrchestrator(source);
+    await expect(orchestrator.run(job)).rejects.toMatchObject({
+      type: {code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED},
+    });
+    await expect(orchestrator.runSnapshot(job, async () => {})).rejects.toMatchObject({
+      type: {code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED},
+    });
+    expect(source.prepareCalls).toHaveLength(0);
+  });
+
+  it("requires explicit alternate intent even on a capable source", async () => {
+    const source = Object.assign(new StubPayloadSource(), {supportsBoundedAlternates: true});
+    await expect(createOrchestrator(source).runSnapshot(buildJob(), async () => {})).rejects.toMatchObject({
+      type: {code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED},
+    });
+    expect(source.prepareCalls).toHaveLength(0);
+  });
+
+  it("does not deliver a read that finishes after alternate cancellation", async () => {
+    const source = Object.assign(new StubPayloadSource(), {
+      supportsBoundedAlternates: true,
+      release: vi.fn(async () => {}),
+    });
+    const pending = defer<BuiltPayload>();
+    source.getPayloadImpl = () => pending.promise;
+    const controller = new AbortController();
+    const job = buildJob("alternate");
+    job.request.requireUnleased = true;
+    const onPayload = vi.fn(async () => {});
+    const result = createOrchestrator(source).runSnapshot(job, onPayload, controller.signal);
+    const rejected = expect(result).rejects.toBeInstanceOf(ErrorAborted);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(source.getPayloadCalls).toHaveLength(1);
+    controller.abort();
+    await rejected;
+    pending.resolve(builtPayload());
+    await vi.advanceTimersByTimeAsync(1);
+    expect(onPayload).not.toHaveBeenCalled();
+    expect(source.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("never retries an alternate begin after a transport error", async () => {
+    const source = Object.assign(new StubPayloadSource(), {supportsBoundedAlternates: true});
+    source.prepareImpl = async () => {
+      throw new Error("unknown begin outcome");
+    };
+    const job = buildJob("alternate", NOW + 500);
+    job.request.requireUnleased = true;
+    await expect(createOrchestrator(source).runSnapshot(job, async () => {})).rejects.toThrow("unknown begin outcome");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(source.prepareCalls).toHaveLength(1);
+  });
+
+  it("publishes a single alternate before cleanup, while keeping physical resources occupied", async () => {
+    const cleanup = defer<void>();
+    const resources: PayloadSourceResources = {
+      capacity: 2,
+      preparing: 0,
+      active: 2,
+      releasing: 0,
+      uncertain: 0,
+      alternatesDisabled: false,
+    };
+    const source = Object.assign(new StubPayloadSource(), {
+      supportsBoundedAlternates: true,
+      getResources: () => ({...resources}),
+      release: vi.fn(async () => {
+        resources.active--;
+        resources.releasing++;
+        await cleanup.promise;
+        resources.releasing--;
+      }),
+    });
+    const orchestrator = createOrchestrator(source);
+    const job = buildJob("alternate");
+    job.request.requireUnleased = true;
+    const offered = vi.fn(async () => {});
+    const result = orchestrator.runSnapshot(job, offered);
+    expect(orchestrator.runSnapshot(job, offered)).toBe(result);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(offered).toHaveBeenCalledExactlyOnceWith(builtPayload());
+    expect(orchestrator.getResources()).toMatchObject({active: 1, releasing: 1});
+    expect(source.release).toHaveBeenCalledTimes(1);
+    cleanup.resolve();
+    await result;
+    expect(orchestrator.getResources()).toMatchObject({active: 1, releasing: 0});
+  });
+
+  it("keeps failed release uncertainty visible after the alternate callback succeeds", async () => {
+    const resources: PayloadSourceResources = {
+      capacity: 2,
+      preparing: 0,
+      active: 2,
+      releasing: 0,
+      uncertain: 0,
+      alternatesDisabled: false,
+    };
+    const source = Object.assign(new StubPayloadSource(), {
+      supportsBoundedAlternates: true,
+      getResources: () => ({...resources}),
+      release: async () => {
+        resources.active--;
+        resources.uncertain++;
+        throw new Error("end unconfirmed");
+      },
+      reconcileResources: vi.fn(async (signal: AbortSignal) => {
+        signal.throwIfAborted();
+        resources.uncertain--;
+      }),
+    });
+    const orchestrator = createOrchestrator(source);
+    const job = buildJob("alternate");
+    job.request.requireUnleased = true;
+    const offered = vi.fn(async () => {});
+    const result = orchestrator.runSnapshot(job, offered);
+    await vi.advanceTimersByTimeAsync(100);
+    await result;
+    expect(offered).toHaveBeenCalledTimes(1);
+    expect(orchestrator.getResources()).toMatchObject({active: 1, uncertain: 1});
+    await orchestrator.reconcileResources();
+    expect(source.reconcileResources).toHaveBeenCalledTimes(1);
+    expect(orchestrator.getResources()).toMatchObject({active: 1, uncertain: 0});
+  });
+
+  it("refuses a leased alternate before invoking its callback and releases it", async () => {
+    const source = Object.assign(new StubPayloadSource(), {
+      supportsBoundedAlternates: true,
+      release: vi.fn(async () => {}),
+    });
+    source.getPayloadImpl = async () => ({
+      ...builtPayload(),
+      offerEligibility: {
+        generation: "0x0",
+        lease: {generation: "0x0", ready: true, validUntil: Infinity, validUntilUnixMs: Infinity},
+      },
+    });
+    const job = buildJob("alternate");
+    job.request.requireUnleased = true;
+    const offered = vi.fn(async () => {});
+    const result = createOrchestrator(source).runSnapshot(job, offered);
+    const rejected = expect(result).rejects.toMatchObject({
+      type: {code: PayloadOrchestratorErrorCode.LEASED_PAYLOAD_REQUIRES_UPDATES},
+    });
+    await vi.advanceTimersByTimeAsync(100);
+    await rejected;
+    expect(offered).not.toHaveBeenCalled();
+    expect(source.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases an alternate after a failed durable callback", async () => {
+    const source = Object.assign(new StubPayloadSource(), {
+      supportsBoundedAlternates: true,
+      release: vi.fn(async () => {}),
+    });
+    const job = buildJob("alternate");
+    job.request.requireUnleased = true;
+    const result = createOrchestrator(source).runSnapshot(job, async () => {
+      throw new Error("durability failed");
+    });
+    const rejected = expect(result).rejects.toThrow("durability failed");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejected;
+    expect(source.release).toHaveBeenCalledTimes(1);
   });
 
   it("prepares immediately and retrieves at the requested time", async () => {

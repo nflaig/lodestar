@@ -110,6 +110,59 @@ using the best ready bid at `bidding.deadlineBps` in the preceding slot. API pol
 continues until `updateCutoffBps` of the proposal slot; 1000 is 1.2 seconds into a
 12-second slot. Parent changes cancel construction without deleting old commitments.
 
+## Experimental alternate parent bids
+
+The builder can retain an API and stream bid for additional parent tuples using the
+same builder identity. Enable this on the beacon node:
+
+```sh
+--chain.emitPayloadAttributes true \
+--chain.emitPayloadAttributesAlternates true \
+--chain.payloadAttributesAlternateBuilderIndices 0
+```
+
+Replace `0` with the primary builder's registered index. On the builder, keep session
+updates enabled and add `--bidding.alternateBranches true`. The constructor must
+support `zbuilder_beginAlternateV1(parentHash, payloadAttributes, extraData?)`, returning
+`{sessionId, orderGenerationVersion: 0, alternateSessionVersion: 1}`. This method rejects
+renewable order-generation leases before allocating a session. Older constructors
+cannot silently accept this request as ordinary session work.
+
+The existing `payload_attributes` event carries alternate tuples in an optional
+`context` object containing `role: "alternate"`, `dependent_root`, and `builders`.
+Ordinary events have no context and keep their existing wire format. No additional
+event topic or subscription is required. Alternate tuples cover the current beacon
+head and its direct parent, each with available FULL and EMPTY variants. EMPTY excludes the
+parent execution payload; the new block can still contain transactions. Each context
+uses its own prepared state, withdrawals and execution requests. The event includes
+the proposer dependent root and branch-specific identity/collateral metadata for at
+most 16 configured builder indices. A differing proposer or dependent root, a missing
+cached state, or missing/ineligible builder metadata causes that alternate to be skipped.
+Enable beacon emission only on a dedicated builder endpoint whose subscribers all
+understand the context extension. An older subscriber can ignore unknown metadata
+and treat every alternate as its new primary. Upgrade the publisher first, then
+enable alternate emission on the beacon node.
+
+Keep `chain.fastConfirmation` disabled (the default). Alternate events are suppressed
+with fast confirmation because its safe execution hash can be ahead of an alternate parent.
+
+Alternates start only after an unleased primary snapshot is retained. One spare native
+worker produces one alternate snapshot at a time, with at most four attempts per slot.
+`--bidding.alternateBuildDurationMs` defaults to 500 ms and accepts 250 through 1000 ms.
+Construction stops for a new primary and does not start near scheduled gossip or too
+late to finish before the slot. An unpublished alternate preempted by a primary change
+may retry once for the same slot, proposer and dependent root. The retry counts toward
+the four-attempt limit and waits for confirmed cleanup and a retained primary bid.
+Cleanup continues to occupy capacity until the native
+constructor confirms it; an unknown allocation outcome disables further alternates.
+Half of the revision, payload-byte and payload-count admission limits remains reserved
+for primary work. Alternates enter the durable journal only while it is idle.
+
+This initial mode publishes alternate bids through HTTP and WebSocket only. Primary
+and staged gossip behavior is unchanged. Previously advertised payloads remain retained
+for reveal when a new primary replaces their branch. The work limits can omit contexts;
+enabling this option does not guarantee a bid for every possible parent.
+
 The default update interval is zero, retaining one retrieval at the usual deadline.
 Positive intervals require this constructor source and must be at least 25 ms. This
 source cannot be combined with the controlled transaction-file source or its capture
@@ -215,6 +268,58 @@ generations. Attempts authorized before a fence can arrive after its acknowledge
 because of scheduling or network delay. Cancellation does not retract delivered bids, remove
 independently authorized copies, or fence copied processes on other hosts. Arbitrary
 VM snapshot rollback and clock restoration are outside the lease assumptions.
+
+## Experimental Gloas bid streaming
+
+Enable `--builderApi --builderApi.bidStream` to serve the WebSocket extension used by
+[Commit-Boost v0.12.0-rc1](https://github.com/Commit-Boost/commit-boost-client/releases/tag/v0.12.0-rc1)
+and [Helix PR #670](https://github.com/gattaca-com/helix/pull/670). This is an experimental
+extension, not a replacement for the standard HTTP builder API. The normal POST bid,
+preferences and signed-block routes remain available.
+
+```text
+GET /eth/v1/builder/execution_payload_bid_stream/{slot}/{parent_hash}/{parent_root}/{proposer_pubkey}
+Eth-Consensus-Version: gloas
+Date-Milliseconds: <request send time in Unix milliseconds>
+X-Timeout-Ms: <total request timeout in milliseconds>
+X-Request-Auth: <standard padded base64 of SSZ SignedBuilderRequestAuth>
+```
+
+The upgrade authenticates the proposer, slot and agreed auth data exactly as HTTP does.
+With `--builderApi.publicUrl https://builder-plataberget.nflaig.dev`, the proposer's
+`auth_data` is the UTF-8 hostname `builder-plataberget.nflaig.dev`, unless
+`--builderApi.authData` overrides it. The JSON auth object is not sent in this header;
+serialize it as SSZ before base64 encoding. A successful upgrade sends binary messages:
+byte `0x01` (frame version), byte `0x07` (Gloas), then SSZ `SignedExecutionPayloadBid`.
+Clients must retain the latest valid message, including a lower replacement after an
+order-generation change.
+
+For Commit-Boost, set `get_header = "stream"` on the existing builder relay entry:
+
+```toml
+[[relays]]
+id = "plataberget-builder"
+url = "https://<registered-builder-pubkey>@builder-plataberget.nflaig.dev"
+get_header = "stream"
+```
+
+Use the actual registered builder key and the appropriate network configuration.
+Commit-Boost opens one stream per bid request and can fall back to HTTP if the upgrade
+fails. A repeated proposer request opens a new stream and can return a newer bid.
+
+The stream sends an eligible retained bid immediately, then updates after durable
+retention. It reserves the same transit and 50 ms response margin as HTTP and closes
+before the caller's deadline. Ping/pong RTT is logged for diagnosis; it does not change
+that margin or assume symmetric network latency. There are at most 64 pending or open
+streams, four per authenticated proposer, one write in flight and one coalesced update indication per
+connection. A 25 ms local eligibility check observes lease renewal without fetching or
+building a payload. Client data frames are rejected; compression is disabled. A peer
+that does not complete close is terminated after 100 ms.
+
+Every send rechecks current offer permission after serialization. Previously sent bids
+remain durably retained for reveal. Closing a stream, cancellation, or a newer message
+does not withdraw a bid already delivered to a proposer. Streaming does not enable
+constructor order generations or alter gossip identities, pricing or construction timing.
 
 ## Staged P2P bids
 

@@ -11,6 +11,7 @@ export class BidStore {
   private readonly revisions = new Map<RootHex, gloas.SignedExecutionPayloadBid>();
   private readonly eligibility = new Map<RootHex, OfferEligibility>();
   private readonly bySlotAndParent = new Map<string, Map<RootHex, gloas.SignedExecutionPayloadBid>>();
+  private readonly subscribers = new Map<string, Set<() => void>>();
 
   add(signedBid: gloas.SignedExecutionPayloadBid, eligibility?: OfferEligibility | "recovery"): void {
     const {slot, parentBlockHash, parentBlockRoot} = signedBid.message;
@@ -29,6 +30,29 @@ export class BidStore {
       this.bySlotAndParent.set(key, revisions);
     }
     revisions.set(root, signedBid);
+    const subscribers = this.subscribers.get(key);
+    for (const notify of subscribers ?? []) {
+      try {
+        notify();
+      } catch {
+        // A failed observer must never interrupt retention or gossip publication.
+        subscribers?.delete(notify);
+      }
+    }
+  }
+
+  subscribe(slot: Slot, parentBlockHash: RootHex, parentBlockRoot: RootHex, notify: () => void): () => void {
+    const key = getKey(slot, parentBlockHash, parentBlockRoot);
+    let subscribers = this.subscribers.get(key);
+    if (!subscribers) {
+      subscribers = new Set();
+      this.subscribers.set(key, subscribers);
+    }
+    subscribers.add(notify);
+    return () => {
+      subscribers.delete(notify);
+      if (subscribers.size === 0 && this.subscribers.get(key) === subscribers) this.subscribers.delete(key);
+    };
   }
 
   get(slot: Slot, parentBlockHash: RootHex, parentBlockRoot: RootHex): gloas.SignedExecutionPayloadBid | null {
