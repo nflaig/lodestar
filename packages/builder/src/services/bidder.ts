@@ -3,7 +3,16 @@ import {ChainForkConfig} from "@lodestar/config";
 import {ForkName, MIN_DEPOSIT_AMOUNT, isForkPostGloas} from "@lodestar/params";
 import {IClock, computeEpochAtSlot} from "@lodestar/state-transition";
 import {BLSPubkey, BuilderIndex, BuilderStatus, ExecutionAddress, RootHex, gloas} from "@lodestar/types";
-import {Logger, isErrorAborted, prettyGweiToEth, sleep, toHex, toRootHex} from "@lodestar/utils";
+import {
+  Logger,
+  TimeoutError,
+  isErrorAborted,
+  prettyGweiToEth,
+  sleep,
+  toHex,
+  toRootHex,
+  withTimeout,
+} from "@lodestar/utils";
 import {BidResult, Metrics} from "../metrics.js";
 import {getAlternateBuilderBidLimit} from "./alternateBuilderEligibility.js";
 import {BidLedger, BidLedgerError, BidLedgerErrorCode} from "./bidLedger.js";
@@ -28,6 +37,8 @@ const ALTERNATE_RETENTION_BUDGET_MS = 150;
 const ALTERNATE_JOURNAL_RECHECK_MS = 10;
 const ALTERNATE_JOURNAL_RECHECK_HEADROOM_MS = 100;
 const ALTERNATE_REFRESH_PRIMARY_MARGIN_MS = 100;
+const STAGED_GOSSIP_REFRESH_MARGIN_MS = 10;
+const STAGED_GOSSIP_REFRESH_MAX_MS = 25;
 
 type AlternateDiagnosticReason =
   | "received"
@@ -890,29 +901,53 @@ export class Bidder {
           const stageStarted = performance.now();
           const timerLatenessMs = Date.now() - stageTime(stage.deadlineBps);
           const expires = index + 1 < stages.length ? stageTime(stages[index + 1].deadlineBps) : until;
+          const logSkipped = (
+            reason: string,
+            preparation?: {
+              initialPrepareMs: number;
+              refreshAttempted: boolean;
+              refreshTimedOut: boolean;
+              refreshMs: number;
+            }
+          ): void =>
+            logger.info("Skipped staged execution payload bid", {
+              code: "BUILDER_STAGED_GOSSIP_SKIPPED",
+              slot,
+              parentBlockHash,
+              parentBlockRoot,
+              builderIndex: stage.builderIndex,
+              reason,
+              phase: preparation ? "after_preparation" : "before_preparation",
+              refreshAttempted: false,
+              ...preparation,
+            });
           if (
             signal.aborted ||
             this.opts.dryRun ||
-            publicationPending ||
             stagesStartedAt >= stageTime(stage.deadlineBps) ||
             Date.now() >= expires ||
             !best ||
             !this.modules.bidStore.canOffer(best)
           )
             return;
+          if (publicationPending) {
+            logSkipped("publication_pending");
+            return;
+          }
           if (stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)) return;
-          const stored = this.modules.payloadStore.get(toRootHex(best.message.blockHash));
+          const initialBest = best;
+          const stored = this.modules.payloadStore.get(toRootHex(initialBest.message.blockHash));
           if (!stored) return;
           publicationPending = true;
           try {
             const minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
-            const signed = await this.bidOnPayload(
+            let signed = await this.bidOnPayload(
               {
                 ...stored.payload,
                 fork: ForkName.gloas,
                 // The same immutable hash can be re-admitted in a new order
                 // generation. Its durable snapshot may carry an older lease.
-                offerEligibility: this.modules.bidStore.getOfferEligibility(best),
+                offerEligibility: this.modules.bidStore.getOfferEligibility(initialBest),
               },
               data,
               feeRecipient,
@@ -921,15 +956,95 @@ export class Bidder {
               stage,
               minimum - 1
             );
+            const initialPrepareMs = performance.now() - stageStarted;
             // Persistence may finish after a parent switch, shutdown, or this stage's window.
-            if (
-              !signed ||
-              signal.aborted ||
-              Date.now() >= expires ||
-              signed.message.value <= highestAttemptedValue ||
-              !stage.bidStore.canOffer(signed)
-            )
+            if (!signed || signal.aborted || Date.now() >= expires || signed.message.value <= highestAttemptedValue) {
+              logSkipped(
+                !signed
+                  ? "no_prepared_bid"
+                  : signal.aborted
+                    ? "aborted"
+                    : Date.now() >= expires
+                      ? "stage_expired"
+                      : "value_not_increased",
+                {initialPrepareMs, refreshAttempted: false, refreshTimedOut: false, refreshMs: 0}
+              );
               return;
+            }
+            let refreshAttempted = false;
+            let refreshMs = 0;
+            let refreshTimedOut = false;
+            const refreshBudgetMs = Math.min(
+              STAGED_GOSSIP_REFRESH_MAX_MS,
+              expires - Date.now() - STAGED_GOSSIP_REFRESH_MARGIN_MS
+            );
+            const refreshBest = best;
+            // The first signature stays revealable. Recheck once before the first gossip,
+            // allowing another observed retention duration plus a scheduling margin.
+            if (
+              refreshBest.message.value > initialBest.message.value &&
+              this.modules.bidStore.canOffer(refreshBest) &&
+              refreshBudgetMs > 0 &&
+              refreshBudgetMs >= initialPrepareMs
+            ) {
+              const refreshedPayload = this.modules.payloadStore.get(toRootHex(refreshBest.message.blockHash));
+              if (refreshedPayload) {
+                refreshAttempted = true;
+                const refreshStarted = performance.now();
+                try {
+                  const minimumRefreshValue = signed.message.value;
+                  const refreshed = await withTimeout(
+                    (refreshSignal = signal) =>
+                      this.bidOnPayload(
+                        {
+                          ...refreshedPayload.payload,
+                          fork: ForkName.gloas,
+                          offerEligibility: this.modules.bidStore.getOfferEligibility(refreshBest),
+                        },
+                        data,
+                        feeRecipient,
+                        refreshSignal,
+                        true,
+                        stage,
+                        minimumRefreshValue
+                      ),
+                    refreshBudgetMs,
+                    signal
+                  );
+                  if (refreshed) signed = refreshed;
+                } catch (error) {
+                  // A failed acknowledgement may still leave a durable new signature.
+                  // Do not retry it; only the earlier confirmed commitment can be offered.
+                  refreshTimedOut = error instanceof TimeoutError;
+                  if (!refreshTimedOut && !isErrorAborted(error) && !signal.aborted)
+                    logger.warn(
+                      "Failed to refresh staged execution payload bid",
+                      {slot, parentBlockHash, parentBlockRoot, builderIndex: stage.builderIndex},
+                      error as Error
+                    );
+                } finally {
+                  refreshMs = performance.now() - refreshStarted;
+                }
+              }
+            }
+            const skipped = signal.aborted
+              ? "aborted"
+              : Date.now() >= expires
+                ? "stage_expired"
+                : signed.message.value <= highestAttemptedValue
+                  ? "value_not_increased"
+                  : !stage.bidStore.canOffer(signed)
+                    ? "offer_ineligible"
+                    : null;
+            if (skipped) {
+              logSkipped(skipped, {
+                refreshAttempted,
+                refreshTimedOut,
+                initialPrepareMs,
+                refreshMs,
+              });
+              return;
+            }
             highestAttemptedValue = signed.message.value;
             const preparedAt = performance.now();
             await stage.bidPublisher.gossip(signed, signal, stage.bidStore.getOfferEligibility(signed));
@@ -943,6 +1058,10 @@ export class Bidder {
               builderIndex: stage.builderIndex,
               value: prettyGweiToEth(signed.message.value),
               timerLatenessMs,
+              initialPrepareMs,
+              refreshAttempted,
+              refreshTimedOut,
+              refreshMs,
               prepareMs: preparedAt - stageStarted,
               publishMs: publishedAt - preparedAt,
             });

@@ -480,6 +480,26 @@ have a higher bid. API requests continue to return revisions signed by the prima
 If the primary's balance caps its API revisions, this also limits the staged snapshot
 feed, even if an additional identity has more balance.
 
+If a richer primary revision becomes ready during a stage's durable preparation, the
+stage may prepare that newer revision once before gossip. The first preparation must
+fit within a 25 ms refresh budget, with another 10 ms left before the next stage or
+update cutoff. Slower initial preparations keep their original bid. The optional
+preparation's asynchronous wait has a timeout of at most 25 ms; a timeout or
+failure falls back to the first durable bid if it remains eligible and within the
+stage window. There is no repeated chasing or second gossip. Both signed payloads
+remain retained, including when the journal acknowledgement arrives after the timeout.
+
+Gossip logs separate `initialPrepareMs`, `refreshMs`, `refreshAttempted` and
+`refreshTimedOut` from `publishMs`. `BUILDER_STAGED_GOSSIP_SKIPPED` logs distinguish
+`publication_pending` from preparation failures, including for stages without a refresh.
+A `stage_expired` preparation skip with
+`refreshAttempted: true` counts as a lost stage during optional refresh, not a successful
+freshness improvement. The timer starts after synchronous signing and journal enqueue;
+it cannot preempt that work or a stalled event loop. The 10 ms scheduling margin does
+not guarantee completion of the beacon request. Compare gossip timing, subsequent
+stages skipped for a pending publication, and expired stages as well as newer bid value
+and the refresh-attempt rate in a canary.
+
 At most four additional identities are accepted. Their deadlines must strictly increase
 after the primary deadline and remain before `10000 + bidding.updateCutoffBps`.
 Session updates and a durable commitment directory are required. Unknown identities fail

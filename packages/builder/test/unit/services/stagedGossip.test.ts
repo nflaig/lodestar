@@ -8,10 +8,11 @@ import {getConfig} from "@lodestar/config/test-utils";
 import {ForkName} from "@lodestar/params";
 import {BuilderStatus, gloas, ssz} from "@lodestar/types";
 import {defer, toRootHex} from "@lodestar/utils";
-import {BidLedger} from "../../../src/services/bidLedger.js";
+import {BidLedger, BidLedgerErrorCode} from "../../../src/services/bidLedger.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import {CommitmentJournal} from "../../../src/services/commitmentJournal.js";
+import {CommitmentJournalError} from "../../../src/services/commitmentJournalError.js";
 import {
   GossipStage,
   assertGossipJournalsConfigured,
@@ -47,6 +48,7 @@ describe("staged P2P gossip", () => {
 
   beforeEach(() => {
     vi.useFakeTimers({now: 0});
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now());
     directory = fs.mkdtempSync(path.join(os.tmpdir(), "lodestar-staged-gossip-"));
     api = getApiClientStub();
     logger = getMockedLogger();
@@ -75,6 +77,7 @@ describe("staged P2P gossip", () => {
   afterEach(() => {
     controller.abort();
     vi.useRealTimers();
+    vi.restoreAllMocks();
     fs.rmSync(directory, {recursive: true, force: true});
   });
 
@@ -101,6 +104,7 @@ describe("staged P2P gossip", () => {
       status?: BuilderStatus;
       balance?: number;
       durable?: boolean;
+      updateIntervalMs?: number;
       retain?: (bid: gloas.SignedExecutionPayloadBid) => Promise<void>;
     } = {}
   ) {
@@ -128,7 +132,7 @@ describe("staged P2P gossip", () => {
       payloadSource: source,
       signal: controller.signal,
       index,
-      updateOptions,
+      updateOptions: {...updateOptions, updateIntervalMs: options.updateIntervalMs ?? updateOptions.updateIntervalMs},
       gossipStages,
       getBuilderStatus,
       retainCommitment:
@@ -260,6 +264,10 @@ describe("staged P2P gossip", () => {
     const building = primary.bidder.onPayloadAttributes(event());
     await vi.advanceTimersByTimeAsync(11200);
     expect(published()).toHaveLength(1);
+    expect(logger.info).toHaveBeenCalledWith(
+      "Skipped staged execution payload bid",
+      expect.objectContaining({builderIndex: 2, reason: "publication_pending", refreshAttempted: false})
+    );
     transport.resolve(mockApiResponse({}));
     await vi.advanceTimersByTimeAsync(2100);
     await building;
@@ -282,6 +290,64 @@ describe("staged P2P gossip", () => {
     expect(payloadStore.has(toRootHex(published()[1].message.blockHash))).toBe(true);
   });
 
+  it.each([false, true])(
+    "refreshes once during retention and keeps both commitments (uncertain gossip: %s)",
+    async (uncertain) => {
+      const persistence = defer<void>();
+      let retained = 0;
+      if (uncertain)
+        api.beacon.publishExecutionPayloadBid
+          .mockResolvedValueOnce(mockApiResponse({}))
+          .mockRejectedValueOnce(Error("ambiguous send"));
+      source.getPayload.mockImplementation(async () => payload(Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1));
+      const second = identity(2, [], {
+        durable: true,
+        retain: async (bid) => {
+          const stored = payloadStore.get(toRootHex(bid.message.blockHash));
+          if (!stored) throw Error("missing test payload");
+          second.journal?.retain(bid, stored);
+          if (++retained === 1) await persistence.promise;
+        },
+      });
+      const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+      second.stage.deadlineBps = 9251;
+      const primary = identity(1, [second.stage], {updateIntervalMs: 25});
+      const building = primary.bidder.onPayloadAttributes(event());
+      await vi.advanceTimersByTimeAsync(11125);
+      expect(sign).toHaveBeenCalledOnce();
+      expect(primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot))?.message.blockHash).toEqual(
+        payload(3).executionPayload.blockHash
+      );
+      persistence.resolve();
+      await vi.advanceTimersByTimeAsync(2100);
+      await building;
+
+      const staged = published().filter((bid) => bid.message.builderIndex === 2);
+      expect(staged).toHaveLength(1);
+      expect(staged[0].message.blockHash).toEqual(payload(3).executionPayload.blockHash);
+      expect(sign).toHaveBeenCalledTimes(2);
+      expect(second.ledger.getBidsForSlot(slot)).toHaveLength(2);
+      expect(second.ledger.hasSubmitted(slot, toRootHex(parentHash), toRootHex(parentRoot))).toBe(true);
+
+      const recoveredPayloads = new PayloadStore();
+      const recoveredLedger = new BidLedger();
+      const recoveredBids = new BidStore();
+      new CommitmentJournal(path.join(directory, "2"), second.journalIdentity, 1).recover(
+        1,
+        recoveredPayloads,
+        recoveredBids,
+        recoveredLedger
+      );
+      expect(recoveredLedger.getBidsForSlot(slot)).toHaveLength(2);
+      for (const revision of [2, 3]) {
+        expect(
+          recoveredPayloads.has(toRootHex(payload(revision).executionPayload.blockHash)),
+          `revision ${revision} must remain revealable`
+        ).toBe(true);
+      }
+    }
+  );
+
   it("retains but does not gossip a stage whose persistence finishes after cancellation", async () => {
     const persistence = defer<void>();
     const second = identity(2, [], {retain: () => persistence.promise});
@@ -295,6 +361,269 @@ describe("staged P2P gossip", () => {
     expect(second.ledger.getBidsForSlot(slot)).toHaveLength(1);
     expect(second.ledger.hasSubmitted(slot, toRootHex(parentHash), toRootHex(parentRoot))).toBe(false);
     expect(payloadStore.has(second.ledger.getBidsForSlot(slot)[0].blockHash)).toBe(true);
+  });
+
+  it("keeps the original after a preparation above 25 ms even with ample stage headroom", async () => {
+    const persistence = defer<void>();
+    source.getPayload.mockImplementation(async () => payload(Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1));
+    const second = identity(2, [], {retain: () => persistence.promise});
+    const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+    const primary = identity(1, [second.stage], {updateIntervalMs: 25});
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(11126);
+    expect(primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot))?.message.blockHash).toEqual(
+      payload(3).executionPayload.blockHash
+    );
+    persistence.resolve();
+    await vi.advanceTimersByTimeAsync(2100);
+    await building;
+    expect(sign).toHaveBeenCalledOnce();
+    expect(published().filter((bid) => bid.message.builderIndex === 2)).toHaveLength(1);
+    expect(published().at(-1)?.message.blockHash).toEqual(payload(2).executionPayload.blockHash);
+    expect(logger.info).toHaveBeenCalledWith(
+      "Gossiped execution payload bid",
+      expect.objectContaining({builderIndex: 2, initialPrepareMs: 26, refreshAttempted: false})
+    );
+  });
+
+  it("does not chase another revision during the single refresh", async () => {
+    const persistence = [defer<void>(), defer<void>()];
+    let retained = 0;
+    source.getPayload.mockImplementation(async () =>
+      payload(Date.now() >= 11150 ? 4 : Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1)
+    );
+    const second = identity(2, [], {retain: () => persistence[retained++]?.promise ?? Promise.resolve()});
+    second.stage.deadlineBps = 9251;
+    const primary = identity(1, [second.stage], {updateIntervalMs: 25});
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(11126);
+    persistence[0].resolve();
+    await vi.advanceTimersByTimeAsync(24);
+    expect(retained).toBe(2);
+    expect(primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot))?.message.blockHash).toEqual(
+      payload(4).executionPayload.blockHash
+    );
+    persistence[1].resolve();
+    await vi.advanceTimersByTimeAsync(2100);
+    await building;
+    expect(retained).toBe(2);
+    expect(published().filter((bid) => bid.message.builderIndex === 2)).toHaveLength(1);
+    expect(published().at(-1)?.message.blockHash).toEqual(payload(3).executionPayload.blockHash);
+  });
+
+  it("uses the retained bid when another preparation would exhaust the stage window", async () => {
+    const persistence = defer<void>();
+    source.getPayload.mockImplementation(async () => payload(Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1));
+    const second = identity(2, [], {retain: () => persistence.promise});
+    const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+    const third = identity(3);
+    third.stage.deadlineBps = 9290;
+    second.stage.deadlineBps = 9251;
+    const primary = identity(1, [second.stage, third.stage], {updateIntervalMs: 25});
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(11125);
+    persistence.resolve();
+    await vi.advanceTimersByTimeAsync(2100);
+    await building;
+    expect(sign).toHaveBeenCalledOnce();
+    expect(published().map((bid) => bid.message.builderIndex)).toEqual([1, 2, 3]);
+    expect(published()[1].message.blockHash).toEqual(payload(2).executionPayload.blockHash);
+    expect(published()[2].message.blockHash).toEqual(payload(3).executionPayload.blockHash);
+  });
+
+  it("falls back to the durable bid after an uncertain refresh without retrying or freeing its admission", async () => {
+    const persistence = defer<void>();
+    let retained = 0;
+    source.getPayload.mockImplementation(async () => payload(Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1));
+    const second = identity(2, [], {
+      durable: true,
+      retain: async (bid) => {
+        const stored = payloadStore.get(toRootHex(bid.message.blockHash));
+        if (!stored) throw Error("missing test payload");
+        second.journal?.retain(bid, stored);
+        if (++retained === 1) await persistence.promise;
+        else throw new CommitmentJournalError("COMMITMENT_WORKER_TIMEOUT", true);
+      },
+    });
+    second.stage.deadlineBps = 9251;
+    const primary = identity(1, [second.stage], {updateIntervalMs: 25});
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(11125);
+    persistence.resolve();
+    await vi.advanceTimersByTimeAsync(2100);
+    await building;
+    const staged = published().filter((bid) => bid.message.builderIndex === 2);
+    expect(staged).toHaveLength(1);
+    expect(staged[0].message.blockHash).toEqual(payload(2).executionPayload.blockHash);
+    expect(retained).toBe(2);
+    expect(second.ledger.getBidsForSlot(slot)).toHaveLength(1);
+    await expect(second.bidPublisher.prepare(staged[0].message, 2)).rejects.toMatchObject({
+      type: {code: BidLedgerErrorCode.REVISION_LIMIT},
+    });
+    const recoveredPayloads = new PayloadStore();
+    const recoveredLedger = new BidLedger();
+    new CommitmentJournal(path.join(directory, "2"), second.journalIdentity, 1).recover(
+      1,
+      recoveredPayloads,
+      new BidStore(),
+      recoveredLedger
+    );
+    expect(recoveredLedger.getBidsForSlot(slot)).toHaveLength(2);
+    for (const revision of [2, 3]) {
+      expect(
+        recoveredPayloads.has(toRootHex(payload(revision).executionPayload.blockHash)),
+        `revision ${revision} must remain revealable`
+      ).toBe(true);
+    }
+  });
+
+  it.each([
+    {reply: "acknowledged", deadlineBps: 9251, nextDeadlineBps: 9300, budget: 25},
+    {reply: "lost", deadlineBps: 9251, nextDeadlineBps: 9300, budget: 25},
+    {reply: "acknowledged", deadlineBps: 9270, nextDeadlineBps: 9290, budget: 13},
+  ])(
+    "gossips the original within the refresh budget and keeps a late signature: %j",
+    async ({reply, deadlineBps, nextDeadlineBps, budget}) => {
+      const persistence = [defer<void>(), defer<void>()];
+      let retained = 0;
+      source.getPayload.mockImplementation(async () => payload(Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1));
+      const second = identity(2, [], {
+        durable: true,
+        retain: async (bid) => {
+          const stored = payloadStore.get(toRootHex(bid.message.blockHash));
+          if (!stored) throw Error("missing test payload");
+          second.journal?.retain(bid, stored);
+          await persistence[retained++].promise;
+        },
+      });
+      const third = identity(3);
+      third.stage.deadlineBps = nextDeadlineBps;
+      second.stage.deadlineBps = deadlineBps;
+      const primary = identity(1, [second.stage, third.stage], {updateIntervalMs: 25});
+      const building = primary.bidder.onPayloadAttributes(event());
+      await vi.advanceTimersByTimeAsync(11125);
+      persistence[0].resolve();
+      await vi.advanceTimersByTimeAsync(budget - 1);
+      expect(published().map((bid) => bid.message.builderIndex)).toEqual([1]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(published().map((bid) => bid.message.builderIndex)).toEqual([1, 2]);
+      expect(published()[1].message.blockHash).toEqual(payload(2).executionPayload.blockHash);
+      expect(logger.info).toHaveBeenCalledWith(
+        "Gossiped execution payload bid",
+        expect.objectContaining({builderIndex: 2, refreshAttempted: true, refreshTimedOut: true, refreshMs: budget})
+      );
+      await vi.advanceTimersByTimeAsync(25);
+      expect(published().map((bid) => bid.message.builderIndex)).toEqual([1, 2, 3]);
+      expect(published()[2].message.blockHash).toEqual(payload(3).executionPayload.blockHash);
+      if (reply === "acknowledged") persistence[1].resolve();
+      else persistence[1].reject(new CommitmentJournalError("COMMITMENT_WORKER_TIMEOUT", true));
+      await vi.advanceTimersByTimeAsync(2200);
+      await building;
+      expect(retained).toBe(2);
+      expect(published().map((bid) => bid.message.builderIndex)).toEqual([1, 2, 3]);
+      expect(second.ledger.getRevisionCount(slot)).toBe(reply === "acknowledged" ? 2 : 1);
+      const recoveredPayloads = new PayloadStore();
+      const recoveredLedger = new BidLedger();
+      new CommitmentJournal(path.join(directory, "2"), second.journalIdentity, 1).recover(
+        1,
+        recoveredPayloads,
+        new BidStore(),
+        recoveredLedger
+      );
+      expect(recoveredLedger.getRevisionCount(slot)).toBe(2);
+      for (const revision of [2, 3]) {
+        expect(
+          recoveredPayloads.has(toRootHex(payload(revision).executionPayload.blockHash)),
+          `revision ${revision} must remain revealable`
+        ).toBe(true);
+      }
+    }
+  );
+
+  it.each(["cancelled", "expired", "generation changed"])(
+    "retains both commitments without gossip when the refresh becomes %s",
+    async (reason) => {
+      const persistence = [defer<void>(), defer<void>()];
+      const lease = {generation: "1", ready: true, validUntil: Infinity, validUntilUnixMs: Infinity};
+      let retained = 0;
+      source.getPayload.mockImplementation(async () => ({
+        ...payload(Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1),
+        offerEligibility: {generation: lease.generation, lease},
+      }));
+      const second = identity(2, [], {retain: () => persistence[retained++]?.promise ?? Promise.resolve()});
+      second.stage.deadlineBps = 9251;
+      const primary = identity(1, [second.stage], {updateIntervalMs: 25});
+      const building = primary.bidder.onPayloadAttributes(event());
+      await vi.advanceTimersByTimeAsync(11125);
+      persistence[0].resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(retained).toBe(2);
+      if (reason === "cancelled") controller.abort();
+      else if (reason === "generation changed") lease.generation = "2";
+      else vi.setSystemTime(13200);
+      persistence[1].resolve();
+      await vi.advanceTimersByTimeAsync(2100);
+      await building;
+      expect(published().map((bid) => bid.message.builderIndex)).toEqual([1]);
+      expect(second.ledger.getBidsForSlot(slot)).toHaveLength(2);
+      expect(second.ledger.hasSubmitted(slot, toRootHex(parentHash), toRootHex(parentRoot))).toBe(false);
+      if (reason === "expired")
+        expect(logger.info).toHaveBeenCalledWith(
+          "Skipped staged execution payload bid",
+          expect.objectContaining({builderIndex: 2, reason: "stage_expired", refreshAttempted: true})
+        );
+      for (const revision of [2, 3]) {
+        expect(
+          payloadStore.has(toRootHex(payload(revision).executionPayload.blockHash)),
+          `revision ${revision} must remain revealable`
+        ).toBe(true);
+      }
+    }
+  );
+
+  it("gossips the original when the stage cannot cover the higher refreshed value", async () => {
+    const persistence = defer<void>();
+    source.getPayload.mockImplementation(async () => payload(Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1));
+    const second = identity(2, [], {balance: 3_000_000_000, retain: () => persistence.promise});
+    const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+    second.stage.deadlineBps = 9251;
+    const primary = identity(1, [second.stage], {updateIntervalMs: 25});
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(11125);
+    persistence.resolve();
+    await vi.advanceTimersByTimeAsync(2100);
+    await building;
+    expect(sign).toHaveBeenCalledOnce();
+    expect(published().filter((bid) => bid.message.builderIndex === 2)).toHaveLength(1);
+    expect(published().at(-1)?.message.blockHash).toEqual(payload(2).executionPayload.blockHash);
+  });
+
+  it("keeps the original gossip when refresh hits the identity's retained revision limit", async () => {
+    const persistence = defer<void>();
+    source.getPayload.mockImplementation(async () => payload(Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1));
+    const second = identity(2, [], {retain: () => persistence.promise});
+    for (let index = 0; index < 255; index++) {
+      second.ledger.recordRevision({
+        slot,
+        parentBlockHash: toRootHex(parentHash),
+        parentBlockRoot: toRootHex(parentRoot),
+        blockHash: toRootHex(Buffer.alloc(32, index)),
+        signedBidRoot: toRootHex(Buffer.alloc(32, index)),
+        valueGwei: 0,
+      });
+    }
+    const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+    second.stage.deadlineBps = 9251;
+    const primary = identity(1, [second.stage], {updateIntervalMs: 25});
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(11125);
+    persistence.resolve();
+    await vi.advanceTimersByTimeAsync(2100);
+    await building;
+    expect(sign).toHaveBeenCalledOnce();
+    expect(second.ledger.getRevisionCount(slot)).toBe(256);
+    expect(published().filter((bid) => bid.message.builderIndex === 2)).toHaveLength(1);
+    expect(published().at(-1)?.message.blockHash).toEqual(payload(2).executionPayload.blockHash);
   });
 
   it("skips expired stages when a parent build starts late", async () => {
