@@ -161,6 +161,7 @@ export class Bidder {
   private primary: PrimaryBuild | undefined;
   private readonly alternateQueue = new Map<string, QueuedAlternate>();
   private readonly alternateAttempts = new Map<number, {id: string; kind: AlternateKind}[]>();
+  private readonly alternateReauthorizations = new Map<string, AlternatePayloadAttributesEvent>();
   private alternateBuild: AlternateBuild | undefined;
   /** Committed owner per tuple; pending replacement/cleanup owners are separate. */
   private readonly retainedAlternates = new Map<string, RetainedAlternate>();
@@ -365,6 +366,7 @@ export class Bidder {
       return;
     }
     const id = `${data.proposalSlot}:${toRootHex(data.parentBlockRoot)}:${toRootHex(data.parentBlockHash)}`;
+    if (this.alternateReauthorizations.has(id)) this.alternateReauthorizations.set(id, event);
     const refresh = (this.opts.alternateRefreshBeforeSlotMs ?? 0) > 0;
     const generations = this.modules.orchestrator.supportsRetainedOffers;
     const active = this.alternateBuild;
@@ -387,6 +389,10 @@ export class Bidder {
     const queued = this.alternateQueue.get(id);
     if ((refresh || generations) && queued) {
       queued.event = event;
+      this.tryAlternate();
+      return;
+    }
+    if (this.alternateReauthorizations.has(id)) {
       this.tryAlternate();
       return;
     }
@@ -490,6 +496,7 @@ export class Bidder {
     this.alternateWake = undefined;
     const {clock, config, orchestrator} = this.modules;
     const primary = this.primary;
+    this.queueReauthorizations(primary);
     const resources = orchestrator.getResources();
     const duration = this.opts.alternateBuildDurationMs ?? 500;
     if (
@@ -600,6 +607,7 @@ export class Bidder {
     attempts.push({id, kind});
     this.alternateAttempts.set(primary.slot, attempts);
     this.alternateQueue.delete(id);
+    this.alternateReauthorizations.delete(id);
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, primary.controller.signal, this.modules.signal]);
     const deadline = Date.now() + duration;
@@ -693,6 +701,39 @@ export class Bidder {
         }
         this.tryAlternate();
       });
+  }
+
+  private queueReauthorizations(primary: PrimaryBuild | undefined): void {
+    for (const [id, event] of this.alternateReauthorizations) {
+      const slot = event.data.proposalSlot;
+      if (
+        this.modules.signal.aborted ||
+        slot <= this.modules.clock.getCurrentSlot() ||
+        (primary && slot < primary.slot) ||
+        (this.alternateAttempts.get(slot)?.length ?? 0) >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT
+      ) {
+        this.alternateReauthorizations.delete(id);
+        continue;
+      }
+      if (!primary?.ready || primary.controller.signal.aborted || primary.dependentRoot === undefined) continue;
+      if (
+        slot !== primary.slot ||
+        event.data.proposerIndex !== primary.data.proposerIndex ||
+        toRootHex(event.context.dependentRoot) !== primary.dependentRoot ||
+        this.getAlternateLimit(event, primary) === null ||
+        this.hasRetainedAlternate(event)
+      ) {
+        this.alternateReauthorizations.delete(id);
+        continue;
+      }
+      if (
+        id === primary.id ||
+        (this.alternateBuild && this.alternateId(this.alternateBuild.event) === id) ||
+        (!this.alternateQueue.has(id) && this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT)
+      )
+        continue;
+      this.alternateQueue.set(id, {event, kind: "reauthorize", notBefore: 0});
+    }
   }
 
   private hasRetainedAlternate(event: AlternatePayloadAttributesEvent): boolean {
@@ -815,10 +856,18 @@ export class Bidder {
           toRootHex(data.parentBlockRoot)
         );
         const incumbent = this.retainedAlternates.get(this.alternateId(alternate.event));
+        const incomingEligibility = payload.offerEligibility;
+        const incumbentEligibility = incumbent?.payload.offerEligibility;
+        const newerGeneration =
+          incomingEligibility?.retained !== undefined &&
+          incumbentEligibility?.retained !== undefined &&
+          incomingEligibility.retained.namespace === incumbentEligibility.retained.namespace &&
+          BigInt(incomingEligibility.generation) > BigInt(incumbentEligibility.generation);
         const minimumValue =
           incumbent &&
           !incumbent.controller.signal.aborted &&
-          incumbent.payload.offerEligibility?.retained?.closed !== true
+          incumbentEligibility?.retained?.closed !== true &&
+          !newerGeneration
             ? (incumbent.signed?.message.value ?? -1)
             : -1;
         const retained = payload.offerEligibility?.retained
@@ -1054,22 +1103,16 @@ export class Bidder {
         await this.modules.orchestrator.releaseOffer(payload).catch(() => {});
         this.retainedOfferOwners.delete(retained);
         if (this.retainedAlternates.get(retained.id) === retained) this.retainedAlternates.delete(retained.id);
-        // Generation changes require a new bounded construction, never a newer
-        // stamp on old bytes. Initial branches still take priority over refreshes.
+        // Only a terminal renewal of an adopted grant earns one reconstruction.
+        // Keep its intent across temporary head/queue changes, but no payload body.
         const id = this.alternateId(retained.event);
-        const primary = this.primary;
         if (
           reauthorize &&
           retained.signed &&
-          primary &&
-          this.retainedContext(retained) === "valid" &&
-          id !== primary.id &&
-          !this.hasRetainedAlternate(retained.event) &&
-          (this.alternateAttempts.get(primary.slot)?.length ?? 0) < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
-          this.alternateQueue.size < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
-          !this.alternateQueue.has(id)
+          !this.modules.signal.aborted &&
+          this.alternateReauthorizations.size < MAX_ALTERNATE_ATTEMPTS_PER_SLOT
         ) {
-          this.alternateQueue.set(id, {event: retained.event, kind: "reauthorize", notBefore: 0});
+          this.alternateReauthorizations.set(id, retained.event);
           this.tryAlternate();
         }
       }

@@ -493,7 +493,7 @@ describe("alternate parent bidder", () => {
         if (request.requireRetainedOffer && !equal) {
           const session = m.sessions.get(handle.payloadId);
           if (!session) throw Error("Missing refresh");
-          session.payload.executionPayloadValue = 1n;
+          session.payload.executionPayloadValue = BigInt(old.message.value - 1) * 1_000_000_000n;
         }
         return handle;
       });
@@ -715,6 +715,189 @@ describe("alternate parent bidder", () => {
       expect(requests(m)).toHaveLength(2);
       expect(m.bidStore.has(oldBid)).toBe(true);
     });
+
+    it("reconstructs a fenced tuple after it stops being primary without spending repeated attempts", async () => {
+      const m = await started();
+      const old = m.offer(m.alternate);
+      if (!old) throw Error("Missing old offer");
+      m.start(m.alternate);
+      await vi.advanceTimersByTimeAsync(101);
+      m.advanceGeneration();
+      await vi.advanceTimersByTimeAsync(101);
+      expect(requests(m)).toHaveLength(1);
+      m.start(m.primary);
+      await vi.advanceTimersByTimeAsync(700);
+      const current = m.offer(m.alternate);
+      if (!current) throw Error("Missing reconstructed offer");
+      expect(m.bidStore.getOfferEligibility(current)?.generation).toBe("0x1");
+      expect(requests(m)).toHaveLength(2);
+      expect(m.payloadStore.has(toRootHex(old.message.blockHash))).toBe(true);
+      for (let n = 0; n < 3; n++) m.bidder.onAlternatePayloadAttributes(m.alternate);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(requests(m)).toHaveLength(2);
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it("preserves a fenced reconstruction while cleanup finishes with unresolved primary duties", async () => {
+      const m = await started();
+      const release = m.payloadSource.releaseOffer.getMockImplementation();
+      if (!release) throw Error("Missing release");
+      const cleanup = defer<void>();
+      m.payloadSource.releaseOffer.mockImplementation(async (payload, signal) => {
+        await cleanup.promise;
+        await release(payload, signal);
+      });
+      m.advanceGeneration();
+      await vi.advanceTimersByTimeAsync(101);
+      const response = await m.api.validator.getProposerDutiesV2({epoch: 0});
+      const duties = defer<typeof response>();
+      m.api.validator.getProposerDutiesV2.mockReturnValueOnce(duties.promise);
+      m.start(attributes(8, 9));
+      cleanup.resolve();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(requests(m)).toHaveLength(1);
+      duties.resolve(response);
+      await vi.advanceTimersByTimeAsync(700);
+      const current = m.offer(m.alternate);
+      if (!current) throw Error("Missing reconstructed offer");
+      expect(m.bidStore.getOfferEligibility(current)?.generation).toBe("0x1");
+      expect(requests(m)).toHaveLength(2);
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it("preserves a fenced reconstruction until a full invalid queue is pruned", async () => {
+      const m = await started();
+      m.canRetainAlternate.mockReturnValue(false);
+      for (let n = 0; n < 4; n++) {
+        const other = attributes(20 + n, 30 + n);
+        other.context.dependentRoot = Buffer.alloc(32, 99);
+        m.bidder.onAlternatePayloadAttributes(other);
+      }
+      m.advanceGeneration();
+      await vi.advanceTimersByTimeAsync(101);
+      expect(requests(m)).toHaveLength(1);
+      m.canRetainAlternate.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(800);
+      const current = m.offer(m.alternate);
+      if (!current) throw Error("Missing reconstructed offer");
+      expect(m.bidStore.getOfferEligibility(current)?.generation).toBe("0x1");
+      expect(requests(m)).toHaveLength(2);
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it("preserves a fenced reconstruction while no primary is available", async () => {
+      const m = await started();
+      const release = m.payloadSource.releaseOffer.getMockImplementation();
+      if (!release) throw Error("Missing release");
+      const cleanup = defer<void>();
+      m.payloadSource.releaseOffer.mockImplementation(async (payload, signal) => {
+        await cleanup.promise;
+        await release(payload, signal);
+      });
+      m.advanceGeneration();
+      await vi.advanceTimersByTimeAsync(101);
+      m.api.validator.getProposerDutiesV2.mockRejectedValueOnce(Error("Duties unavailable"));
+      m.start(attributes(8, 9));
+      await vi.advanceTimersByTimeAsync(101);
+      cleanup.resolve();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(m.sessions.size).toBe(0);
+      expect(requests(m)).toHaveLength(1);
+      m.start(m.primary);
+      await vi.advanceTimersByTimeAsync(700);
+      const current = m.offer(m.alternate);
+      if (!current) throw Error("Missing reconstructed offer");
+      expect(m.bidStore.getOfferEligibility(current)?.generation).toBe("0x1");
+      expect(requests(m)).toHaveLength(2);
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it("consumes a deferred reconstruction once even when its new construction fails", async () => {
+      const m = await started();
+      m.start(m.alternate);
+      await vi.advanceTimersByTimeAsync(101);
+      m.advanceGeneration();
+      await vi.advanceTimersByTimeAsync(101);
+      const prepare = m.payloadSource.prepare.getMockImplementation();
+      if (!prepare) throw Error("Missing prepare");
+      m.payloadSource.prepare.mockImplementation(async (request, signal) => {
+        if (request.requireRetainedOffer) throw Error("Construction failed");
+        return prepare(request, signal);
+      });
+      m.start(m.primary);
+      await vi.advanceTimersByTimeAsync(700);
+      for (let n = 0; n < 3; n++) {
+        m.bidder.onAlternatePayloadAttributes(m.alternate);
+        await vi.advanceTimersByTimeAsync(600);
+      }
+      expect(requests(m)).toHaveLength(2);
+      expect(m.offer(m.alternate)).toBeNull();
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it("discards a deferred reconstruction after authoritative branch eligibility changes", async () => {
+      const m = await started();
+      m.start(m.alternate);
+      await vi.advanceTimersByTimeAsync(101);
+      m.advanceGeneration();
+      await vi.advanceTimersByTimeAsync(101);
+      const unavailable = attributes(4, 6);
+      unavailable.context.builders[0].active = false;
+      m.bidder.onAlternatePayloadAttributes(unavailable);
+      m.start(m.primary);
+      await vi.advanceTimersByTimeAsync(700);
+      m.bidder.onAlternatePayloadAttributes(m.alternate);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(requests(m)).toHaveLength(1);
+      expect(m.offer(m.alternate)).toBeNull();
+    });
+
+    it.each([false, true])(
+      "accepts a lower refresh before the fenced incumbent renews only in its namespace (same %s)",
+      async (sameNamespace) => {
+        const m = setup({alternateRefreshBeforeSlotMs: 800}, [9850], true);
+        const alternate = attributes(4, 6);
+        m.start(attributes(4, 5));
+        await vi.advanceTimersByTimeAsync(100);
+        m.bidder.onAlternatePayloadAttributes(alternate);
+        await vi.advanceTimersByTimeAsync(600);
+        const old = m.offer(alternate);
+        if (!old) throw Error("Missing old offer");
+        const oldEligibility = m.bidStore.getOfferEligibility(old);
+        const prepare = m.payloadSource.prepare.getMockImplementation();
+        const renew = m.payloadSource.renewOffer.getMockImplementation();
+        if (!oldEligibility?.retained || !prepare || !renew) throw Error("Missing source");
+        m.payloadSource.prepare.mockImplementation(async (request, signal) => {
+          const handle = await prepare(request, signal);
+          if (request.requireRetainedOffer) {
+            const payload = m.sessions.get(handle.payloadId)?.payload;
+            if (!payload?.offerEligibility?.retained) throw Error("Missing refresh");
+            payload.executionPayloadValue = BigInt(old.message.value - 1) * 1_000_000_000n;
+            if (!sameNamespace) payload.offerEligibility.retained.namespace = "other-namespace";
+          }
+          return handle;
+        });
+        m.payloadSource.renewOffer.mockImplementation(async (payload, signal) => {
+          if (payload.offerEligibility === oldEligibility) {
+            oldEligibility.lease.ready = false;
+            return false;
+          }
+          return renew(payload, signal);
+        });
+        m.advanceGeneration();
+        await vi.advanceTimersByTimeAsync(11_050);
+        expect(requests(m)).toHaveLength(2);
+        const current = m.offer(alternate);
+        expect(current !== null).toBe(sameNamespace);
+        if (current) {
+          expect(current.message.value).toBeGreaterThan(0);
+          expect(current.message.value).toBeLessThan(old.message.value);
+          expect(m.bidStore.getOfferEligibility(current)?.generation).toBe("0x1");
+        }
+        expect(m.payloadStore.has(toRootHex(old.message.blockHash))).toBe(true);
+        expect(m.sessions.size).toBe(1);
+      }
+    );
 
     it("bounds repeated cancellation reauthorizations by the existing four-attempt cap", async () => {
       const m = await started();
