@@ -899,6 +899,53 @@ describe("alternate parent bidder", () => {
       }
     );
 
+    it("replaces a fenced incumbent while its last local lease is still valid", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 800}, [9850], true);
+      const alternate = attributes(4, 6);
+      m.start(attributes(4, 5));
+      await vi.advanceTimersByTimeAsync(100);
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(600);
+      const old = m.offer(alternate);
+      if (!old) throw Error("Missing old offer");
+      const eligibility = m.bidStore.getOfferEligibility(old);
+      const get = m.payloadSource.getPayload.getMockImplementation();
+      const renew = m.payloadSource.renewOffer.getMockImplementation();
+      if (!eligibility?.retained || !get || !renew) throw Error("Missing source");
+      const pendingRenewal = defer<void>();
+      m.payloadSource.getPayload.mockImplementation(async (handle, signal) => {
+        const session = m.sessions.get(handle.payloadId);
+        if (session?.request.requireRetainedOffer) {
+          const refreshed = session.payload.offerEligibility;
+          if (!refreshed) throw Error("Missing refresh grant");
+          refreshed.generation = refreshed.lease.generation = "0x1";
+          session.payload.executionPayloadValue = BigInt(old.message.value - 1) * 1_000_000_000n;
+          expect(m.bidStore.canOffer(old), "previous local lease has not expired").toBe(true);
+        }
+        return get(handle, signal);
+      });
+      await vi.advanceTimersByTimeAsync(10_800);
+      expect(Date.now()).toBe(11_500);
+      expect(m.bidStore.canOffer(old)).toBe(true);
+      m.advanceGeneration();
+      m.payloadSource.renewOffer.mockImplementation(async (payload, signal) => {
+        if (payload.offerEligibility === eligibility) await pendingRenewal.promise;
+        return renew(payload, signal);
+      });
+      await vi.advanceTimersByTimeAsync(200);
+      pendingRenewal.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+      const current = m.offer(alternate);
+      if (!current) throw Error("Missing lower-value current-generation offer");
+      expect(current.message.value).toBeGreaterThan(0);
+      expect(current.message.value).toBeLessThan(old.message.value);
+      expect(m.bidStore.getOfferEligibility(current)?.generation).toBe("0x1");
+      expect(m.bidStore.canOffer(old)).toBe(false);
+      expect(m.payloadStore.has(toRootHex(old.message.blockHash))).toBe(true);
+      expect(requests(m)).toHaveLength(2);
+      expect(m.sessions.size).toBe(1);
+    });
+
     it("bounds repeated cancellation reauthorizations by the existing four-attempt cap", async () => {
       const m = await started();
       for (let n = 0; n < 7; n++) {

@@ -181,7 +181,7 @@ updated to that generation. Such reconstructions share the existing four-attempt
 limit and spare worker. Only a committed owner's terminal renewal queues
 reauthorization; repeated attributes for a recorded but unadopted tuple do not
 authorize extra attempts. A bounded reconstruction intent survives a temporary
-primary role, unresolved duties or a full queue, and is consumed when construction
+primary role, unresolved duties or a full queue, and is consumed when an attempt
 starts. It is discarded when its slot or branch context is no longer valid.
 A generation-not-ready initial acquisition gets at most
 one retry within that same cap and deadline, after confirmed cleanup. Initial

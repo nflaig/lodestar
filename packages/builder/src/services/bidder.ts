@@ -863,6 +863,9 @@ export class Bidder {
           incumbentEligibility?.retained !== undefined &&
           incomingEligibility.retained.namespace === incumbentEligibility.retained.namespace &&
           BigInt(incomingEligibility.generation) > BigInt(incumbentEligibility.generation);
+        // The fresh grant proves this lease is fenced even before its next renewal.
+        // Keep the owner alive so a failed replacement can still earn reconstruction.
+        if (newerGeneration && incumbentEligibility) incumbentEligibility.lease.ready = false;
         const minimumValue =
           incumbent &&
           !incumbent.controller.signal.aborted &&
