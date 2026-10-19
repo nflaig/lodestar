@@ -521,63 +521,85 @@ describe("SessionPayloadSource", () => {
       }
     });
 
-    it("recovers an actual closed cancel connection after the next primary is already ready", async () => {
-      const cancellationReceived = defer<void>();
-      const closeFirstReply = defer<void>();
-      const confirmSecondReply = defer<void>();
-      let reservations = 0;
-      let cancellations = 0;
-      const server = createServer(async (req, res) => {
-        const chunks: Buffer[] = [];
-        for await (const chunk of req) chunks.push(Buffer.from(chunk));
-        const call = JSON.parse(Buffer.concat(chunks).toString()) as {id: number; method: string};
-        let result: unknown;
-        if (call.method === "zbuilder_reserveBeginV1") result = reservation(++reservations);
-        else if (call.method === "zbuilder_beginReservedV1") result = begun(reservations);
-        else {
-          cancellations++;
-          if (cancellations === 1) {
-            cancellationReceived.resolve();
-            await closeFirstReply.promise;
-            res.destroy();
-            return;
-          }
-          await confirmSecondReply.promise;
-          result = released;
-        }
-        res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify({jsonrpc: "2.0", id: call.id, result}));
-      });
-      server.listen(0, "127.0.0.1");
-      await once(server, "listening");
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Missing local test address");
-      const source = new SessionPayloadSource(
-        "session",
-        (callSignal) => new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal: callSignal}),
-        {boundedAlternates: true, beginReservations: true}
-      );
-      try {
-        const request = buildRequest();
-        const old = await source.prepare(request, signal);
-        const cleanup = source.release(old, signal);
-        const settled = Promise.allSettled([cleanup]);
-        await cancellationReceived.promise;
-        await source.prepare({...request, payloadAttributes: {...request.payloadAttributes, slotNumber: 13}}, signal);
-        closeFirstReply.resolve();
-        await vi.waitFor(() => expect(cancellations).toBe(2));
-        expect(source.getResources()).toMatchObject({active: 1, releasing: 1, uncertain: 0});
-        confirmSecondReply.resolve();
-        expect((await settled).map((result) => result.status)).toEqual(["fulfilled"]);
-        expect(source.getResources()).toMatchObject({active: 1, releasing: 0, uncertain: 0});
-        expect(reservations).toBe(2);
-      } finally {
-        closeFirstReply.resolve();
-        confirmSecondReply.resolve();
-        server.closeAllConnections();
-        await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-      }
+    it.each([
+      new SyntaxError("invalid response JSON"),
+      new TypeError("input failure", {cause: Object.assign(new Error("invalid"), {code: "ERR_INVALID_INPUT"})}),
+      new Error("application failure", {cause: Object.assign(new Error("closed"), {code: "UND_ERR_SOCKET"})}),
+    ])("does not retry unclassified release failures: %s", async (error) => {
+      const {source, fetch, request} = setup(false, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const handle = await source.prepare(request, signal);
+      fetch.mockRejectedValueOnce(error);
+      await expect(source.release(handle, signal)).rejects.toBe(error);
+      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 1});
     });
+
+    it.each(["before-headers", "during-body"])(
+      "recovers an actual cancel connection closed %s after the next primary is ready",
+      async (phase) => {
+        const cancellationReceived = defer<void>();
+        const closeFirstReply = defer<void>();
+        const confirmSecondReply = defer<void>();
+        let reservations = 0;
+        let cancellations = 0;
+        const server = createServer(async (req, res) => {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(Buffer.from(chunk));
+          const call = JSON.parse(Buffer.concat(chunks).toString()) as {id: number; method: string};
+          let result: unknown;
+          if (call.method === "zbuilder_reserveBeginV1") result = reservation(++reservations);
+          else if (call.method === "zbuilder_beginReservedV1") result = begun(reservations);
+          else {
+            cancellations++;
+            if (cancellations === 1) {
+              cancellationReceived.resolve();
+              await closeFirstReply.promise;
+              if (phase === "during-body") {
+                res.writeHead(200, {"content-type": "application/json"});
+                res.write(`{"jsonrpc":"2.0","id":${call.id},"result":`);
+                await sleep(20);
+              }
+              res.destroy();
+              return;
+            }
+            await confirmSecondReply.promise;
+            result = released;
+          }
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({jsonrpc: "2.0", id: call.id, result}));
+        });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Missing local test address");
+        const source = new SessionPayloadSource(
+          "session",
+          (callSignal) => new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal: callSignal}),
+          {boundedAlternates: true, beginReservations: true}
+        );
+        try {
+          const request = buildRequest();
+          const old = await source.prepare(request, signal);
+          const cleanup = source.release(old, signal);
+          const settled = Promise.allSettled([cleanup]);
+          await cancellationReceived.promise;
+          await source.prepare({...request, payloadAttributes: {...request.payloadAttributes, slotNumber: 13}}, signal);
+          closeFirstReply.resolve();
+          await vi.waitFor(() => expect(cancellations).toBe(2));
+          expect(source.getResources()).toMatchObject({active: 1, releasing: 1, uncertain: 0});
+          confirmSecondReply.resolve();
+          expect((await settled).map((result) => result.status)).toEqual(["fulfilled"]);
+          expect(source.getResources()).toMatchObject({active: 1, releasing: 0, uncertain: 0});
+          expect(reservations).toBe(2);
+        } finally {
+          closeFirstReply.resolve();
+          confirmSecondReply.resolve();
+          server.closeAllConnections();
+          await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+        }
+      }
+    );
 
     it("allows tracked primary cleanup to finish beyond one second without enabling alternates", async () => {
       const {source, fetch, request, signals} = setup(false, true);
