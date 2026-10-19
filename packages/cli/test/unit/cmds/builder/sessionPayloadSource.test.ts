@@ -325,6 +325,282 @@ describe("SessionPayloadSource", () => {
     });
     const released = {released: true, beginReservationVersion: 1};
 
+    it.each(["before", "after"])(
+      "recovers a lost release reply %s the next primary prepares without waiting for another head",
+      async (failureOrder) => {
+        vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+        try {
+          const {source, fetch, request} = setup(true, true, true);
+          const firstCancel = defer<typeof released>();
+          const confirmed = defer<typeof released>();
+          let reservations = 0;
+          let cancels = 0;
+          fetch.mockImplementation(async (call) => {
+            if (call.method === "zbuilder_reserveBeginV1" || call.method === "zbuilder_reserveAlternateBeginV1")
+              return reservation(++reservations);
+            if (call.method === "zbuilder_beginReservedV1")
+              return {
+                ...begun(reservations),
+                orderGenerationVersion: 1,
+                retainedOfferVersion: 1,
+                alternateSessionVersion: reservations === 3 ? 2 : 0,
+              };
+            return ++cancels === 1 ? firstCancel.promise : confirmed.promise;
+          });
+          const old = await source.prepare(request, signal);
+          const release = source.release(old, signal);
+          const settled = Promise.allSettled([release]);
+          const next = {...request, payloadAttributes: {...request.payloadAttributes, slotNumber: 13}};
+          if (failureOrder === "after") await source.prepare(next, signal);
+          await vi.advanceTimersByTimeAsync(0);
+          firstCancel.reject(transportError("UND_ERR_SOCKET"));
+          await vi.advanceTimersByTimeAsync(0);
+          if (failureOrder === "before") await source.prepare(next, signal);
+          await vi.advanceTimersByTimeAsync(100);
+          expect(cancels).toBe(2);
+          expect(source.getResources()).toMatchObject({active: 1, releasing: 1, uncertain: 0});
+          await expect(source.prepare({...next, requireRetainedOffer: true}, signal)).rejects.toMatchObject({
+            type: {code: SessionPayloadErrorCode.CAPACITY},
+          });
+          confirmed.resolve(released);
+          expect((await settled).map((result) => result.status)).toEqual(["fulfilled"]);
+          expect(source.getResources()).toMatchObject({active: 1, releasing: 0, uncertain: 0});
+          await source.prepare({...next, requireRetainedOffer: true}, signal);
+          expect(source.getResources()).toMatchObject({active: 2, uncertain: 0});
+          expect(reservations).toBe(3);
+        } finally {
+          vi.useRealTimers();
+        }
+      }
+    );
+
+    it("bounds failed release retries and shares the retry with concurrent cleanup callers", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request, signals} = setup(true, true);
+        fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+        const handle = await source.prepare(request, signal);
+        const error = transportError("ECONNRESET");
+        fetch.mockRejectedValue(error);
+        const first = source.release(handle, signal);
+        const second = source.release(handle, signal);
+        const settled = Promise.allSettled([first, second]);
+        await vi.advanceTimersByTimeAsync(99);
+        expect(fetch).toHaveBeenCalledTimes(3);
+        expect(source.getResources()).toMatchObject({active: 0, releasing: 1, uncertain: 0});
+        await vi.advanceTimersByTimeAsync(1);
+        expect((await settled).map((result) => result.status)).toEqual(["rejected", "rejected"]);
+        expect(fetch).toHaveBeenCalledTimes(4);
+        expect(signals.at(-1)).toBe(signals.at(-2));
+        expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 1});
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(fetch).toHaveBeenCalledTimes(4);
+        const reconcile = Promise.allSettled([source.reconcileResources(signal), source.reconcileResources(signal)]);
+        await vi.advanceTimersByTimeAsync(100);
+        expect((await reconcile).map((result) => result.status)).toEqual(["rejected", "rejected"]);
+        expect(fetch).toHaveBeenCalledTimes(6);
+        expect(source.getResources()).toMatchObject({uncertain: 1, releasing: 0});
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(fetch).toHaveBeenCalledTimes(6);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("confirms simultaneous failed releases independently without exceeding one retry per owner", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(false, true);
+        fetch
+          .mockResolvedValueOnce(reservation())
+          .mockResolvedValueOnce(begun())
+          .mockResolvedValueOnce(reservation(2))
+          .mockResolvedValueOnce(begun(2));
+        const first = await source.prepare(request, signal);
+        const second = await source.prepare(request, signal);
+        const counts = new Map<string, number>();
+        const firstProof = defer<typeof released>();
+        fetch.mockImplementation(async (call) => {
+          const id = String(Array.isArray(call.params) ? call.params[0] : "");
+          const count = (counts.get(id) ?? 0) + 1;
+          counts.set(id, count);
+          if (count === 1) throw transportError("UND_ERR_SOCKET");
+          return id === first.payloadId ? firstProof.promise : released;
+        });
+        const settled = Promise.allSettled([source.release(first, signal), source.release(second, signal)]);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(counts).toEqual(
+          new Map([
+            [first.payloadId, 2],
+            [second.payloadId, 2],
+          ])
+        );
+        expect(source.getResources()).toMatchObject({active: 0, releasing: 1, uncertain: 0});
+        firstProof.resolve(released);
+        expect((await settled).map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+        expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 0});
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("retries a release while sibling reconciliation is running without waiting on itself", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(false, true);
+        fetch
+          .mockResolvedValueOnce(reservation())
+          .mockResolvedValueOnce(begun())
+          .mockResolvedValueOnce(reservation(2))
+          .mockResolvedValueOnce(begun(2));
+        const first = await source.prepare(request, signal);
+        const second = await source.prepare(request, signal);
+        fetch.mockRejectedValueOnce(new Error("existing uncertain owner"));
+        await expect(source.release(first, signal)).rejects.toThrow("existing uncertain owner");
+        const firstProof = defer<typeof released>();
+        let secondCancels = 0;
+        fetch.mockImplementation(async (call) => {
+          if (Array.isArray(call.params) && call.params[0] === first.payloadId) return firstProof.promise;
+          if (++secondCancels === 1) throw transportError("ECONNRESET");
+          return released;
+        });
+        const reconciliation = source.reconcileResources(signal);
+        const release = source.release(second, signal);
+        const settled = Promise.allSettled([release]);
+        await vi.advanceTimersByTimeAsync(100);
+        expect((await settled).map((result) => result.status)).toEqual(["fulfilled"]);
+        expect(secondCancels).toBe(2);
+        expect(source.getResources()).toMatchObject({active: 0, releasing: 1, uncertain: 0});
+        firstProof.resolve(released);
+        await reconciliation;
+        expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 0});
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not retry a release after its cleanup signal is aborted during the pacing delay", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(false, true);
+        fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+        const handle = await source.prepare(request, signal);
+        fetch.mockRejectedValue(transportError("UND_ERR_SOCKET"));
+        const controller = new AbortController();
+        const settled = Promise.allSettled([source.release(handle, controller.signal)]);
+        await vi.advanceTimersByTimeAsync(50);
+        controller.abort();
+        await vi.advanceTimersByTimeAsync(100);
+        expect((await settled).map((result) => result.status)).toEqual(["rejected"]);
+        expect(fetch).toHaveBeenCalledTimes(3);
+        expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 1});
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not replenish the transport retry after an intermediate pending-cancellation reply", async () => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request} = setup(false, true);
+        fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+        const handle = await source.prepare(request, signal);
+        fetch
+          .mockRejectedValueOnce(transportError("UND_ERR_SOCKET"))
+          .mockResolvedValueOnce({...released, released: false})
+          .mockRejectedValueOnce(transportError("ECONNRESET"));
+        const settled = Promise.allSettled([source.release(handle, signal)]);
+        await vi.advanceTimersByTimeAsync(200);
+        expect((await settled).map((result) => result.status)).toEqual(["rejected"]);
+        expect(fetch).toHaveBeenCalledTimes(5);
+        expect(source.getResources()).toMatchObject({uncertain: 1, releasing: 0});
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(fetch).toHaveBeenCalledTimes(5);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it.each([
+      new SyntaxError("invalid response JSON"),
+      new TypeError("input failure", {cause: Object.assign(new Error("invalid"), {code: "ERR_INVALID_INPUT"})}),
+      new Error("application failure", {cause: Object.assign(new Error("closed"), {code: "UND_ERR_SOCKET"})}),
+    ])("does not retry unclassified release failures: %s", async (error) => {
+      const {source, fetch, request} = setup(false, true);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const handle = await source.prepare(request, signal);
+      fetch.mockRejectedValueOnce(error);
+      await expect(source.release(handle, signal)).rejects.toBe(error);
+      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 1});
+    });
+
+    it.each(["before-headers", "during-body"])(
+      "recovers an actual cancel connection closed %s after the next primary is ready",
+      async (phase) => {
+        const cancellationReceived = defer<void>();
+        const closeFirstReply = defer<void>();
+        const confirmSecondReply = defer<void>();
+        let reservations = 0;
+        let cancellations = 0;
+        const server = createServer(async (req, res) => {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(Buffer.from(chunk));
+          const call = JSON.parse(Buffer.concat(chunks).toString()) as {id: number; method: string};
+          let result: unknown;
+          if (call.method === "zbuilder_reserveBeginV1") result = reservation(++reservations);
+          else if (call.method === "zbuilder_beginReservedV1") result = begun(reservations);
+          else {
+            cancellations++;
+            if (cancellations === 1) {
+              cancellationReceived.resolve();
+              await closeFirstReply.promise;
+              if (phase === "during-body") {
+                res.writeHead(200, {"content-type": "application/json"});
+                res.write(`{"jsonrpc":"2.0","id":${call.id},"result":`);
+                await sleep(20);
+              }
+              res.destroy();
+              return;
+            }
+            await confirmSecondReply.promise;
+            result = released;
+          }
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({jsonrpc: "2.0", id: call.id, result}));
+        });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Missing local test address");
+        const source = new SessionPayloadSource(
+          "session",
+          (callSignal) => new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal: callSignal}),
+          {boundedAlternates: true, beginReservations: true}
+        );
+        try {
+          const request = buildRequest();
+          const old = await source.prepare(request, signal);
+          const cleanup = source.release(old, signal);
+          const settled = Promise.allSettled([cleanup]);
+          await cancellationReceived.promise;
+          await source.prepare({...request, payloadAttributes: {...request.payloadAttributes, slotNumber: 13}}, signal);
+          closeFirstReply.resolve();
+          await vi.waitFor(() => expect(cancellations).toBe(2));
+          expect(source.getResources()).toMatchObject({active: 1, releasing: 1, uncertain: 0});
+          confirmSecondReply.resolve();
+          expect((await settled).map((result) => result.status)).toEqual(["fulfilled"]);
+          expect(source.getResources()).toMatchObject({active: 1, releasing: 0, uncertain: 0});
+          expect(reservations).toBe(2);
+        } finally {
+          closeFirstReply.resolve();
+          confirmSecondReply.resolve();
+          server.closeAllConnections();
+          await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+        }
+      }
+    );
+
     it("allows tracked primary cleanup to finish beyond one second without enabling alternates", async () => {
       const {source, fetch, request, signals} = setup(false, true);
       fetch
@@ -510,9 +786,13 @@ describe("SessionPayloadSource", () => {
     });
 
     it.each([
+      undefined,
       null,
       {},
       true,
+      false,
+      0,
+      "true",
       {released: "true", beginReservationVersion: 1},
       {released: true, beginReservationVersion: 2},
     ])("retains capacity for a malformed cancellation confirmation %j", async (reply) => {
@@ -524,6 +804,7 @@ describe("SessionPayloadSource", () => {
         type: {code: SessionPayloadErrorCode.RELEASE_UNCONFIRMED},
       });
       expect(source.getResources()).toMatchObject({uncertain: 1, active: 0});
+      expect(fetch).toHaveBeenCalledTimes(3);
     });
 
     it("does not treat another native instance or UnknownSession as release proof", async () => {
@@ -1203,6 +1484,45 @@ describe("SessionPayloadSource", () => {
     );
   }
 
+  it.each(["UND_ERR_SOCKET", "ECONNRESET"])(
+    "retries one tracked endV1 %s failure before releasing capacity",
+    async (code) => {
+      vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+      try {
+        const {source, fetch, request, signals} = setup(true);
+        fetch.mockResolvedValueOnce({sessionId: "tracked"});
+        const handle = await source.prepare(request, signal);
+        fetch.mockRejectedValueOnce(transportError(code)).mockResolvedValueOnce(true);
+        const release = source.release(handle, signal);
+        await vi.advanceTimersByTimeAsync(99);
+        expect(source.getResources()).toMatchObject({active: 0, releasing: 1, uncertain: 0});
+        expect(fetch).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(1);
+        await release;
+        expect(fetch).toHaveBeenCalledTimes(3);
+        expect(fetch.mock.calls.slice(1).map(([call]) => call)).toEqual([
+          {method: "zbuilder_endV1", params: [handle.payloadId]},
+          {method: "zbuilder_endV1", params: [handle.payloadId]},
+        ]);
+        expect(signals.at(-1)).toBe(signals.at(-2));
+        expect(signals.at(-1)).toBe(signal);
+        expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 0});
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it("does not add transport retries to an untracked legacy release", async () => {
+    const {source, fetch, request} = setup();
+    fetch.mockResolvedValueOnce({sessionId: "untracked"});
+    const handle = await source.prepare(request, signal);
+    fetch.mockRejectedValueOnce(transportError("UND_ERR_SOCKET"));
+    await expect(source.release(handle, signal)).rejects.toBeInstanceOf(FetchError);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(source.getResources()).toBeUndefined();
+  });
+
   it("cannot revive an offer with a read response arriving after release", async () => {
     const {source, fetch, request} = setup();
     fetch.mockResolvedValueOnce({sessionId: "released", orderGenerationVersion: 1});
@@ -1780,7 +2100,7 @@ describe("SessionPayloadSource", () => {
       fetch.mockResolvedValueOnce({sessionId: oldId}).mockResolvedValueOnce({sessionId: newId});
       const old = await source.prepare(request, signal);
       const current = await source.prepare(request, signal);
-      fetch.mockRejectedValueOnce(transportError("ECONNRESET"));
+      fetch.mockRejectedValueOnce(transportError("ECONNRESET")).mockRejectedValueOnce(transportError("ECONNRESET"));
       await expect(source.release(old, signal)).rejects.toBeInstanceOf(FetchError);
       const absent = new ErrorJsonRpcResponse(
         {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "UnknownSession"}},
@@ -1793,7 +2113,7 @@ describe("SessionPayloadSource", () => {
       await expect(source.getPayload(current, signal)).resolves.toMatchObject({sourceId: "session"});
       expect(
         fetch.mock.calls.filter(([call]) => call.method === "zbuilder_endV1").map(([call]) => call.params)
-      ).toEqual([[oldId], [oldId]]);
+      ).toEqual([[oldId], [oldId], [oldId]]);
     });
 
     it.each([

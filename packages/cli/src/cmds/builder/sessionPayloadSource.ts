@@ -857,14 +857,36 @@ export class SessionPayloadSource implements PayloadSource {
     entry.state = "releasing";
     entry.release = Promise.resolve()
       .then(async () => {
-        if (!entry.reserved) return this.rpc(signal).fetch({method: "zbuilder_endV1", params: [handle.payloadId]});
-        const cleanup = AbortSignal.any([signal, AbortSignal.timeout(6000)]);
+        const cleanup = entry.reserved ? AbortSignal.any([signal, AbortSignal.timeout(6000)]) : signal;
+        let retryTransport = true;
         while (true) {
           cleanup.throwIfAborted();
-          const result = await this.rpc(cleanup).fetch<{released: boolean; beginReservationVersion: number}>({
-            method: "zbuilder_cancelBeginV1",
-            params: [handle.payloadId],
-          });
+          let result: boolean | {released: boolean; beginReservationVersion: number};
+          try {
+            result = await this.rpc(cleanup).fetch<typeof result>({
+              method: entry.reserved ? "zbuilder_cancelBeginV1" : "zbuilder_endV1",
+              params: [handle.payloadId],
+            });
+          } catch (error) {
+            const transportFailure = isFetchError(error)
+              ? error.type === "failed"
+              : error instanceof TypeError &&
+                error.cause instanceof Error &&
+                "code" in error.cause &&
+                (error.cause.code === "UND_ERR_SOCKET" || error.cause.code === "ECONNRESET");
+            if (!retryTransport || cleanup.aborted || !transportFailure) throw error;
+            // A new primary may already have checked for uncertainty. Retry the
+            // idempotent cleanup once, under the same ownership and deadline.
+            retryTransport = false;
+            await sleep(100, cleanup);
+            continue;
+          }
+          if (!entry.reserved) return result;
+          if (typeof result !== "object")
+            throw new SessionPayloadError({
+              code: SessionPayloadErrorCode.RELEASE_UNCONFIRMED,
+              reason: handle.payloadId,
+            });
           if (result?.beginReservationVersion !== 1 || typeof result.released !== "boolean")
             throw new SessionPayloadError({
               code: SessionPayloadErrorCode.RELEASE_UNCONFIRMED,
