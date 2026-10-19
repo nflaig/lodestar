@@ -245,6 +245,7 @@ protolambda
 prover
 proxying
 pubsub
+reauthorization
 rebased
 recompiles
 repo
@@ -273,6 +274,8 @@ trustless
 typesafe
 udp
 uint
+unadopted
+unleased
 unpkg
 util
 utils
