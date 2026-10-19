@@ -178,11 +178,17 @@ measure that gap during a canary. Cancellation fences
 old grants even after their workers have ended. A new bounded construction may
 authorize a lower-value payload in the new generation; an old token is never
 updated to that generation. Such reconstructions share the existing four-attempt
-limit and spare worker. A generation-not-ready initial acquisition gets at most
+limit and spare worker. Only a committed owner's terminal renewal queues
+reauthorization; repeated attributes for a recorded but unadopted tuple do not
+authorize extra attempts. A generation-not-ready initial acquisition gets at most
 one retry within that same cap and deadline, after confirmed cleanup. Initial
 branches take priority. All previously signed
 payloads remain available for reveal, and recovered journals never restore offer
 permission. No additional gossip is scheduled by these renewals.
+An incumbent's temporary lease lapse does not lower the value floor for its
+refresh. Grant owners share the payload store's immutable transaction and blob
+bodies, including same-hash replacements, while keeping independent permission
+and valuation metadata.
 
 Local protocol tests use authenticated fixture state and canned Engine replies;
 they do not establish independent block validity or competitive improvement.

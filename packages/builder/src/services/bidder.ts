@@ -391,17 +391,12 @@ export class Bidder {
       return;
     }
     const retained = this.hasRetainedAlternate(event);
-    const kind: AlternateKind =
-      refresh && retained
-        ? "refresh"
-        : generations && !retained && this.hasRecordedAlternate(event)
-          ? "reauthorize"
-          : "initial";
+    // Only an owned grant's terminal renewal can queue reauthorization. A
+    // ledger record alone may be a failed adoption, not permission to retry it.
+    const kind: AlternateKind = refresh && retained ? "refresh" : "initial";
     if (
       id === primary.id ||
-      attempts.some(
-        (attempt) => attempt.id === id && kind !== "reauthorize" && (kind !== "refresh" || attempt.kind === "refresh")
-      ) ||
+      attempts.some((attempt) => attempt.id === id && (kind !== "refresh" || attempt.kind === "refresh")) ||
       this.alternateQueue.has(id) ||
       (!refresh &&
         this.modules.bidStore.get(data.proposalSlot, toRootHex(data.parentBlockHash), toRootHex(data.parentBlockRoot)))
@@ -819,6 +814,13 @@ export class Bidder {
           toRootHex(data.parentBlockHash),
           toRootHex(data.parentBlockRoot)
         );
+        const incumbent = this.retainedAlternates.get(this.alternateId(alternate.event));
+        const minimumValue =
+          incumbent &&
+          !incumbent.controller.signal.aborted &&
+          incumbent.payload.offerEligibility?.retained?.closed !== true
+            ? (incumbent.signed?.message.value ?? -1)
+            : -1;
         const retained = payload.offerEligibility?.retained
           ? this.startRetainedAlternate(
               alternate.event,
@@ -837,7 +839,7 @@ export class Bidder {
             signal,
             true,
             this.modules,
-            -1,
+            minimumValue,
             {
               coverableGwei,
               deadline,
@@ -969,6 +971,17 @@ export class Bidder {
     });
   }
 
+  private shareRetainedPayloadBody(payload: BuiltPayload): void {
+    if (!payload.offerEligibility?.retained) return;
+    const stored = this.modules.payloadStore.get(toRootHex(payload.executionPayload.blockHash))?.payload;
+    if (!stored) return;
+    // Rebind the wrapper captured by renewal/cleanup too. Grant and valuation
+    // remain independent; immutable body ownership stays inside the store budget.
+    payload.executionPayload = stored.executionPayload;
+    payload.executionRequests = stored.executionRequests;
+    payload.blobsBundle = stored.blobsBundle;
+  }
+
   private startRetainedAlternate(
     event: AlternatePayloadAttributesEvent,
     payload: BuiltPayload,
@@ -988,6 +1001,7 @@ export class Bidder {
       renewRequested: false,
     };
     if (this.retainedContext(retained) !== "valid") return undefined;
+    this.shareRetainedPayloadBody(payload);
     this.retainedOfferOwners.add(retained);
     const signal = AbortSignal.any([retained.controller.signal, this.modules.signal]);
     void (async () => {
@@ -1001,6 +1015,18 @@ export class Bidder {
             retained.renewRequested = false;
             try {
               await this.modules.orchestrator.renewOffer(payload, signal);
+              // The tuple can briefly become primary and re-add this identical
+              // signed root with its session lease. Once that lease ends, the
+              // current tuple owner may restore its independently renewed exact
+              // permission; never overwrite another still-eligible permission.
+              if (
+                retained.signed &&
+                this.retainedAlternates.get(retained.id) === retained &&
+                this.retainedContext(retained) === "valid" &&
+                isOfferEligible(payload.offerEligibility) &&
+                !isOfferEligible(this.modules.bidStore.getOfferEligibility(retained.signed))
+              )
+                this.modules.bidStore.add(retained.signed, payload.offerEligibility);
             } catch (error) {
               if (!signal.aborted && !payload.offerEligibility?.retained?.closed)
                 this.modules.logger.debug(
@@ -1009,7 +1035,7 @@ export class Bidder {
                   error as Error
                 );
             }
-            if (payload.offerEligibility?.retained?.closed) {
+            if (!signal.aborted && payload.offerEligibility?.retained?.closed) {
               reauthorize = true;
               break;
             }
@@ -1451,8 +1477,7 @@ export class Bidder {
     const previous = bidStore.get(slot, parentBlockHash, parentBlockRoot);
     if (apiRevision && previous && value <= previous.message.value) return previous;
     signal.throwIfAborted();
-    const {executionPayload} = payload;
-    const blockHash = toRootHex(executionPayload.blockHash);
+    const blockHash = toRootHex(payload.executionPayload.blockHash);
     if (alternate && this.modules.canRetainAlternate?.() !== true) {
       logger.debug("Skipping alternate parent bid", {...logCtx, reason: "journal_busy"});
       return null;
@@ -1466,6 +1491,7 @@ export class Bidder {
       {slot, parentBlockRoot: data.parentBlockRoot, blockHash, payload},
       alternate ? "alternate" : "offer"
     );
+    this.shareRetainedPayloadBody(payload);
 
     const bid = createExecutionPayloadBid({
       slot,
@@ -1515,8 +1541,8 @@ export class Bidder {
         value: prettyGweiToEth(value),
         payloadValue: prettyGweiToEth(payloadValueGwei),
         feeRecipient: toHex(feeRecipient),
-        gasLimit: executionPayload.gasLimit,
-        transactions: executionPayload.transactions.length,
+        gasLimit: payload.executionPayload.gasLimit,
+        transactions: payload.executionPayload.transactions.length,
         blobs: bid.blobKzgCommitments.length,
         slotBidRevisions: ledger.getRevisionCount(slot),
         retainedPayloads: this.modules.payloadStore.size,
