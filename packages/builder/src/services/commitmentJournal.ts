@@ -285,47 +285,62 @@ export class CommitmentJournal {
       )
         throw Error("COMMITMENT_PAYLOAD_REFERENCE");
     }
-    // A failed offer may leave orphan sidecars, never a payload referencing
-    // absent sidecars: recovery also needs this dependency order.
-    for (const file of this.sizes.has(files[0].name) ? [] : [...files.slice(1), files[0]]) {
-      if (this.sizes.has(file.name)) continue;
-      this.assertCapacity(file.name, file.bytes);
-      const filename = path.join(this.directory, file.name);
-      const temporary = `${filename}.tmp`;
-      // Missing/pruned source files fail this offer before publishing. Completed
-      // links own their data and can safely be reused by a subsequent offer.
+    // Blobs must be durable before linking their payload, including orphan payloads recovered after
+    // a crash. A partial group also needs a barrier before an unavailable source can fall back.
+    for (const filesToLink of this.sizes.has(files[0].name) ? [] : [files.slice(1), [files[0]]]) {
+      let linked = false;
       try {
-        fs.unlinkSync(temporary);
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      }
-      try {
-        fs.linkSync(path.join(this.sharedPayloadDirectory, file.name), temporary);
-      } catch (error) {
-        throw Error("COMMITMENT_REFERENCE_UNAVAILABLE", {cause: error});
-      }
-      try {
-        const info = fs.lstatSync(temporary, {bigint: true});
-        if (
-          !info.isFile() ||
-          info.dev !== file.dev ||
-          info.ino !== file.ino ||
-          info.size !== BigInt(file.bytes) ||
-          info.mtimeNs !== file.mtimeNs
-        )
-          throw Error("COMMITMENT_PAYLOAD_REFERENCE");
-      } catch (error) {
-        fs.unlinkSync(temporary);
-        throw error;
-      }
-      try {
-        fs.renameSync(temporary, filename);
-        syncDirectory(this.directory);
-        this.sizes.set(file.name, file.bytes);
-        this.bytes += file.bytes;
-      } catch (error) {
-        this.failed = true;
-        throw error;
+        for (const file of filesToLink) {
+          if (this.sizes.has(file.name)) continue;
+          this.assertCapacity(file.name, file.bytes);
+          const filename = path.join(this.directory, file.name);
+          const temporary = `${filename}.tmp`;
+          // Missing/pruned source files fail this offer before publishing. Completed
+          // links own their data and can safely be reused by a subsequent offer.
+          try {
+            fs.unlinkSync(temporary);
+          } catch (error) {
+            if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+          }
+          try {
+            fs.linkSync(path.join(this.sharedPayloadDirectory, file.name), temporary);
+          } catch (error) {
+            throw Error("COMMITMENT_REFERENCE_UNAVAILABLE", {cause: error});
+          }
+          try {
+            const info = fs.lstatSync(temporary, {bigint: true});
+            if (
+              !info.isFile() ||
+              info.dev !== file.dev ||
+              info.ino !== file.ino ||
+              info.size !== BigInt(file.bytes) ||
+              info.mtimeNs !== file.mtimeNs
+            )
+              throw Error("COMMITMENT_PAYLOAD_REFERENCE");
+          } catch (error) {
+            fs.unlinkSync(temporary);
+            throw error;
+          }
+          try {
+            fs.renameSync(temporary, filename);
+            this.sizes.set(file.name, file.bytes);
+            this.bytes += file.bytes;
+            linked = true;
+          } catch (error) {
+            this.failed = true;
+            throw error;
+          }
+        }
+      } finally {
+        if (linked) {
+          try {
+            syncDirectory(this.directory);
+          } catch (error) {
+            this.failed = true;
+            // biome-ignore lint/correctness/noUnsafeFinally: An uncertain barrier must override a source error to forbid snapshot fallback.
+            throw error;
+          }
+        }
       }
     }
     const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid));
