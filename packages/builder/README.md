@@ -176,6 +176,44 @@ With begin reservations, confirmed cancellation recovers capacity after a lost r
 Half of the revision, payload-byte and payload-count admission limits remains reserved
 for primary work. Alternates enter the durable journal only while it is idle.
 
+`--bidding.alternateRefreshBeforeSlotMs` defaults to `0` (disabled). With alternate
+branches enabled, values from 500 through 5000 schedule one last refresh for each
+retained alternate tuple, starting that many milliseconds before the proposal slot.
+This also covers an earlier primary that is subsequently received as an authoritative
+alternate event. Builder eligibility and collateral must come from that event; an old
+primary alone cannot authorize a refresh. Events for the current primary are ignored,
+so a context received only before the primary changes does not schedule a refresh.
+
+Refreshes share the four-attempt limit with initial snapshots and preemption retries.
+Unattempted queued branches take priority, and a preempted refresh is not retried.
+A refresh replaces an API offer only when its value increases. Earlier signed payloads
+remain available for reveal. A snapshot that fails to retain an offer does not schedule
+another refresh. Context, preferences, spare-worker capacity and journal availability
+are checked again before retention.
+
+The refresh lead is a scheduling target, not a reserved execution window. It can be
+delayed or skipped by primary work, gossip deadlines or admission limits. It must leave
+more than the build duration plus 50 ms before the slot. For example, with a 500 ms
+build duration, primary gossip at 9250 bps and stages at 9850/10000/10400/10800 bps,
+a 750 ms lead starts after the primary's exclusion window and finishes before the
+first stage's exclusion window. A 500 ms lead cannot fit and is skipped. Choose a lead
+against the actual gossip schedule and measure primary performance before enabling it.
+
+To qualify the scheduler separately from native construction, run:
+
+```sh
+pnpm --filter '@lodestar/builder...' build
+node --expose-gc packages/builder/test/perf/alternateParentRefresh.mjs > refresh-results.json
+```
+
+This compares refresh off/on over two alternating pairs with identical synthetic
+transaction arrivals, roughly 130 transactions per late payload and real wall-clock
+scheduling, signing and worker-backed durable journals. It reports retained alternate
+value, primary revisions, stage timing, journal costs, CPU time and timer gaps. The fake
+provider performs no transaction execution or proof loading, and its transport has fixed
+delays. Those results cannot establish the native constructor cost or live fee gains;
+follow with an isolated canary while monitoring primary throughput and bid timing.
+
 This initial mode publishes alternate bids through HTTP and WebSocket only. Primary
 and staged gossip behavior is unchanged. Previously advertised payloads remain retained
 for reveal when a new primary replaces their branch. The work limits can omit contexts;
