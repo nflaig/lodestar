@@ -393,7 +393,7 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
 
   "builderApi.bidStreamAdaptiveTiming": {
     description:
-      "Adapt bid-stream send deadlines to measured RTT; requires bidStream and verified end-to-end pong forwarding",
+      "Adapt bid-stream send deadlines to measured RTT; requires bid streaming and verified end-to-end pong forwarding",
     type: "boolean",
     default: false,
     group: "builderApi",

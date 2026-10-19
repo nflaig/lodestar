@@ -13,6 +13,7 @@ CTRL
 Casper
 Chai
 ChainSafe
+Cloudflare
 Codespaces
 CoinCashew
 Corepack

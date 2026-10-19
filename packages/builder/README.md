@@ -125,7 +125,7 @@ fallback. Reservations are scoped to one native process instance, so a native re
 requires coordinated publisher restart and recovery of its durable reveal journal.
 Routing a reservation to another instance fails closed and keeps its capacity
 uncertain. A cleanup timeout also retains capacity; later reconciliation may recover
-it without restarting either process. Already signed payloads remain revealable.
+it without restarting either process. Already signed payloads remain available for reveal.
 
 ## Experimental alternate parent bids
 
@@ -163,7 +163,7 @@ enable alternate emission on the beacon node.
 Keep `chain.fastConfirmation` disabled (the default). Alternate events are suppressed
 with fast confirmation because its safe execution hash can be ahead of an alternate parent.
 
-Alternates start only after an unleased primary snapshot is retained. One spare native
+Alternates start only after a primary snapshot with no active lease is retained. One spare native
 worker produces one alternate snapshot at a time, with at most four attempts per slot.
 `--bidding.alternateBuildDurationMs` defaults to 500 ms and accepts 250 through 1000 ms.
 Construction stops for a new primary and does not start near scheduled gossip or too
@@ -187,7 +187,7 @@ primary alone cannot authorize a refresh. Events for the current primary are ign
 so a context received only before the primary changes does not schedule a refresh.
 
 Refreshes share the four-attempt limit with initial snapshots and preemption retries.
-Unattempted queued branches take priority, and a preempted refresh is not retried.
+Queued branches not yet attempted take priority, and a preempted refresh is not retried.
 A refresh replaces an API offer only when its value increases. Earlier signed payloads
 remain available for reveal. A snapshot that fails to retain an offer does not schedule
 another refresh. Context, preferences, spare-worker capacity and journal availability
