@@ -113,6 +113,7 @@ export class BuilderApiClient {
   private readonly clients = new Map<BuilderUrl, BuilderApi>();
   private activeStreams = 0;
   private streamAgent?: Agent;
+  private bidAttemptSequence = 0;
 
   constructor(
     private readonly opts: BuilderApiClientOpts,
@@ -151,6 +152,7 @@ export class BuilderApiClient {
     proposerPubkey: BLSPubkey,
     signal?: AbortSignal
   ): Promise<BuilderApiBid[]> {
+    const collectionId = `${slot}-${++this.bidAttemptSequence}`;
     const streamController = new AbortController();
     const streamSignal = this.signal
       ? AbortSignal.any([streamController.signal, this.signal])
@@ -222,6 +224,8 @@ export class BuilderApiClient {
                 parentHash,
                 parentRoot,
                 proposerPubkey,
+                roundIndex,
+                collectionId,
                 streamSignal,
                 collect,
                 signal
@@ -249,8 +253,17 @@ export class BuilderApiClient {
         await Promise.race([
           collection,
           new Promise<void>((resolve) => {
-            onAbort = resolve;
-            if (signal.aborted) resolve();
+            onAbort = () => {
+              resolve();
+              this.logBidTiming({
+                slot,
+                collectionId,
+                event: "collection_stopped",
+                atMs: performance.now(),
+                candidates: candidates.size,
+              });
+            };
+            if (signal.aborted) onAbort();
             else signal.addEventListener("abort", onAbort, {once: true});
           }),
         ]);
@@ -277,6 +290,8 @@ export class BuilderApiClient {
     parentHash: Root,
     parentRoot: Root,
     proposerPubkey: BLSPubkey,
+    roundIndex: number,
+    collectionId: string,
     signal: AbortSignal,
     onBid: (bid: StreamedBuilderBid) => void,
     stopSignal?: AbortSignal
@@ -285,6 +300,36 @@ export class BuilderApiClient {
     const started = performance.now();
     let timeoutMs = this.bidDeadline;
     let requestTimeoutMs = timeoutMs + BUILDER_BID_LAG_BUFFER_MS;
+    const attempt = `${slot}-${++this.bidAttemptSequence}`;
+    const advertisedBudgetDeadlineAtMs = started + timeoutMs;
+    const clientBudgetDeadlineAtMs = started + requestTimeoutMs;
+    const timingContext = {
+      slot,
+      collectionId,
+      attempt,
+      roundIndex,
+      builder: toPrintableUrl(url),
+      parentHash: toHex(parentHash),
+      parentRoot: toHex(parentRoot),
+      startedAtMs: started,
+      advertisedBudgetDeadlineAtMs,
+      clientBudgetDeadlineAtMs,
+    };
+    const logTiming = (
+      event: string,
+      atMs: number,
+      fields: Record<string, string | number | boolean | undefined> = {}
+    ): void => {
+      this.logBidTiming({
+        ...timingContext,
+        event,
+        atMs,
+        advertisedBudgetSlackMs: advertisedBudgetDeadlineAtMs - atMs,
+        clientBudgetSlackMs: clientBudgetDeadlineAtMs - atMs,
+        ...fields,
+      });
+    };
+    logTiming("started", started);
     if (
       this.opts.bidStream &&
       this.config.getForkName(slot) === ForkName.gloas &&
@@ -308,6 +353,7 @@ export class BuilderApiClient {
           stopSignal,
           msFromSlot: () => this.clock.msFromSlot(slot),
           onBid,
+          onTiming: ({event, atMs, ...fields}) => logTiming(`websocket_${event}`, atMs, fields),
         });
         const elapsed = performance.now() - started;
         timeoutMs = Math.floor(this.bidDeadline - elapsed);
@@ -335,17 +381,53 @@ export class BuilderApiClient {
             : {}),
         });
         if (result.upgraded || signal.aborted || timeoutMs <= 0) return result.bid;
+        logTiming("http_fallback", performance.now(), {timeoutMs, requestTimeoutMs});
       } finally {
         this.activeStreams--;
       }
     }
     if (signal.aborted) return undefined;
-    const res = await client.getExecutionPayloadBid(
-      {slot, parentHash, parentRoot, proposerPubkey, requestAuth: entry.auth, dateMilliseconds: Date.now(), timeoutMs},
+    const dateMilliseconds = Date.now();
+    const dispatchedAt = performance.now();
+    const response = client.getExecutionPayloadBid(
+      {slot, parentHash, parentRoot, proposerPubkey, requestAuth: entry.auth, dateMilliseconds, timeoutMs},
       {timeoutMs: requestTimeoutMs, signal, redirect: "manual"}
     );
-    const signedBid = res.value();
-    return signedBid ? {signedBid, receivedMs: this.clock.msFromSlot(slot)} : undefined;
+    const dispatchTiming = {dateMilliseconds, timeoutMs, requestTimeoutMs, dispatchedAtMs: dispatchedAt};
+    logTiming("http_dispatch", dispatchedAt, dispatchTiming);
+    let statusCode: number | undefined;
+    try {
+      const res = await response;
+      statusCode = res.status;
+      const signedBid = res.value();
+      const bid = signedBid ? {signedBid, receivedMs: this.clock.msFromSlot(slot)} : undefined;
+      const decodedAt = performance.now();
+      logTiming("http_decoded", decodedAt, {
+        ...dispatchTiming,
+        dispatchBudgetSlackMs: dispatchedAt + timeoutMs - decodedAt,
+        dispatchClientBudgetSlackMs: dispatchedAt + requestTimeoutMs - decodedAt,
+        statusCode: res.status,
+        receivedMs: bid?.receivedMs,
+        blockHash: bid ? toHex(bid.signedBid.message.blockHash) : undefined,
+      });
+      return bid;
+    } catch (e) {
+      logTiming("http_failed", performance.now(), {
+        ...dispatchTiming,
+        statusCode,
+        aborted: signal.aborted,
+        errorName: e instanceof Error ? e.constructor.name : "unknown",
+      });
+      throw e;
+    }
+  }
+
+  private logBidTiming(context: Record<string, string | number | boolean | undefined>): void {
+    try {
+      this.logger?.debug("Builder bid request timing", context);
+    } catch {
+      // Diagnostics must not change transport or bid selection.
+    }
   }
 
   private getStreamAgent(): Agent {
