@@ -868,7 +868,13 @@ export class SessionPayloadSource implements PayloadSource {
               params: [handle.payloadId],
             });
           } catch (error) {
-            if (!retryTransport || cleanup.aborted || !isFetchError(error) || error.type !== "failed") throw error;
+            const transportFailure = isFetchError(error)
+              ? error.type === "failed"
+              : error instanceof TypeError &&
+                error.cause instanceof Error &&
+                "code" in error.cause &&
+                (error.cause.code === "UND_ERR_SOCKET" || error.cause.code === "ECONNRESET");
+            if (!retryTransport || cleanup.aborted || !transportFailure) throw error;
             // A new primary may already have checked for uncertainty. Retry the
             // idempotent cleanup once, under the same ownership and deadline.
             retryTransport = false;
