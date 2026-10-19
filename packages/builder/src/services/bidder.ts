@@ -850,11 +850,6 @@ export class Bidder {
         const coverableGwei = this.getAlternateLimit(alternate.event, primary);
         if (coverableGwei === null) return;
         if (this.modules.proposerPreferencesTracker.get(data.proposalSlot, dependentRoot) !== preferences) return;
-        const previous = this.modules.bidStore.get(
-          data.proposalSlot,
-          toRootHex(data.parentBlockHash),
-          toRootHex(data.parentBlockRoot)
-        );
         const incumbent = this.retainedAlternates.get(this.alternateId(alternate.event));
         const incomingEligibility = payload.offerEligibility;
         const incumbentEligibility = incumbent?.payload.offerEligibility;
@@ -866,6 +861,11 @@ export class Bidder {
         // The fresh grant proves this lease is fenced even before its next renewal.
         // Keep the owner alive so a failed replacement can still earn reconstruction.
         if (newerGeneration && incumbentEligibility) incumbentEligibility.lease.ready = false;
+        const previous = this.modules.bidStore.get(
+          data.proposalSlot,
+          toRootHex(data.parentBlockHash),
+          toRootHex(data.parentBlockRoot)
+        );
         const minimumValue =
           incumbent &&
           !incumbent.controller.signal.aborted &&
@@ -900,7 +900,11 @@ export class Bidder {
               },
             }
           );
-          alternate.retainedOffer = signed !== null && signed !== previous && this.modules.bidStore.canOffer(signed);
+          alternate.retainedOffer =
+            signed !== null &&
+            signed !== previous &&
+            toRootHex(signed.message.blockHash) === toRootHex(payload.executionPayload.blockHash) &&
+            this.modules.bidStore.canOffer(signed);
           if (retained && alternate.retainedOffer && signed) {
             retained.signed = signed;
             // Only retire the preceding exact grant after its replacement has
@@ -920,7 +924,7 @@ export class Bidder {
               parentBlockRoot: toRootHex(data.parentBlockRoot),
               parentBlockHash: toRootHex(data.parentBlockHash),
               improved: alternate.retainedOffer,
-              previousValueGwei: previous?.message.value,
+              previousValueGwei: incumbent?.signed?.message.value ?? previous?.message.value,
               valueGwei: signed?.message.value,
               secFromSlot: this.modules.clock.secFromSlot(data.proposalSlot),
             });
