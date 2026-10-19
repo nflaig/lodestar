@@ -52,6 +52,26 @@ describe("cmds / builder / api server", () => {
     expect(res.statusCode).toBe(200);
   });
 
+  it("keeps the client deadline anchor even when edge timestamp headers are supplied", async () => {
+    const received = vi.fn().mockResolvedValue({data: undefined, meta: {version: "gloas"}, status: 204});
+    const root = toHex(Buffer.alloc(32));
+    const clientStamp = Date.now() - 200;
+    const res = await getServer({getExecutionPayloadBid: received}).inject({
+      method: "POST",
+      url: `/eth/v1/builder/execution_payload_bid/5/${root}/${root}/${toHex(Buffer.alloc(48))}`,
+      headers: {
+        "Eth-Consensus-Version": "gloas",
+        "Date-Milliseconds": String(clientStamp),
+        "X-Timeout-Ms": "400",
+        "X-Edge-Received-Sec": String(Math.floor(Date.now() / 1000)),
+        "X-Edge-Received-Msec": String(Date.now() % 1000),
+      },
+      payload: ssz.gloas.SignedBuilderRequestAuth.toJson(ssz.gloas.SignedBuilderRequestAuth.defaultValue()) as object,
+    });
+    expect(res.statusCode).toBe(204);
+    expect(received).toHaveBeenCalledWith(expect.objectContaining({dateMilliseconds: clientStamp}), expect.anything());
+  });
+
   it("does not serve routes of earlier forks", async () => {
     const res = await getServer().inject({method: "POST", url: "/eth/v1/builder/validators", payload: []});
 

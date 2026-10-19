@@ -29,7 +29,23 @@ export type BuilderApi = Pick<
 export type BuilderApiOptions = {
   /** Auth data proposers must sign their requests with */
   authData: Uint8Array;
+  /** HTTP only: optional operator estimate limiting the mirrored return allowance. */
+  httpReturnReserveCapMs?: number;
+  /** HTTP only: scheduling/serialization headroom; tune separately from the return allowance. */
+  httpResponseMarginMs?: number;
 };
+
+export function validateHttpBidResponseTiming(
+  opts: Pick<BuilderApiOptions, "httpReturnReserveCapMs" | "httpResponseMarginMs">
+): void {
+  const {httpReturnReserveCapMs: cap, httpResponseMarginMs: margin} = opts;
+  if (cap !== undefined && (!Number.isSafeInteger(cap) || cap < 0 || cap > 10_000)) {
+    throw Error("--builderApi.httpReturnReserveCapMs must be an integer between 0 and 10000");
+  }
+  if (margin !== undefined && (!Number.isSafeInteger(margin) || margin < 20 || margin > 1_000)) {
+    throw Error("--builderApi.httpResponseMarginMs must be an integer between 20 and 1000");
+  }
+}
 
 export type BuilderApiModules = {
   config: BeaconConfig;
@@ -46,6 +62,13 @@ export type BuilderApiModules = {
 /** Serves retained bids to proposers that request them directly and accepts their signed blocks */
 export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOptions): BuilderApi {
   const {api, bidStore, builderIndex, clock, config, logger, metrics, proposerDutiesTracker} = modules;
+  validateHttpBidResponseTiming(opts);
+  const responseMarginMs = opts.httpResponseMarginMs ?? BID_RESPONSE_MARGIN_MS;
+  const returnReserveCapMs = opts.httpReturnReserveCapMs ?? Infinity;
+  logger.info("HTTP bid response timing", {
+    responseMarginMs,
+    returnReserveCapMs: opts.httpReturnReserveCapMs ?? "request age",
+  });
   let waitingBidRequests = 0;
 
   return {
@@ -60,10 +83,14 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
       if (modules.signal?.aborted) throw new ApiError(503, "Builder is stopping");
       const started = performance.now();
       const transitMs = Date.now() - dateMilliseconds;
-      // The request timeout includes inbound transit. Reserve the same amount for the reply,
-      // plus serialization/scheduling headroom. A future timestamp disables waiting because of clock skew.
+      // Request age includes connection setup, queues and clock offset, not just network transit.
+      // Keep the proposer's deadline anchor. An optional return cap is an operator assumption,
+      // not a measured return path. Future timestamps disable waiting because of clock skew.
       // Use the slot end to bound long waits: a revision can finish retention after construction stops.
-      const waitBudget = bidWaitBudget(clock, config, slot, transitMs, timeoutMs);
+      const waitBudget = bidResponseBudgets(clock, config, slot, transitMs, timeoutMs, {
+        returnReserveCapMs,
+        responseMarginMs,
+      }).waitMs;
       if (requestAuth.message.slot !== slot) {
         throw new ApiError(
           400,
@@ -97,7 +124,12 @@ export function getBuilderApi(modules: BuilderApiModules, opts: BuilderApiOption
         parentBlockRoot,
         proposer: toPubkeyHex(proposerPubkey),
         requestTransitMs: transitMs,
+        requestAgeMs: transitMs,
+        returnReserveMs: Math.max(0, Math.min(transitMs, returnReserveCapMs)),
+        responseMarginMs,
+        waitBudgetMs: Math.round(waitBudget),
         bidWaitMs: Math.round(performance.now() - waitStarted),
+        responseReadyOverrunMs: Math.max(0, Math.round(performance.now() - started - waitBudget)),
         waitCapacityExceeded,
       };
       const version = config.getForkName(slot);
@@ -191,14 +223,18 @@ export function bidResponseBudgets(
   config: BeaconConfig,
   slot: number,
   transitMs: number,
-  timeoutMs: number
+  timeoutMs: number,
+  timing: {returnReserveCapMs: number; responseMarginMs: number} = {
+    returnReserveCapMs: Infinity,
+    responseMarginMs: BID_RESPONSE_MARGIN_MS,
+  }
 ): {waitMs: number; hardStopMs: number} {
   const currentSlot = clock.getCurrentSlot();
   if (!(transitMs >= 0 && slot >= currentSlot && slot <= currentSlot + 1)) return {waitMs: 0, hardStopMs: 0};
   const slotRemaining = clock.msToSlot(slot) + config.SLOT_DURATION_MS;
-  const requestRemaining = timeoutMs - transitMs - BID_RESPONSE_MARGIN_MS;
+  const requestRemaining = timeoutMs - transitMs - timing.responseMarginMs;
   return {
-    waitMs: Math.max(0, Math.min(requestRemaining - transitMs, slotRemaining)),
+    waitMs: Math.max(0, Math.min(requestRemaining - Math.min(transitMs, timing.returnReserveCapMs), slotRemaining)),
     hardStopMs: Math.max(0, Math.min(requestRemaining, slotRemaining)),
   };
 }

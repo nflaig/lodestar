@@ -80,9 +80,12 @@ export class BuilderRestApiServer extends RestApiServer {
 
     super(opts, modules);
 
+    const arrivals = new WeakMap<object, {unixMs: number; monotonicMs: number}>();
+
     // Bid eligibility is short-lived. Intermediaries must never replay an
     // earlier response after the constructor has fenced its order generation.
-    this.server.addHook("onRequest", async (_req, res) => {
+    this.server.addHook("onRequest", async (req, res) => {
+      arrivals.set(req, {unixMs: Date.now(), monotonicMs: performance.now()});
       res.header("Cache-Control", "no-store");
     });
     this.server.addHook("onSend", (_req, res, payload, done) => {
@@ -126,6 +129,10 @@ export class BuilderRestApiServer extends RestApiServer {
 
       const {slot, proposer_pubkey: proposer} = (req.params ?? {}) as {slot?: number; proposer_pubkey?: string};
       const dateMs = Number(req.headers[DATE_MILLISECONDS_HEADER]);
+      const timeoutMs = Number(req.headers[TIMEOUT_MS_HEADER]);
+      const arrival = arrivals.get(req);
+      const durationMs = arrival ? performance.now() - arrival.monotonicMs : res.elapsedTime;
+      const requestAgeMs = arrival && Number.isFinite(dateMs) ? arrival.unixMs - dateMs : undefined;
       // Routes without path params or timing headers only log the fields they have
       const logCtx = removeUndefined({
         operationId,
@@ -136,9 +143,15 @@ export class BuilderRestApiServer extends RestApiServer {
         // The proxies in front of the builder API pass on the address of the caller
         ip: firstHeaderValue(req.headers[CF_CONNECTING_IP_HEADER] ?? req.headers[FORWARDED_FOR_HEADER]) ?? req.ip,
         timeoutMs: firstHeaderValue(req.headers[TIMEOUT_MS_HEADER]),
-        // Time the request took to arrive, based on the send time reported by the caller
-        transitMs: Number.isFinite(dateMs) ? Math.round(Date.now() - res.elapsedTime - dateMs) : undefined,
-        durationMs: Math.round(res.elapsedTime),
+        // This cross-clock age includes connection setup, queues and clock offset. Edge headers do not replace it.
+        transitMs: requestAgeMs,
+        requestAgeMs,
+        // Remaining client budget at the origin's response completion, before the unmeasured return path.
+        responseDeadlineRemainingMs:
+          requestAgeMs !== undefined && Number.isFinite(timeoutMs)
+            ? Math.round(timeoutMs - requestAgeMs - durationMs)
+            : undefined,
+        durationMs: Math.round(durationMs),
       });
 
       if (operationId === "getExecutionPayloadBid" || operationId === "submitSignedBeaconBlock") {

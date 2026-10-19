@@ -329,6 +329,34 @@ because of scheduling or network delay. Cancellation does not retract delivered 
 independently authorized copies, or fence copied processes on other hosts. Arbitrary
 VM snapshot rollback and clock restoration are outside the lease assumptions.
 
+## HTTP bid response timing
+
+HTTP bid requests keep the proposer's `Date-Milliseconds` as the timeout anchor.
+The default wait reserves the request age for the reply and another 50 ms for
+scheduling and serialization. Request age includes connection setup, queues and
+clock offset; it is not a measurement of the return path.
+
+`--builderApi.httpReturnReserveCapMs` optionally caps that mirrored reply allowance
+(integer 0–10000 ms). For example, age 158 ms and timeout 400 ms give a 34 ms wait
+by default, or 132 ms with a 60 ms cap and the unchanged 50 ms margin. This is an
+operator assumption: a slower return path can cause a timeout. The cap defaults
+to unset, affects HTTP only, and never moves the client deadline. Cloudflare
+timestamp headers do not replace that deadline, and other callers' request ages
+are not used to learn it.
+
+`--builderApi.httpResponseMarginMs` independently sets scheduling/serialization
+headroom (integer 20–1000 ms, default 50). Keep it at 50 while testing a return cap.
+The served-bid log records request age, reply allowance, planned wait and how late
+the bid was ready against that plan. The API request log records remaining client
+budget at origin response completion, before the unmeasured return trip. These
+logs cannot prove that the proposer received the complete response on time; use
+client-side completion/timeout evidence for that.
+
+The manual loopback test `node packages/cli/test/perf/bidResponseTiming.mjs` (after
+building the builder and CLI) exercises real authenticated routes with controlled
+transport delays. It includes both a fresher on-time capped response and a slower
+return path where the same cap times out. It does not measure a production path.
+
 ## Experimental Gloas bid streaming
 
 Enable `--builderApi --builderApi.bidStream` to serve the WebSocket extension used by

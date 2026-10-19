@@ -7,7 +7,13 @@ import {ZERO_HASH, computeDomain, computeSigningRoot} from "@lodestar/state-tran
 import {gloas, ssz} from "@lodestar/types";
 import * as utils from "@lodestar/utils";
 import {BuilderBidStreamApi, getBuilderBidStreamApi} from "../../../src/api/bidStream.js";
-import {BuilderApi, bidResponseBudgets, getBuilderApi} from "../../../src/api/impl.js";
+import {
+  BuilderApi,
+  BuilderApiOptions,
+  bidResponseBudgets,
+  getBuilderApi,
+  validateHttpBidResponseTiming,
+} from "../../../src/api/impl.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {ProposerDutiesTracker} from "../../../src/services/proposerDutiesTracker.js";
 import {getApiClientStub, mockApiResponse} from "../utils/apiStub.js";
@@ -47,35 +53,9 @@ describe("builder api", () => {
     clock.currentSlot = slot;
     bidStore = new BidStore();
     controller = new AbortController();
-    builderApi = getBuilderApi(
-      {
-        config,
-        logger: getMockedLogger(),
-        clock,
-        api,
-        bidStore,
-        proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
-        builderIndex,
-        metrics: null,
-        signal: controller.signal,
-      },
-      {authData}
-    );
+    builderApi = createHttpApi();
 
-    streamApi = getBuilderBidStreamApi(
-      {
-        config,
-        logger: getMockedLogger(),
-        clock,
-        api,
-        bidStore,
-        proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
-        builderIndex,
-        metrics: null,
-        signal: controller.signal,
-      },
-      {authData}
-    );
+    streamApi = createStreamApi();
 
     signedBid = ssz.gloas.SignedExecutionPayloadBid.defaultValue();
     signedBid.message.slot = slot;
@@ -86,6 +66,40 @@ describe("builder api", () => {
     signedBid.message.value = 5;
     bidStore.add(signedBid);
   });
+
+  function createStreamApi(options: Partial<BuilderApiOptions> = {}): BuilderBidStreamApi {
+    return getBuilderBidStreamApi(
+      {
+        config,
+        logger: getMockedLogger(),
+        clock,
+        api,
+        bidStore,
+        proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
+        builderIndex,
+        metrics: null,
+        signal: controller.signal,
+      },
+      {authData, ...options}
+    );
+  }
+
+  function createHttpApi(options: Partial<BuilderApiOptions> = {}): BuilderApi {
+    return getBuilderApi(
+      {
+        config,
+        logger: getMockedLogger(),
+        clock,
+        api,
+        bidStore,
+        proposerDutiesTracker: new ProposerDutiesTracker(api, clock),
+        builderIndex,
+        metrics: null,
+        signal: controller.signal,
+      },
+      {authData, ...options}
+    );
+  }
 
   function signAuth(
     message: gloas.BuilderRequestAuth = {data: authData, slot},
@@ -119,6 +133,139 @@ describe("builder api", () => {
     block.signature = secretKey.sign(signingRoot).toBytes();
     return block;
   }
+
+  describe("HTTP return reserve", () => {
+    beforeEach(() => {
+      vi.useFakeTimers({toFake: ["Date", "performance", "setTimeout", "clearTimeout"]});
+      vi.setSystemTime(1_700_000_000_000);
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+    });
+
+    it("keeps the default formula across request ages and slot boundaries", () => {
+      for (const remaining of [0, 20, 500, 12000]) {
+        vi.spyOn(clock, "msToSlot").mockReturnValue(remaining - config.SLOT_DURATION_MS);
+        for (const age of [-1, 0, 25, 158, 300, 1000]) {
+          for (const timeout of [0, 150, 400, 1500]) {
+            expect(bidResponseBudgets(clock, config, slot, age, timeout)).toEqual({
+              waitMs: age < 0 ? 0 : Math.max(0, Math.min(timeout - 2 * age - 50, remaining)),
+              hardStopMs: age < 0 ? 0 : Math.max(0, Math.min(timeout - age - 50, remaining)),
+            });
+          }
+        }
+      }
+    });
+
+    it("changes the return reserve without moving the original client deadline", () => {
+      for (const cap of [0, 20, 60, 250, Infinity]) {
+        const budget = bidResponseBudgets(clock, config, slot, 158, 400, {
+          returnReserveCapMs: cap,
+          responseMarginMs: 50,
+        });
+        expect(budget.hardStopMs).toBe(192);
+        expect(budget.waitMs).toBe(Math.max(0, 192 - Math.min(158, cap)));
+      }
+    });
+
+    it("can include a newer retained bid during the additional wait", async () => {
+      builderApi = createHttpApi({httpReturnReserveCapMs: 60});
+      const resolved = vi.fn();
+      const response = builderApi
+        .getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now() - 158, timeoutMs: 400}))
+        .then(resolved);
+      await vi.advanceTimersByTimeAsync(100);
+      const better = structuredClone(signedBid);
+      better.message.value = 10;
+      better.message.blockHash = Buffer.alloc(32, 9);
+      bidStore.add(better);
+      await vi.advanceTimersByTimeAsync(31);
+      expect(resolved).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await response;
+      expect(resolved).toHaveBeenCalledExactlyOnceWith({data: better, meta: {version: ForkName.gloas}});
+    });
+
+    it("never grants a fresh deadline after slow authentication", async () => {
+      builderApi = createHttpApi({httpReturnReserveCapMs: 60});
+      const duties = await api.validator.getProposerDutiesV2({epoch: 0});
+      api.validator.getProposerDutiesV2.mockImplementationOnce(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        vi.setSystemTime(Date.now() - 10000);
+        return duties;
+      });
+      const resolved = vi.fn();
+      const response = builderApi
+        .getExecutionPayloadBid(bidRequest({dateMilliseconds: Date.now() - 158, timeoutMs: 400}))
+        .then(resolved);
+      await vi.advanceTimersByTimeAsync(131);
+      expect(resolved).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await response;
+      expect(resolved).toHaveBeenCalledOnce();
+    });
+
+    it("does not apply HTTP overrides to WebSocket deadlines", async () => {
+      streamApi = createStreamApi({httpReturnReserveCapMs: 0, httpResponseMarginMs: 20});
+      const stream = await streamApi.open(bidRequest({dateMilliseconds: Date.now() - 158, timeoutMs: 400}));
+      expect(stream.deadline).toBe(34);
+      expect(stream.hardDeadline?.monotonic).toBe(192);
+    });
+
+    it("fences a cancelled generation during the longer wait and at serialization", async () => {
+      builderApi = createHttpApi({httpReturnReserveCapMs: 60});
+      const lease = {generation: "0x0", ready: true, validUntil: 1000, validUntilUnixMs: Date.now() + 1000};
+      bidStore.add(signedBid, {generation: "0x0", lease});
+      const pending = builderApi.getExecutionPayloadBid(
+        bidRequest({dateMilliseconds: Date.now() - 158, timeoutMs: 400})
+      );
+      await vi.advanceTimersByTimeAsync(100);
+      lease.generation = "0x1";
+      await vi.advanceTimersByTimeAsync(32);
+      expect((await pending).status).toBe(204);
+      expect(bidStore.has(signedBid)).toBe(true);
+
+      lease.generation = "0x0";
+      let guard: (() => boolean) | undefined;
+      const response = builderApi.getExecutionPayloadBid(
+        bidRequest({dateMilliseconds: Date.now() - 158, timeoutMs: 400}),
+        {
+          setResponseGuard: (value) => {
+            guard = value;
+          },
+        }
+      );
+      await vi.advanceTimersByTimeAsync(132);
+      expect((await response).data).toBe(signedBid);
+      expect(guard?.()).toBe(true);
+      lease.generation = "0x1";
+      expect(guard?.()).toBe(false);
+    });
+
+    it("shows why edge substitution and a historical minimum cannot guarantee the caller deadline", () => {
+      const wait = (age: number, timeout: number) => bidResponseBudgets(clock, config, slot, age, timeout).waitMs;
+      // 90 ms before edge, 10 ms onward, 25 ms return. Edge-25 shifts an already running timeout.
+      expect(100 + wait(100, 400) + 25).toBeLessThan(400);
+      expect(100 + wait(35, 400) + 25).toBeGreaterThan(400);
+      // Past minimum inbound 10 ms cannot bound today's 55 ms return and 30 ms scheduling cost.
+      expect(40 + wait(40, 400) + 55 + 30).toBeLessThan(400);
+      const minimumReserve = bidResponseBudgets(clock, config, slot, 40, 400, {
+        returnReserveCapMs: 10,
+        responseMarginMs: 50,
+      });
+      expect(40 + minimumReserve.waitMs + 55 + 30).toBeGreaterThan(400);
+    });
+
+    it.each([-1, NaN, Infinity, 1.5, 10_001])("rejects invalid return cap %s", (cap) => {
+      expect(() => createHttpApi({httpReturnReserveCapMs: cap})).toThrow("httpReturnReserveCapMs");
+    });
+
+    it.each([-1, 0, 19, NaN, Infinity, 20.5, 1_001])("rejects invalid margin %s", (margin) => {
+      expect(() => validateHttpBidResponseTiming({httpResponseMarginMs: margin})).toThrow("httpResponseMarginMs");
+    });
+  });
 
   describe("retained bid stream", () => {
     describe("fixed response bounds", () => {
