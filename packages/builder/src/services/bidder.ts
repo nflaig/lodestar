@@ -901,16 +901,39 @@ export class Bidder {
           const stageStarted = performance.now();
           const timerLatenessMs = Date.now() - stageTime(stage.deadlineBps);
           const expires = index + 1 < stages.length ? stageTime(stages[index + 1].deadlineBps) : until;
+          const logSkipped = (
+            reason: string,
+            preparation?: {
+              initialPrepareMs: number;
+              refreshAttempted: boolean;
+              refreshTimedOut: boolean;
+              refreshMs: number;
+            }
+          ): void =>
+            logger.info("Skipped staged execution payload bid", {
+              code: "BUILDER_STAGED_GOSSIP_SKIPPED",
+              slot,
+              parentBlockHash,
+              parentBlockRoot,
+              builderIndex: stage.builderIndex,
+              reason,
+              phase: preparation ? "after_preparation" : "before_preparation",
+              refreshAttempted: false,
+              ...preparation,
+            });
           if (
             signal.aborted ||
             this.opts.dryRun ||
-            publicationPending ||
             stagesStartedAt >= stageTime(stage.deadlineBps) ||
             Date.now() >= expires ||
             !best ||
             !this.modules.bidStore.canOffer(best)
           )
             return;
+          if (publicationPending) {
+            logSkipped("publication_pending");
+            return;
+          }
           if (stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)) return;
           const initialBest = best;
           const stored = this.modules.payloadStore.get(toRootHex(initialBest.message.blockHash));
@@ -933,10 +956,21 @@ export class Bidder {
               stage,
               minimum - 1
             );
-            // Persistence may finish after a parent switch, shutdown, or this stage's window.
-            if (!signed || signal.aborted || Date.now() >= expires || signed.message.value <= highestAttemptedValue)
-              return;
             const initialPrepareMs = performance.now() - stageStarted;
+            // Persistence may finish after a parent switch, shutdown, or this stage's window.
+            if (!signed || signal.aborted || Date.now() >= expires || signed.message.value <= highestAttemptedValue) {
+              logSkipped(
+                !signed
+                  ? "no_prepared_bid"
+                  : signal.aborted
+                    ? "aborted"
+                    : Date.now() >= expires
+                      ? "stage_expired"
+                      : "value_not_increased",
+                {initialPrepareMs, refreshAttempted: false, refreshTimedOut: false, refreshMs: 0}
+              );
+              return;
+            }
             let refreshAttempted = false;
             let refreshMs = 0;
             let refreshTimedOut = false;
@@ -946,7 +980,7 @@ export class Bidder {
             );
             const refreshBest = best;
             // The first signature stays revealable. Recheck once before the first gossip,
-            // allowing another observed retention duration plus transport headroom.
+            // allowing another observed retention duration plus a scheduling margin.
             if (
               refreshBest.message.value > initialBest.message.value &&
               this.modules.bidStore.canOffer(refreshBest) &&
@@ -1003,12 +1037,7 @@ export class Bidder {
                     ? "offer_ineligible"
                     : null;
             if (skipped) {
-              logger.debug("Skipped staged execution payload bid after preparation", {
-                slot,
-                parentBlockHash,
-                parentBlockRoot,
-                builderIndex: stage.builderIndex,
-                reason: skipped,
+              logSkipped(skipped, {
                 refreshAttempted,
                 refreshTimedOut,
                 initialPrepareMs,

@@ -264,6 +264,10 @@ describe("staged P2P gossip", () => {
     const building = primary.bidder.onPayloadAttributes(event());
     await vi.advanceTimersByTimeAsync(11200);
     expect(published()).toHaveLength(1);
+    expect(logger.info).toHaveBeenCalledWith(
+      "Skipped staged execution payload bid",
+      expect.objectContaining({builderIndex: 2, reason: "publication_pending", refreshAttempted: false})
+    );
     transport.resolve(mockApiResponse({}));
     await vi.advanceTimersByTimeAsync(2100);
     await building;
@@ -347,10 +351,9 @@ describe("staged P2P gossip", () => {
   it("retains but does not gossip a stage whose persistence finishes after cancellation", async () => {
     const persistence = defer<void>();
     const second = identity(2, [], {retain: () => persistence.promise});
-    second.stage.deadlineBps = 9251;
-    const primary = identity(1, [second.stage], {updateIntervalMs: 25});
+    const primary = identity(1, [second.stage]);
     const building = primary.bidder.onPayloadAttributes(event());
-    await vi.advanceTimersByTimeAsync(11102);
+    await vi.advanceTimersByTimeAsync(11100);
     controller.abort();
     persistence.resolve();
     await building;
@@ -358,6 +361,29 @@ describe("staged P2P gossip", () => {
     expect(second.ledger.getBidsForSlot(slot)).toHaveLength(1);
     expect(second.ledger.hasSubmitted(slot, toRootHex(parentHash), toRootHex(parentRoot))).toBe(false);
     expect(payloadStore.has(second.ledger.getBidsForSlot(slot)[0].blockHash)).toBe(true);
+  });
+
+  it("keeps the original after a preparation above 25 ms even with ample stage headroom", async () => {
+    const persistence = defer<void>();
+    source.getPayload.mockImplementation(async () => payload(Date.now() >= 11125 ? 3 : Date.now() >= 10800 ? 2 : 1));
+    const second = identity(2, [], {retain: () => persistence.promise});
+    const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+    const primary = identity(1, [second.stage], {updateIntervalMs: 25});
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(11126);
+    expect(primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot))?.message.blockHash).toEqual(
+      payload(3).executionPayload.blockHash
+    );
+    persistence.resolve();
+    await vi.advanceTimersByTimeAsync(2100);
+    await building;
+    expect(sign).toHaveBeenCalledOnce();
+    expect(published().filter((bid) => bid.message.builderIndex === 2)).toHaveLength(1);
+    expect(published().at(-1)?.message.blockHash).toEqual(payload(2).executionPayload.blockHash);
+    expect(logger.info).toHaveBeenCalledWith(
+      "Gossiped execution payload bid",
+      expect.objectContaining({builderIndex: 2, initialPrepareMs: 26, refreshAttempted: false})
+    );
   });
 
   it("does not chase another revision during the single refresh", async () => {
@@ -542,8 +568,8 @@ describe("staged P2P gossip", () => {
       expect(second.ledger.getBidsForSlot(slot)).toHaveLength(2);
       expect(second.ledger.hasSubmitted(slot, toRootHex(parentHash), toRootHex(parentRoot))).toBe(false);
       if (reason === "expired")
-        expect(logger.debug).toHaveBeenCalledWith(
-          "Skipped staged execution payload bid after preparation",
+        expect(logger.info).toHaveBeenCalledWith(
+          "Skipped staged execution payload bid",
           expect.objectContaining({builderIndex: 2, reason: "stage_expired", refreshAttempted: true})
         );
       for (const revision of [2, 3]) {
