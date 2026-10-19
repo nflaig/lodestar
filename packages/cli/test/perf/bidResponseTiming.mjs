@@ -74,7 +74,11 @@ async function trial(mode, scenario) {
       builderIndex: 1,
       metrics: null,
     },
-    {authData, ...(mode === "cap60" ? {httpReturnReserveCapMs: 60} : {})}
+    {
+      authData,
+      ...(mode === "cap60" ? {httpReturnReserveCapMs: 60} : {}),
+      ...(mode === "margin20" ? {httpResponseMarginMs: 20} : {}),
+    }
   );
   if (mode === "edgeReplacement") {
     const original = api.getExecutionPayloadBid;
@@ -89,6 +93,13 @@ async function trial(mode, scenario) {
       );
   }
   const origin = new BuilderRestApiServer({port: 0}, {config, logger, api, metrics: null});
+  if (scenario.serverCompletionDelayMs) {
+    origin.server.addHook("onSend", async (_request, _reply, payload) => {
+      // A controlled server-side scheduling/completion delay after the bid was chosen.
+      await sleep(scenario.serverCompletionDelayMs);
+      return payload;
+    });
+  }
   await origin.listen();
   const originPort = origin.server.server.address().port;
   const proxy = http.createServer(async (request, response) => {
@@ -200,6 +211,24 @@ for (const name of ["queued_inbound", "cold_request"]) {
 const asymmetric = results.filter((row) => row.scenario === "slow_return_cap_is_unsafe");
 assert.equal(asymmetric[0].timeout, false);
 assert.equal(asymmetric[1].timeout, true);
+for (const serverCompletionDelayMs of [0, 35]) {
+  const scenario = {
+    name: serverCompletionDelayMs ? "completion_delay_margin20_is_unsafe" : "margin20_quiet_server",
+    timeoutMs: 400,
+    preEdgeMs: 80,
+    edgeToOriginMs: 20,
+    returnMs: 100,
+    revisionMs: 260,
+    serverCompletionDelayMs,
+  };
+  const original = await trial("mirror", scenario);
+  const reduced = await trial("margin20", scenario);
+  results.push(original, reduced);
+  assert.equal(original.timeout, false);
+  assert.equal(original.value, 5);
+  assert.equal(reduced.timeout, Boolean(serverCompletionDelayMs));
+  if (!serverCompletionDelayMs) assert.equal(reduced.value, 10);
+}
 console.log(
   JSON.stringify(
     {benchmark: "authenticated-loopback-http-deadline", simulatedLatency: true, noProductionWinClaim: true, results},
