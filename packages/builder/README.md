@@ -145,6 +145,51 @@ support `zbuilder_beginAlternateV1(parentHash, payloadAttributes, extraData?)`, 
 renewable order-generation leases before allocating a session. Older constructors
 cannot silently accept this request as ordinary session work.
 
+For a constructor running order generations, explicitly enable
+`--payload.alternateOrderGenerations true` as well. It defaults to false and requires
+alternate branches and continuous primary updates. The publisher first requires
+`orderGenerationVersion: 1` and `retainedOfferVersion: 1` from the primary begin.
+An older constructor cannot be treated as supporting the new permission protocol.
+With generations disabled, the existing unleased alternate path remains in use.
+
+In this opt-in mode, `zbuilder_beginAlternateV2` (or the separate
+`zbuilder_reserveAlternateBeginV1` reservation) allocates the spare worker.
+`zbuilder_getRetainedPayloadV1` atomically copies a candidate and grants permission
+for its exact block hash, both parents, slot, namespace and generation. The worker
+is then released normally. Small `zbuilder_renewPayloadOfferV1` reads renew that
+permission every 100 ms, each for at most 250 ms measured before sending the read.
+The native table holds at most eight metadata records, no workers or payload bytes.
+The records expire at payload timestamp plus 1200 ms or 24 seconds of monotonic
+time, whichever comes first. Full tables reject new grants without evicting live
+ones; release, expiration or a generation change recovers capacity. Every read
+owns a distinct grant even for identical bytes. A tuple's incumbent stays owned
+through temporary lease lapses and is replaced only after a new offer is retained;
+late cleanup of the old grant cannot revoke the replacement. Unused or late read
+results are released, independently of physical worker cleanup. Lost responses
+whose IDs never reach the publisher remain bounded by native expiry.
+
+Each renewal rechecks authoritative branch metadata, proposer preferences, dependent
+root, builder status, collateral and the publication cutoff. A pending primary
+context pauses permission with an epoch that invalidates in-flight renewals.
+Resolving the same context wakes a serialized renewal immediately. A changed
+context, unavailable preferences or the end of the primary job closes permission.
+The resulting pause still includes the duties RPC and one renewal round trip;
+measure that gap during a canary. Cancellation fences
+old grants even after their workers have ended. A new bounded construction may
+authorize a lower-value payload in the new generation; an old token is never
+updated to that generation. Such reconstructions share the existing four-attempt
+limit and spare worker. A generation-not-ready initial acquisition gets at most
+one retry within that same cap and deadline, after confirmed cleanup. Initial
+branches take priority. All previously signed
+payloads remain available for reveal, and recovered journals never restore offer
+permission. No additional gossip is scheduled by these renewals.
+
+Local protocol tests use authenticated fixture state and canned Engine replies;
+they do not establish independent block validity or competitive improvement.
+Qualify a separate canary before enabling this mode: compare requested-parent
+availability and value before actual publication, primary update latency, deadline
+lateness, worker cleanup and cancellation behavior on the same workload.
+
 The existing `payload_attributes` event carries alternate tuples in an optional
 `context` object containing `role: "alternate"`, `dependent_root`, and `builders`.
 Ordinary events have no context and keep their existing wire format. No additional
@@ -163,7 +208,8 @@ enable alternate emission on the beacon node.
 Keep `chain.fastConfirmation` disabled (the default). Alternate events are suppressed
 with fast confirmation because its safe execution hash can be ahead of an alternate parent.
 
-Alternates start only after a primary snapshot with no active lease is retained. One spare native
+Alternates start only after a primary snapshot with no active lease is retained, or
+an eligible leased snapshot when retained alternate permissions are enabled. One spare native
 worker produces one alternate snapshot at a time, with at most four attempts per slot.
 `--bidding.alternateBuildDurationMs` defaults to 500 ms and accepts 250 through 1000 ms.
 Construction stops for a new primary and does not start near scheduled gossip or too
@@ -188,7 +234,7 @@ so a context received only before the primary changes does not schedule a refres
 
 Refreshes share the four-attempt limit with initial snapshots and preemption retries.
 Queued branches not yet attempted take priority, and a preempted refresh is not retried.
-A refresh replaces an API offer only when its value increases. Earlier signed payloads
+A refresh replaces an eligible API offer only when its value increases. Earlier signed payloads
 remain available for reveal. A snapshot that fails to retain an offer does not schedule
 another refresh. Context, preferences, spare-worker capacity and journal availability
 are checked again before retention.

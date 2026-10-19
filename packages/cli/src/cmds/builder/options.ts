@@ -31,6 +31,7 @@ export type IBuilderCliArgs = LogArgs & {
   "payload.testingUrl"?: string;
   "payload.constructorUrl"?: string;
   "payload.beginReservations"?: boolean;
+  "payload.alternateOrderGenerations"?: boolean;
   "payload.outputDir"?: string;
   "payload.dryRun"?: boolean;
 
@@ -186,6 +187,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
 
   "payload.beginReservations": {
     description: "Use server-issued constructor reservations to recover safely from lost session-begin replies",
+    type: "boolean",
+    default: false,
+    group: "payload",
+  },
+
+  "payload.alternateOrderGenerations": {
+    description: "Opt in to exact retained alternate offers with a compatible generation-aware constructor",
     type: "boolean",
     default: false,
     group: "payload",

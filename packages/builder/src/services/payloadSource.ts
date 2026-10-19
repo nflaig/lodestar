@@ -26,7 +26,13 @@ export type BuildRequest = {
   payloadAttributes: PayloadAttributes;
   /** One-shot alternate work must use a constructor that rejects renewable leases before allocation. */
   requireUnleased?: boolean;
+  /** Alternate with an exact, renewable permission that survives confirmed worker release. */
+  requireRetainedOffer?: boolean;
 };
+
+export function isAlternateBuild(request: BuildRequest): boolean {
+  return request.requireUnleased === true || request.requireRetainedOffer === true;
+}
 
 /** Disjoint physical reservations. A timeout never proves a constructor slot is free. */
 export type PayloadSourceResources = {
@@ -82,11 +88,15 @@ export interface PayloadSource {
   /** getPayload may return successive immutable snapshots from the same handle. */
   readonly supportsUpdates?: boolean;
   readonly supportsBoundedAlternates?: boolean;
+  readonly supportsRetainedOffers?: boolean;
   getResources?(): PayloadSourceResources | undefined;
   /** Retry only recorded end operations; an anonymous timed-out begin cannot be reclaimed by inference. */
   reconcileResources?(signal: AbortSignal): Promise<void>;
   prepare(request: BuildRequest, signal: AbortSignal): Promise<BuildHandle>;
   getPayload(handle: BuildHandle, signal: AbortSignal): Promise<BuiltPayload>;
+  /** Renew only the exact immutable payload's permission. Never re-stamp an older generation. */
+  renewOffer?(payload: BuiltPayload, signal: AbortSignal): Promise<boolean>;
+  releaseOffer?(payload: BuiltPayload, signal: AbortSignal): Promise<void>;
   /** Release construction resources without invalidating previously returned payloads. */
   release?(handle: BuildHandle, signal: AbortSignal): Promise<void>;
 }
