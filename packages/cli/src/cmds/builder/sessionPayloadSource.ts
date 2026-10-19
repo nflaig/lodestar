@@ -15,6 +15,8 @@ import {
   type PayloadSource,
   PayloadSourceNotReady,
   type PayloadSourceResources,
+  type RetainedOffer,
+  isAlternateBuild,
 } from "@lodestar/builder";
 import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB, ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
@@ -22,6 +24,20 @@ import {ErrorAborted, LodestarError, type Logger, isFetchError, sleep, toHex, wi
 
 type Rpc = Pick<JsonRpcHttpClient, "fetch">;
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
+type RetainedResponse = {
+  retainedOfferVersion: number;
+  offerId: string;
+  namespace: string;
+  generation: string;
+  currentGeneration: string;
+  leaseMs: number;
+  ready: boolean;
+  parentHash: string;
+  parentBeaconBlockRoot: string;
+  blockHash: string;
+  slot: string;
+  payload: PayloadResponse;
+};
 type LeasedResponse = {generation: string; leaseMs: number; ready: boolean; payload: PayloadResponse | null};
 // Native operations allow up to 15s; retain the reply through bounded failure
 // cleanup too. The orchestrator's build deadline still detaches independently.
@@ -92,6 +108,7 @@ export class SessionPayloadSource implements PayloadSource {
   readonly supportsUpdates = true;
   private readonly requests = new Map<string, SessionEntry>();
   private preparing = 0;
+  private retainedProtocol = false;
   private orphaned = 0;
   private alternatesDisabled = false;
   private reconciliation: Reconciliation | undefined;
@@ -104,12 +121,17 @@ export class SessionPayloadSource implements PayloadSource {
     private readonly options: {
       boundedAlternates?: boolean;
       beginReservations?: boolean;
+      retainedAlternateOffers?: boolean;
       logger?: {warn: Logger["warn"]};
     } = {}
   ) {}
 
   get supportsBoundedAlternates(): boolean {
     return this.options.boundedAlternates === true;
+  }
+
+  get supportsRetainedOffers(): boolean {
+    return this.options.retainedAlternateOffers === true && this.retainedProtocol;
   }
 
   private get tracksSessions(): boolean {
@@ -134,7 +156,11 @@ export class SessionPayloadSource implements PayloadSource {
     request: BuildRequest,
     signal: AbortSignal,
     reason: AlternateDisabledReason,
-    method = request.requireUnleased ? "zbuilder_beginAlternateV1" : "zbuilder_beginV1"
+    method = request.requireRetainedOffer
+      ? "zbuilder_beginAlternateV2"
+      : request.requireUnleased
+        ? "zbuilder_beginAlternateV1"
+        : "zbuilder_beginV1"
   ): void {
     try {
       const logger = this.options.logger;
@@ -179,7 +205,7 @@ export class SessionPayloadSource implements PayloadSource {
             "OtherJsonRpcRejection";
       const now = performance.now();
       if (
-        !request.requireUnleased &&
+        !isAlternateBuild(request) &&
         (reason === "SlotNotArmed" || reason === "ConstructionHalted") &&
         this.beginRetry.slot === request.payloadAttributes.slotNumber
       ) {
@@ -273,7 +299,12 @@ export class SessionPayloadSource implements PayloadSource {
       throw new SessionPayloadError({code: SessionPayloadErrorCode.UNSUPPORTED_FORK, reason: request.fork});
     }
     const bounded = this.tracksSessions;
-    const alternate = request.requireUnleased === true;
+    const alternate = isAlternateBuild(request);
+    if (request.requireRetainedOffer && (request.requireUnleased || !this.supportsRetainedOffers))
+      throw new SessionPayloadError({
+        code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED,
+        reason: "Retained alternate offers unavailable",
+      });
     if (request.payloadAttributes.slotNumber > this.beginRetry.slot) {
       this.beginRetry = {slot: request.payloadAttributes.slotNumber, failures: 0, after: 0};
     }
@@ -283,7 +314,11 @@ export class SessionPayloadSource implements PayloadSource {
         reason: "Alternates unavailable",
       });
     const call = {
-      method: alternate ? "zbuilder_beginAlternateV1" : "zbuilder_beginV1",
+      method: request.requireRetainedOffer
+        ? "zbuilder_beginAlternateV2"
+        : alternate
+          ? "zbuilder_beginAlternateV1"
+          : "zbuilder_beginV1",
       params: [request.forkchoiceState.headBlockHash, serializePayloadAttributes(request.payloadAttributes)],
     };
     const before = this.getResources();
@@ -328,7 +363,12 @@ export class SessionPayloadSource implements PayloadSource {
     if (this.options.beginReservations) return this.prepareReserved(request, signal);
     const beginRpc = this.rpc(bounded ? AbortSignal.timeout(BEGIN_RPC_TIMEOUT_MS) : signal);
     if (bounded) this.preparing++;
-    let result: {sessionId: string; orderGenerationVersion?: number; alternateSessionVersion?: number};
+    let result: {
+      sessionId: string;
+      orderGenerationVersion?: number;
+      alternateSessionVersion?: number;
+      retainedOfferVersion?: number;
+    };
     let disabledReason: AlternateDisabledReason | undefined;
     try {
       // Cancelling the build must not discard a late allocation handle. Keep
@@ -394,13 +434,20 @@ export class SessionPayloadSource implements PayloadSource {
       await this.release(handle, AbortSignal.timeout(bounded ? 6000 : 1000)).catch(() => {});
       throw new ErrorAborted();
     }
-    if (alternate && (result.orderGenerationVersion !== 0 || result.alternateSessionVersion !== 1)) {
+    if (
+      alternate &&
+      (request.requireRetainedOffer
+        ? result.orderGenerationVersion !== 1 ||
+          result.alternateSessionVersion !== 2 ||
+          result.retainedOfferVersion !== 1
+        : result.orderGenerationVersion !== 0 || result.alternateSessionVersion !== 1)
+    ) {
       this.alternatesDisabled = true;
       this.warnAlternatesDisabled(request, signal, "unconfirmed_alternate_capability");
       await this.release(handle, AbortSignal.timeout(6000)).catch(() => {});
       throw new SessionPayloadError({
         code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED,
-        reason: "Constructor did not confirm an unleased alternate session",
+        reason: "Constructor did not confirm alternate session capabilities",
       });
     }
     if (
@@ -414,6 +461,7 @@ export class SessionPayloadSource implements PayloadSource {
         reason: "Unsupported order generation protocol",
       });
     }
+    if (!alternate) this.retainedProtocol = result.orderGenerationVersion === 1 && result.retainedOfferVersion === 1;
     this.resetBeginRetry(request);
     return handle;
   }
@@ -426,11 +474,11 @@ export class SessionPayloadSource implements PayloadSource {
   private async prepareReserved(request: BuildRequest, signal: AbortSignal): Promise<BuildHandle> {
     this.preparing++;
     let ticket: string | undefined;
-    let method = "zbuilder_reserveBeginV1";
+    let method = request.requireRetainedOffer ? "zbuilder_reserveAlternateBeginV1" : "zbuilder_reserveBeginV1";
     let disabledReason: AlternateDisabledReason | undefined;
     try {
       const reservation = await this.rpc(signal).fetch<{reservationId: string; beginReservationVersion: number}>(
-        {method: "zbuilder_reserveBeginV1", params: [request.requireUnleased === true]},
+        {method, params: request.requireRetainedOffer ? [] : [request.requireUnleased === true]},
         {timeout: 1000}
       );
       if (
@@ -452,6 +500,7 @@ export class SessionPayloadSource implements PayloadSource {
         beginReservationVersion: number;
         orderGenerationVersion: number;
         alternateSessionVersion: number;
+        retainedOfferVersion?: number;
       }>(
         {
           method: "zbuilder_beginReservedV1",
@@ -467,10 +516,14 @@ export class SessionPayloadSource implements PayloadSource {
         result?.sessionId !== ticket ||
         result.beginReservationVersion !== 1 ||
         (result.orderGenerationVersion !== 0 && result.orderGenerationVersion !== 1) ||
-        (!request.requireUnleased && result.alternateSessionVersion !== 0) ||
+        (!isAlternateBuild(request) && result.alternateSessionVersion !== 0) ||
+        (request.requireRetainedOffer &&
+          (result.orderGenerationVersion !== 1 ||
+            result.alternateSessionVersion !== 2 ||
+            result.retainedOfferVersion !== 1)) ||
         (request.requireUnleased && (result.orderGenerationVersion !== 0 || result.alternateSessionVersion !== 1))
       ) {
-        if (request.requireUnleased) disabledReason = "unconfirmed_alternate_capability";
+        if (isAlternateBuild(request)) disabledReason = "unconfirmed_alternate_capability";
         throw new SessionPayloadError({
           code: SessionPayloadErrorCode.INVALID_SESSION,
           reason: "Constructor did not confirm reserved session capabilities",
@@ -485,12 +538,14 @@ export class SessionPayloadSource implements PayloadSource {
             ? {generation: "", validUntil: 0, validUntilUnixMs: 0, ready: false}
             : undefined,
       });
+      if (!isAlternateBuild(request))
+        this.retainedProtocol = result.orderGenerationVersion === 1 && result.retainedOfferVersion === 1;
       this.resetBeginRetry(request);
       if (signal.aborted) throw new ErrorAborted();
       return {sourceId: this.id, fork: request.fork, payloadId: ticket};
     } catch (error) {
       const rejected = this.noteBeginRejection(request, signal, method, error, ticket);
-      if (request.requireUnleased && error instanceof ErrorJsonRpcResponse) {
+      if (isAlternateBuild(request) && error instanceof ErrorJsonRpcResponse) {
         const rejection = error.response.error;
         if (
           rejection.code === -32601 ||
@@ -508,7 +563,7 @@ export class SessionPayloadSource implements PayloadSource {
         const entry: SessionEntry = this.requests.get(ticket) ?? {request, state: "uncertain", reserved: true};
         entry.state = "uncertain";
         entry.beginRejected =
-          !request.requireUnleased && (rejected === "SlotNotArmed" || rejected === "ConstructionHalted");
+          !isAlternateBuild(request) && (rejected === "SlotNotArmed" || rejected === "ConstructionHalted");
         this.requests.set(ticket, entry);
         if (!rejected) {
           try {
@@ -538,6 +593,7 @@ export class SessionPayloadSource implements PayloadSource {
     if (handle.sourceId !== this.id || !entry || entry.state !== "active" || entry.request.fork !== handle.fork) {
       throw new SessionPayloadError({code: SessionPayloadErrorCode.UNKNOWN_HANDLE, reason: handle.payloadId});
     }
+    if (entry.request.requireRetainedOffer) return this.getRetainedPayload(handle, entry, signal);
     const started = performance.now();
     const startedUnix = Date.now();
     const call = {
@@ -622,6 +678,168 @@ export class SessionPayloadSource implements PayloadSource {
       if (entry.lease) entry.lease.ready = false;
       throw error;
     }
+  }
+
+  private async getRetainedPayload(
+    handle: BuildHandle,
+    entry: SessionEntry,
+    signal: AbortSignal
+  ): Promise<BuiltPayload> {
+    const started = performance.now();
+    const startedUnix = Date.now();
+    let result: RetainedResponse;
+    try {
+      result = await this.rpc(signal).fetch<RetainedResponse>({
+        method: "zbuilder_getRetainedPayloadV1",
+        params: [handle.payloadId],
+      });
+    } catch (error) {
+      if (
+        error instanceof ErrorJsonRpcResponse &&
+        ["PayloadNotReady", "StaleOrderGeneration"].includes(error.response.error.message)
+      )
+        throw new PayloadSourceNotReady();
+      throw error;
+    }
+    // A token must belong to the same constructor instance as its allocation.
+    const instance = /^(?:native|begin)-([0-9a-f]{32})-/.exec(handle.payloadId)?.[1];
+    const token = /^offer-([0-9a-f]{32})-([1-9][0-9]{0,19})$/.exec(result?.offerId ?? "");
+    if (!instance || token?.[1] !== instance || BigInt(token[2]) > 0xffffffffffffffffn)
+      throw new SessionPayloadError({
+        code: SessionPayloadErrorCode.RESPONSE_MISMATCH,
+        reason: "Invalid retained offer identity",
+      });
+    let payload: BuiltPayload | undefined;
+    try {
+      payload = validateSessionPayload(this.id, entry.request, result.payload);
+      const retained: RetainedOffer = {
+        id: result.offerId,
+        namespace: result.namespace,
+        parentHash: entry.request.forkchoiceState.headBlockHash,
+        parentBeaconBlockRoot: toHex(entry.request.payloadAttributes.parentBeaconBlockRoot),
+        blockHash: toHex(payload.executionPayload.blockHash),
+        slot: `0x${entry.request.payloadAttributes.slotNumber.toString(16)}`,
+        closed: false,
+      };
+      payload.offerEligibility = {
+        generation: result.generation,
+        retained,
+        lease: {generation: result.generation, validUntil: 0, validUntilUnixMs: 0, ready: false},
+      };
+      this.applyRetainedLease(payload, result, started, startedUnix);
+      signal.throwIfAborted();
+      if (this.requests.get(handle.payloadId) !== entry || entry.state !== "active")
+        throw new SessionPayloadError({code: SessionPayloadErrorCode.UNKNOWN_HANDLE, reason: handle.payloadId});
+      // Large payload serialization may consume the initial lease. A small exact
+      // token read can recover permission without transferring the payload again.
+      if (!payload.offerEligibility.lease.ready && !(await this.renewOffer(payload, signal)))
+        throw new PayloadSourceNotReady();
+      entry.latest = payload;
+      return payload;
+    } catch (error) {
+      if (payload?.offerEligibility?.retained) {
+        await this.releaseOffer(payload, AbortSignal.timeout(1000)).catch(() => {});
+      } else {
+        await this.rpc(AbortSignal.timeout(1000))
+          .fetch({method: "zbuilder_releasePayloadOfferV1", params: [result.offerId]})
+          .catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  private applyRetainedLease(
+    payload: BuiltPayload,
+    result: RetainedResponse,
+    started: number,
+    startedUnix: number,
+    pauseEpoch = 0
+  ): void {
+    const eligibility = payload.offerEligibility;
+    const retained = eligibility?.retained;
+    if (!eligibility || !retained) throw new Error("Missing retained offer");
+    // A reply from an earlier context cannot either renew or overwrite a
+    // newer context's permission. The caller serializes ordinary renewals.
+    if ((retained.pauseEpoch ?? 0) !== pauseEpoch || retained.paused) return;
+    eligibility.lease.ready = false;
+    const quantity = /^0x(?:0|[1-9a-f][0-9a-f]{0,15})$/;
+    if (
+      result?.retainedOfferVersion !== 1 ||
+      result.offerId !== retained.id ||
+      typeof result.namespace !== "string" ||
+      !/^0x[0-9a-f]{32}$/.test(result.namespace) ||
+      result.namespace !== retained.namespace ||
+      typeof result.generation !== "string" ||
+      !quantity.test(result.generation) ||
+      result.generation !== eligibility.generation ||
+      typeof result.currentGeneration !== "string" ||
+      !quantity.test(result.currentGeneration) ||
+      BigInt(result.currentGeneration) < BigInt(result.generation) ||
+      !Number.isSafeInteger(result.leaseMs) ||
+      result.leaseMs < 0 ||
+      result.leaseMs > 250 ||
+      typeof result.ready !== "boolean" ||
+      (result.ready && (result.leaseMs === 0 || result.generation !== result.currentGeneration)) ||
+      result.parentHash !== retained.parentHash ||
+      result.parentBeaconBlockRoot !== retained.parentBeaconBlockRoot ||
+      result.blockHash !== retained.blockHash ||
+      result.slot !== retained.slot
+    )
+      throw new SessionPayloadError({
+        code: SessionPayloadErrorCode.RESPONSE_MISMATCH,
+        reason: "Retained offer context mismatch",
+      });
+    if (retained.closed) return;
+    eligibility.lease.validUntil = started + result.leaseMs;
+    eligibility.lease.validUntilUnixMs = startedUnix + result.leaseMs;
+    // A generation transition permanently revokes this token, even if the exact
+    // same bytes are built again later. Reauthorization requires a new token.
+    if (result.currentGeneration !== eligibility.generation || !result.ready) retained.closed = true;
+    eligibility.lease.ready =
+      !retained.closed &&
+      performance.now() < eligibility.lease.validUntil &&
+      Date.now() < eligibility.lease.validUntilUnixMs;
+  }
+
+  async renewOffer(payload: BuiltPayload, signal: AbortSignal): Promise<boolean> {
+    const eligibility = payload.offerEligibility;
+    const retained = eligibility?.retained;
+    if (payload.sourceId !== this.id || !eligibility || !retained || retained.closed || retained.paused) return false;
+    const pauseEpoch = retained.pauseEpoch ?? 0;
+    const started = performance.now();
+    const startedUnix = Date.now();
+    try {
+      const result = await this.rpc(signal).fetch<RetainedResponse>(
+        {method: "zbuilder_renewPayloadOfferV1", params: [retained.id]},
+        {timeout: 250}
+      );
+      signal.throwIfAborted();
+      this.applyRetainedLease(payload, result, started, startedUnix, pauseEpoch);
+      return !retained.paused && (retained.pauseEpoch ?? 0) === pauseEpoch && eligibility.lease.ready;
+    } catch (error) {
+      if ((retained.pauseEpoch ?? 0) === pauseEpoch) {
+        eligibility.lease.ready = false;
+        if (error instanceof ErrorJsonRpcResponse || error instanceof SessionPayloadError) retained.closed = true;
+      }
+      throw error;
+    }
+  }
+
+  async releaseOffer(payload: BuiltPayload, signal: AbortSignal): Promise<void> {
+    const eligibility = payload.offerEligibility;
+    const retained = eligibility?.retained;
+    if (payload.sourceId !== this.id || !eligibility || !retained) return;
+    retained.closed = true;
+    eligibility.lease.ready = false;
+    const result = await this.rpc(signal).fetch(
+      {method: "zbuilder_releasePayloadOfferV1", params: [retained.id]},
+      {timeout: 1000}
+    );
+    if (result !== true)
+      throw new SessionPayloadError({
+        code: SessionPayloadErrorCode.RESPONSE_MISMATCH,
+        reason: "Retained offer release unconfirmed",
+      });
   }
 
   async release(handle: BuildHandle, signal: AbortSignal): Promise<void> {

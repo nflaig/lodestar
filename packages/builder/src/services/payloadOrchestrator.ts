@@ -1,6 +1,13 @@
 import {ErrorAborted, LodestarError, TimeoutError, retry, sleep, withTimeout} from "@lodestar/utils";
 import {PayloadSourceNotReady} from "./offerEligibility.js";
-import type {BuildHandle, BuildRequest, BuiltPayload, PayloadSource, PayloadSourceResources} from "./payloadSource.js";
+import {
+  type BuildHandle,
+  type BuildRequest,
+  type BuiltPayload,
+  type PayloadSource,
+  type PayloadSourceResources,
+  isAlternateBuild,
+} from "./payloadSource.js";
 
 const PREPARE_RETRY_DELAY = 100;
 
@@ -69,6 +76,23 @@ export class PayloadOrchestrator {
     return this.source.supportsBoundedAlternates === true;
   }
 
+  get supportsRetainedOffers(): boolean {
+    return (
+      this.source.supportsRetainedOffers === true &&
+      this.source.renewOffer !== undefined &&
+      this.source.releaseOffer !== undefined
+    );
+  }
+
+  async renewOffer(payload: BuiltPayload, signal: AbortSignal): Promise<boolean> {
+    return (await this.source.renewOffer?.(payload, AbortSignal.any([this.signal, signal]))) ?? false;
+  }
+
+  async releaseOffer(payload: BuiltPayload): Promise<void> {
+    // Cleanup is independent of a preempted build or stopped publisher.
+    await this.source.releaseOffer?.(payload, AbortSignal.timeout(1000));
+  }
+
   getResources(): PayloadSourceResources | undefined {
     return this.source.getResources?.();
   }
@@ -87,10 +111,10 @@ export class PayloadOrchestrator {
     return promise;
   }
 
-  /** Deliver one unleased alternate before its separately accounted cleanup finishes. */
+  /** Deliver one alternate. A true callback result explicitly owns its retained permission. */
   runSnapshot(
     job: PayloadBuildJob,
-    onPayload: (payload: BuiltPayload) => Promise<void>,
+    onPayload: (payload: BuiltPayload) => Promise<boolean | void>,
     signal: AbortSignal = this.signal
   ): Promise<void> {
     let promise = this.snapshotJobs.get(job.id);
@@ -105,27 +129,47 @@ export class PayloadOrchestrator {
 
   private async runSnapshotJob(
     job: PayloadBuildJob,
-    onPayload: (payload: BuiltPayload) => Promise<void>,
+    onPayload: (payload: BuiltPayload) => Promise<boolean | void>,
     signal: AbortSignal
   ): Promise<void> {
-    if (!job.request.requireUnleased || !this.supportsBoundedAlternates)
+    if (
+      !isAlternateBuild(job.request) ||
+      (job.request.requireUnleased && job.request.requireRetainedOffer) ||
+      !this.supportsBoundedAlternates ||
+      (job.request.requireRetainedOffer && !this.supportsRetainedOffers)
+    )
       throw new PayloadOrchestratorError({
         code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED,
         jobId: job.id,
       });
     const handle = await this.prepare(job, signal);
+    let payload: BuiltPayload | undefined;
+    let retained = false;
     try {
       await sleep(job.getPayloadAt - Date.now(), signal);
-      const payload = await this.retrieve(job.id, handle, signal);
+      payload = await this.retrieve(job.id, handle, signal);
       signal.throwIfAborted();
-      if (payload.offerEligibility)
+      if (
+        payload.offerEligibility &&
+        !(job.request.requireRetainedOffer && payload.offerEligibility.retained && this.supportsRetainedOffers)
+      )
         throw new PayloadOrchestratorError({
           code: PayloadOrchestratorErrorCode.LEASED_PAYLOAD_REQUIRES_UPDATES,
           jobId: job.id,
         });
-      await onPayload(payload);
+      if (job.request.requireRetainedOffer && !payload.offerEligibility?.retained)
+        throw new PayloadOrchestratorError({
+          code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED,
+          jobId: job.id,
+        });
+      retained = (await onPayload(payload)) === true;
     } finally {
-      await this.release(handle);
+      // Permission cleanup must not delay physical worker release. Both remain
+      // owned until settled; releaseOffer closes local eligibility synchronously.
+      await Promise.all([
+        payload?.offerEligibility?.retained && !retained ? this.releaseOffer(payload).catch(() => {}) : undefined,
+        this.release(handle),
+      ]);
     }
   }
 
@@ -220,7 +264,7 @@ export class PayloadOrchestrator {
   }
 
   private async prepare({id, request, getPayloadAt}: PayloadBuildJob, signal: AbortSignal): Promise<BuildHandle> {
-    if (request.requireUnleased && !this.supportsBoundedAlternates)
+    if (isAlternateBuild(request) && !this.supportsBoundedAlternates)
       throw new PayloadOrchestratorError({code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED, jobId: id});
     const prepareTimeout = getPayloadAt - Date.now();
     if (!(prepareTimeout > 0)) {
@@ -243,7 +287,7 @@ export class PayloadOrchestrator {
             return handle;
           },
           {
-            retries: request.requireUnleased ? 0 : Infinity,
+            retries: isAlternateBuild(request) ? 0 : Infinity,
             retryDelay: PREPARE_RETRY_DELAY,
             onRetry: (error) => {
               lastError = error;
@@ -271,7 +315,16 @@ export class PayloadOrchestrator {
     timeout = this.options.getPayloadTimeout
   ): Promise<BuiltPayload> {
     return withTimeout(
-      (retrieveSignal = signal) => this.source.getPayload(handle, retrieveSignal),
+      async (retrieveSignal = signal) => {
+        const payload = await this.source.getPayload(handle, retrieveSignal);
+        if (retrieveSignal.aborted) {
+          // A source may complete after withTimeout detached the read. The
+          // late grant has no callback owner, so release it exactly here.
+          if (payload.offerEligibility?.retained) await this.releaseOffer(payload).catch(() => {});
+          throw new ErrorAborted();
+        }
+        return payload;
+      },
       timeout,
       signal
     ).catch((error: unknown) => {

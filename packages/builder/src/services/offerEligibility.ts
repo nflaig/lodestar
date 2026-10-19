@@ -4,12 +4,27 @@
  * Only plain data crosses the journal worker boundary; leases are never restored.
  */
 export type OfferLease = {generation: string; validUntil: number; validUntilUnixMs: number; ready: boolean};
-export type OfferEligibility = {generation: string; lease: OfferLease};
+/** Exact native permission, independent of the worker that constructed these bytes. */
+export type RetainedOffer = {
+  id: string;
+  namespace: string;
+  parentHash: string;
+  parentBeaconBlockRoot: string;
+  blockHash: string;
+  slot: string;
+  closed: boolean;
+  /** Invalidates renewals started before a parent-context pause. */
+  pauseEpoch?: number;
+  paused?: boolean;
+};
+export type OfferEligibility = {generation: string; lease: OfferLease; retained?: RetainedOffer};
 
 export function isOfferEligible(eligibility?: OfferEligibility): boolean {
   return (
     eligibility === undefined ||
-    (eligibility.lease.ready &&
+    (eligibility.retained?.closed !== true &&
+      eligibility.retained?.paused !== true &&
+      eligibility.lease.ready &&
       eligibility.generation === eligibility.lease.generation &&
       performance.now() < eligibility.lease.validUntil &&
       Date.now() < eligibility.lease.validUntilUnixMs)

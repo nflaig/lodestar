@@ -75,7 +75,7 @@ function payloadResponse(request: BuildRequest, transactions = ["0x01aa", "0x02b
 
 describe("SessionPayloadSource", () => {
   const signal = new AbortController().signal;
-  function setup(boundedAlternates = false, beginReservations = false) {
+  function setup(boundedAlternates = false, beginReservations = false, retainedAlternateOffers = false) {
     const rpc = new JsonRpcHttpClient(["http://127.0.0.1:1"]);
     const fetch = vi.spyOn(rpc, "fetch");
     const warn = vi.fn<Logger["warn"]>();
@@ -86,10 +86,233 @@ describe("SessionPayloadSource", () => {
         signals.push(callSignal);
         return rpc;
       },
-      {boundedAlternates, beginReservations, logger: {warn}}
+      {boundedAlternates, beginReservations, retainedAlternateOffers, logger: {warn}}
     );
     return {source, fetch, signals, warn, request: buildRequest()};
   }
+
+  describe("retained alternate offers", () => {
+    const instance = "ab".repeat(16);
+    const session = `native-${instance}-0-1`;
+    const alternate = `native-${instance}-1-2`;
+    const offerId = `offer-${instance}-1`;
+    const capabilities = {orderGenerationVersion: 1, retainedOfferVersion: 1};
+    function grant(request: BuildRequest) {
+      const payload = payloadResponse(request);
+      return {
+        retainedOfferVersion: 1,
+        offerId,
+        namespace: `0x${"cd".repeat(16)}`,
+        generation: "0x0",
+        currentGeneration: "0x0",
+        leaseMs: 250,
+        ready: true,
+        parentHash: request.forkchoiceState.headBlockHash,
+        parentBeaconBlockRoot: toHex(request.payloadAttributes.parentBeaconBlockRoot),
+        blockHash: payload.executionPayload.blockHash,
+        slot: `0x${request.payloadAttributes.slotNumber.toString(16)}`,
+        payload,
+      };
+    }
+    async function prepared() {
+      const m = setup(true, false, true);
+      m.fetch.mockResolvedValueOnce({sessionId: session, ...capabilities});
+      await m.source.prepare(m.request, signal);
+      m.fetch.mockResolvedValueOnce({sessionId: alternate, ...capabilities, alternateSessionVersion: 2});
+      const handle = await m.source.prepare({...m.request, requireRetainedOffer: true}, signal);
+      expect(m.fetch).toHaveBeenLastCalledWith(
+        {
+          method: "zbuilder_beginAlternateV2",
+          params: [m.request.forkchoiceState.headBlockHash, serializePayloadAttributes(m.request.payloadAttributes)],
+        },
+        {timeout: 20_000}
+      );
+      return {...m, handle};
+    }
+
+    it.each([false, true])("requires opt-in and the native capability (option %s)", async (enabled) => {
+      const {source, fetch, request} = setup(true, false, enabled);
+      fetch.mockResolvedValueOnce({sessionId: session, ...(enabled ? {orderGenerationVersion: 1} : capabilities)});
+      await source.prepare(request, signal);
+      expect(source.supportsRetainedOffers).toBe(false);
+      await expect(source.prepare({...request, requireRetainedOffer: true}, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED},
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps exact permission after worker release, but never renews an older generation", async () => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      const bytes = toHex(payload.executionPayload.blockHash);
+      fetch.mockResolvedValueOnce(true);
+      await source.release(handle, signal);
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 0});
+      expect(payload.offerEligibility?.lease.ready).toBe(true);
+      fetch.mockResolvedValueOnce(grant(request));
+      expect(await source.renewOffer(payload, signal)).toBe(true);
+      fetch.mockResolvedValueOnce({...grant(request), currentGeneration: "0x1", leaseMs: 0, ready: false});
+      expect(await source.renewOffer(payload, signal)).toBe(false);
+      expect(payload.offerEligibility?.retained?.closed).toBe(true);
+      expect(payload.offerEligibility?.generation).toBe("0x0");
+      const count = fetch.mock.calls.length;
+      expect(await source.renewOffer(payload, signal)).toBe(false);
+      expect(fetch).toHaveBeenCalledTimes(count);
+      expect(toHex(payload.executionPayload.blockHash)).toBe(bytes);
+      fetch.mockResolvedValue(true);
+      await source.releaseOffer(payload, signal);
+      await source.releaseOffer(payload, signal);
+      expect(payload.offerEligibility?.lease.ready).toBe(false);
+    });
+
+    it("uses an explicit alternate reservation and verifies all capability versions", async () => {
+      const {source, fetch, request} = setup(true, true, true);
+      const first = `begin-${instance}-1`;
+      const second = `begin-${instance}-2`;
+      fetch.mockResolvedValueOnce({reservationId: first, beginReservationVersion: 1}).mockResolvedValueOnce({
+        sessionId: first,
+        beginReservationVersion: 1,
+        alternateSessionVersion: 0,
+        ...capabilities,
+      });
+      await source.prepare(request, signal);
+      fetch.mockResolvedValueOnce({reservationId: second, beginReservationVersion: 1}).mockResolvedValueOnce({
+        sessionId: second,
+        beginReservationVersion: 1,
+        alternateSessionVersion: 2,
+        ...capabilities,
+      });
+      const handle = await source.prepare({...request, requireRetainedOffer: true}, signal);
+      expect(handle.payloadId).toBe(second);
+      expect(fetch.mock.calls[2][0]).toEqual({method: "zbuilder_reserveAlternateBeginV1", params: []});
+      fetch.mockResolvedValueOnce({released: true, beginReservationVersion: 1});
+      await source.release(handle, signal);
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 0});
+    });
+
+    it("rejects a stale alternate capability and cleans the known worker", async () => {
+      const {source, fetch, request} = setup(true, false, true);
+      fetch.mockResolvedValueOnce({sessionId: session, ...capabilities});
+      await source.prepare(request, signal);
+      fetch
+        .mockResolvedValueOnce({sessionId: alternate, ...capabilities, alternateSessionVersion: 1})
+        .mockResolvedValueOnce(true);
+      await expect(source.prepare({...request, requireRetainedOffer: true}, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED},
+      });
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 0, alternatesDisabled: true});
+      expect(fetch).toHaveBeenLastCalledWith({method: "zbuilder_endV1", params: [alternate]});
+    });
+
+    it.each([
+      {parentHash: `0x${"77".repeat(32)}`},
+      {parentBeaconBlockRoot: `0x${"77".repeat(32)}`},
+      {blockHash: `0x${"77".repeat(32)}`},
+      {slot: "0xd"},
+      {leaseMs: 251},
+      {currentGeneration: "0x1"},
+      {retainedOfferVersion: 2},
+      {namespace: "0x00"},
+    ])("rejects mismatched retained payload metadata %j", async (mutation) => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce({...grant(request), ...mutation}).mockResolvedValueOnce(true);
+      await expect(source.getPayload(handle, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH},
+      });
+      expect(fetch).toHaveBeenLastCalledWith(
+        {method: "zbuilder_releasePayloadOfferV1", params: [offerId]},
+        {timeout: 1000}
+      );
+    });
+
+    it("rejects a foreign constructor token before creating permission", async () => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce({...grant(request), offerId: `offer-${"ee".repeat(16)}-1`});
+      await expect(source.getPayload(handle, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH},
+      });
+    });
+
+    it("does not resurrect a released permission when an earlier renewal completes", async () => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      const response = defer<ReturnType<typeof grant>>();
+      fetch.mockReturnValueOnce(response.promise);
+      const renewing = source.renewOffer(payload, signal);
+      fetch.mockResolvedValueOnce(true);
+      await source.releaseOffer(payload, signal);
+      response.resolve(grant(request));
+      expect(await renewing).toBe(false);
+      expect(payload.offerEligibility?.lease.ready).toBe(false);
+    });
+
+    it.each([false, true])("discards an in-flight renewal across a context pause (resumed %s)", async (resumed) => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      const eligibility = payload.offerEligibility;
+      if (!eligibility?.retained) throw Error("Missing grant");
+      const response = defer<ReturnType<typeof grant>>();
+      fetch.mockReturnValueOnce(response.promise);
+      const renewing = source.renewOffer(payload, signal);
+      eligibility.retained.pauseEpoch = 1;
+      eligibility.retained.paused = !resumed;
+      eligibility.lease.ready = false;
+      response.resolve(grant(request));
+      expect(await renewing).toBe(false);
+      expect(eligibility.lease.ready).toBe(false);
+      eligibility.retained.paused = false;
+      fetch.mockResolvedValueOnce(grant(request));
+      expect(await source.renewOffer(payload, signal)).toBe(true);
+    });
+
+    it.each(["PayloadNotReady", "StaleOrderGeneration"])(
+      "marks %s during initial acquisition as retryable",
+      async (message) => {
+        const {source, fetch, handle} = await prepared();
+        fetch.mockRejectedValueOnce(
+          new ErrorJsonRpcResponse(
+            {jsonrpc: "2.0", id: 1, error: {code: -32000, message}},
+            "zbuilder_getRetainedPayloadV1"
+          )
+        );
+        await expect(source.getPayload(handle, signal)).rejects.toBeInstanceOf(PayloadSourceNotReady);
+      }
+    );
+
+    it("recovers a slow initial transfer using a small exact-token renewal", async () => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockImplementationOnce(async () => {
+        await sleep(270);
+        return grant(request);
+      });
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      expect(payload.offerEligibility?.lease.ready).toBe(true);
+      expect(fetch).toHaveBeenLastCalledWith(
+        {method: "zbuilder_renewPayloadOfferV1", params: [offerId]},
+        {timeout: 250}
+      );
+    });
+
+    it("does not hold physical capacity after confirmed cleanup, and preserves uncertain cleanup", async () => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      fetch.mockRejectedValueOnce(new Error("lost end"));
+      await expect(source.release(handle, signal)).rejects.toThrow("lost end");
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 1});
+      expect(payload.offerEligibility?.lease.ready).toBe(true);
+      await expect(source.prepare({...request, requireRetainedOffer: true}, signal)).rejects.toMatchObject({
+        type: {code: SessionPayloadErrorCode.CAPACITY},
+      });
+      fetch.mockResolvedValueOnce(true);
+      await source.release(handle, signal);
+      expect(source.getResources()).toMatchObject({active: 1, uncertain: 0});
+    });
+  });
 
   describe("reserved begins", () => {
     const ticket = (counter = 1) => `begin-${"ab".repeat(16)}-${counter}`;

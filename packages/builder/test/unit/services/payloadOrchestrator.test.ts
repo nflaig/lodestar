@@ -111,6 +111,71 @@ describe("PayloadOrchestrator", () => {
     expect(source.prepareCalls).toHaveLength(0);
   });
 
+  it.each(["owned", "declined", "throw"] as const)(
+    "releases alternate worker independently of retained permission (%s)",
+    async (outcome) => {
+      const source = Object.assign(new StubPayloadSource(), {
+        supportsBoundedAlternates: true,
+        supportsRetainedOffers: true,
+        renewOffer: vi.fn(async () => true),
+        releaseOffer: vi.fn(async () => {}),
+        release: vi.fn(async () => {}),
+      });
+      const payload = builtPayload();
+      payload.offerEligibility = {
+        generation: "0x0",
+        lease: {generation: "0x0", ready: true, validUntil: performance.now() + 250, validUntilUnixMs: NOW + 250},
+        retained: {
+          id: "offer-fixture",
+          namespace: "fixture",
+          parentHash: "parent",
+          parentBeaconBlockRoot: "root",
+          blockHash: "hash",
+          slot: "0x1",
+          closed: false,
+        },
+      };
+      source.getPayloadImpl = async () => payload;
+      const job = buildJob();
+      job.request.requireRetainedOffer = true;
+      const callback = vi.fn(async () => {
+        if (outcome === "throw") throw Error("retention failed");
+        return outcome === "owned";
+      });
+      const promise = createOrchestrator(source).runSnapshot(job, callback);
+      const checked =
+        outcome === "throw"
+          ? expect(promise).rejects.toThrow("retention failed")
+          : expect(promise).resolves.toBeUndefined();
+      await vi.advanceTimersByTimeAsync(100);
+      await checked;
+      expect(callback).toHaveBeenCalledWith(payload);
+      expect(source.release).toHaveBeenCalledTimes(1);
+      expect(source.releaseOffer).toHaveBeenCalledTimes(outcome === "owned" ? 0 : 1);
+    }
+  );
+
+  it("rejects a retained alternate response without exact permission and cleans the worker", async () => {
+    const source = Object.assign(new StubPayloadSource(), {
+      supportsBoundedAlternates: true,
+      supportsRetainedOffers: true,
+      renewOffer: vi.fn(async () => true),
+      releaseOffer: vi.fn(async () => {}),
+      release: vi.fn(async () => {}),
+    });
+    const job = buildJob();
+    job.request.requireRetainedOffer = true;
+    const callback = vi.fn(async () => true);
+    const promise = createOrchestrator(source).runSnapshot(job, callback);
+    const rejected = expect(promise).rejects.toMatchObject({
+      type: {code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED},
+    });
+    await vi.advanceTimersByTimeAsync(100);
+    await rejected;
+    expect(callback).not.toHaveBeenCalled();
+    expect(source.release).toHaveBeenCalledTimes(1);
+  });
+
   it("does not deliver a read that finishes after alternate cancellation", async () => {
     const source = Object.assign(new StubPayloadSource(), {
       supportsBoundedAlternates: true,
@@ -133,6 +198,53 @@ describe("PayloadOrchestrator", () => {
     expect(onPayload).not.toHaveBeenCalled();
     expect(source.release).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["aborted", "timeout"])(
+    "releases a late retained grant after %s retrieval without blocking worker cleanup",
+    async (kind) => {
+      const cleanup = defer<void>();
+      const source = Object.assign(new StubPayloadSource(), {
+        supportsBoundedAlternates: true,
+        supportsRetainedOffers: true,
+        renewOffer: vi.fn(async () => true),
+        releaseOffer: vi.fn(() => cleanup.promise),
+        release: vi.fn(async () => {}),
+      });
+      const pending = defer<BuiltPayload>();
+      source.getPayloadImpl = () => pending.promise;
+      const controller = new AbortController();
+      const job = buildJob("late-grant");
+      job.request.requireRetainedOffer = true;
+      const callback = vi.fn(async () => true);
+      const result = createOrchestrator(source).runSnapshot(job, callback, controller.signal);
+      const rejected = expect(result).rejects.toBeInstanceOf(Error);
+      await vi.advanceTimersByTimeAsync(100);
+      if (kind === "aborted") controller.abort();
+      else await vi.advanceTimersByTimeAsync(51);
+      await rejected;
+      expect(source.release).toHaveBeenCalledTimes(1);
+      const payload = builtPayload();
+      payload.offerEligibility = {
+        generation: "0x0",
+        lease: {generation: "0x0", ready: true, validUntil: Infinity, validUntilUnixMs: Infinity},
+        retained: {
+          id: "late",
+          namespace: "fixture",
+          parentHash: "parent",
+          parentBeaconBlockRoot: "root",
+          blockHash: "hash",
+          slot: "0x1",
+          closed: false,
+        },
+      };
+      pending.resolve(payload);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(source.releaseOffer).toHaveBeenCalledExactlyOnceWith(payload, expect.any(AbortSignal));
+      expect(callback).not.toHaveBeenCalled();
+      cleanup.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+    }
+  );
 
   it("never retries an alternate begin after a transport error", async () => {
     const source = Object.assign(new StubPayloadSource(), {supportsBoundedAlternates: true});

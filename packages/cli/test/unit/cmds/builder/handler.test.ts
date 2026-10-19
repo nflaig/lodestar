@@ -144,6 +144,20 @@ describe("cmds / builder / args handler", () => {
     ).rejects.toThrow("--bidding.maxRevisionsPerSlot must be between 1 and 256");
   });
 
+  it("keeps retained alternate authorization disabled by default", () => {
+    expect(builderOptions["payload.alternateOrderGenerations"].default).toBe(false);
+  });
+
+  it.each([
+    {},
+    {"payload.constructorUrl": "http://127.0.0.1:8547"},
+    {"payload.constructorUrl": "http://127.0.0.1:8547", "bidding.alternateBranches": true},
+  ])("requires constructor, alternate branches and updates for retained permissions %j", async (args) => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "payload.alternateOrderGenerations": true, ...args})
+    ).rejects.toThrow("--payload.alternateOrderGenerations requires");
+  });
+
   it("requires a constructor for recoverable begins", async () => {
     await expect(
       runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "payload.beginReservations": true})
@@ -179,6 +193,34 @@ describe("cmds / builder / args handler", () => {
     await expect(
       runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateRefreshBeforeSlotMs": 750})
     ).rejects.toThrow("--bidding.alternateRefreshBeforeSlotMs requires --bidding.alternateBranches");
+  });
+
+  it.each([false, true])("forwards retained alternate opt-in %s to the session source", async (enabled) => {
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1));
+    const load = vi
+      .spyOn(keyLoader, "loadBuilderKeypair")
+      .mockResolvedValue({secretKey, publicKey: secretKey.toPublicKey()});
+    const shutdown = vi.spyOn(cliUtils, "onGracefulShutdown").mockImplementation(() => {});
+    const init = vi.spyOn(Builder, "init").mockRejectedValue(Error("BUILDER_INIT_CAPTURED"));
+    try {
+      await expect(
+        runBuilderHandler({
+          "params.GLOAS_FORK_EPOCH": "0",
+          "payload.constructorUrl": "http://127.0.0.1:8547",
+          "bidding.updateIntervalMs": 100,
+          "bidding.alternateBranches": true,
+          "payload.alternateOrderGenerations": enabled,
+        })
+      ).rejects.toThrow("BUILDER_INIT_CAPTURED");
+      const source = init.mock.calls[0][0].payloadSource;
+      // The flag alone cannot enable the protocol; the native handshake is still mandatory.
+      expect(source.supportsRetainedOffers).toBe(false);
+      expect(source).toMatchObject({options: {retainedAlternateOffers: enabled}});
+    } finally {
+      init.mockRestore();
+      shutdown.mockRestore();
+      load.mockRestore();
+    }
   });
 
   it.each([undefined, 800])("forwards alternate refresh %s to Builder initialization", async (lead) => {

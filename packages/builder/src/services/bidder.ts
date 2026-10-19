@@ -22,7 +22,7 @@ import {BidStore} from "./bidStore.js";
 import {MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import {GossipStage, getMinGossipBidValue, validateGossipStages} from "./gossipStages.js";
-import {isOfferEligible} from "./offerEligibility.js";
+import {PayloadSourceNotReady, isOfferEligible} from "./offerEligibility.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuiltPayload, PayloadSourceResources} from "./payloadSource.js";
 import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
@@ -61,7 +61,7 @@ type AlternateDiagnosticReason =
   | "builder_ineligible"
   | "refresh_capacity";
 
-type AlternateKind = "initial" | "retry" | "refresh";
+type AlternateKind = "initial" | "retry" | "refresh" | "reauthorize";
 type QueuedAlternate = {
   event: AlternatePayloadAttributesEvent;
   kind: AlternateKind;
@@ -91,6 +91,19 @@ type AlternateBuild = {
   journalRecheckStarted: boolean;
   retainedOffer: boolean;
   preemptedBy?: PrimaryBuild;
+};
+
+type RetainedAlternate = {
+  id: string;
+  event: AlternatePayloadAttributesEvent;
+  payload: BuiltPayload;
+  dependentRoot: RootHex;
+  feeRecipient: ExecutionAddress;
+  targetGasLimit: bigint;
+  controller: AbortController;
+  signed?: gloas.SignedExecutionPayloadBid;
+  renewRequested: boolean;
+  wake?: () => void;
 };
 
 export type PayloadAttributesEvent = routes.events.EventData[routes.events.EventType.payloadAttributes];
@@ -148,7 +161,11 @@ export class Bidder {
   private primary: PrimaryBuild | undefined;
   private readonly alternateQueue = new Map<string, QueuedAlternate>();
   private readonly alternateAttempts = new Map<number, {id: string; kind: AlternateKind}[]>();
+  private readonly alternateReauthorizations = new Map<string, AlternatePayloadAttributesEvent>();
   private alternateBuild: AlternateBuild | undefined;
+  /** Committed owner per tuple; pending replacement/cleanup owners are separate. */
+  private readonly retainedAlternates = new Map<string, RetainedAlternate>();
+  private readonly retainedOfferOwners = new Set<RetainedAlternate>();
   private alternateTask: Promise<void> | undefined;
   private alternateWake: ReturnType<typeof setTimeout> | undefined;
   private alternateDiagnosticSlot = -Infinity;
@@ -253,6 +270,7 @@ export class Bidder {
     const active = {slot, controller};
     this.activeBuilds.set(buildId, active);
     this.primary = primary;
+    this.recheckRetainedContexts();
     const signal = AbortSignal.any([controller.signal, this.modules.signal]);
 
     try {
@@ -274,6 +292,7 @@ export class Bidder {
       const {feeRecipient, targetGasLimit} = proposerPreferences.message;
       primary.dependentRoot = dependentRoot;
       primary.feeRecipient = feeRecipient;
+      this.recheckRetainedContexts();
       signal.throwIfAborted();
 
       const msToDeadline =
@@ -313,6 +332,7 @@ export class Bidder {
       if (this.activeBuilds.get(buildId) === active) this.activeBuilds.delete(buildId);
       if (this.primary === primary) {
         this.primary = undefined;
+        this.recheckRetainedContexts();
         this.alternateBuild?.controller.abort();
         this.alternateQueue.clear();
         clearTimeout(this.alternateWake);
@@ -335,15 +355,23 @@ export class Bidder {
       this.logAlternateDiagnostic("primary_context_unavailable", data);
       return;
     }
+    for (const retained of this.retainedOfferOwners) {
+      if (this.alternateId(retained.event) === this.alternateId(event)) {
+        retained.event = event;
+        if (this.retainedContext(retained) === "invalid") this.stopRetainedAlternate(retained);
+      }
+    }
     if (data.proposalSlot <= this.modules.clock.getCurrentSlot()) {
       this.logAlternateDiagnostic("past_slot", data);
       return;
     }
     const id = `${data.proposalSlot}:${toRootHex(data.parentBlockRoot)}:${toRootHex(data.parentBlockHash)}`;
+    if (this.alternateReauthorizations.has(id)) this.alternateReauthorizations.set(id, event);
     const refresh = (this.opts.alternateRefreshBeforeSlotMs ?? 0) > 0;
+    const generations = this.modules.orchestrator.supportsRetainedOffers;
     const active = this.alternateBuild;
     if (
-      refresh &&
+      (refresh || generations) &&
       active &&
       active.event.data.proposalSlot === data.proposalSlot &&
       toRootHex(active.event.data.parentBlockRoot) === toRootHex(data.parentBlockRoot) &&
@@ -359,12 +387,18 @@ export class Bidder {
     }
     const attempts = this.alternateAttempts.get(data.proposalSlot) ?? [];
     const queued = this.alternateQueue.get(id);
-    if (refresh && queued) {
+    if ((refresh || generations) && queued) {
       queued.event = event;
       this.tryAlternate();
       return;
     }
+    if (this.alternateReauthorizations.has(id)) {
+      this.tryAlternate();
+      return;
+    }
     const retained = this.hasRetainedAlternate(event);
+    // Only an owned grant's terminal renewal can queue reauthorization. A
+    // ledger record alone may be a failed adoption, not permission to retry it.
     const kind: AlternateKind = refresh && retained ? "refresh" : "initial";
     if (
       id === primary.id ||
@@ -377,7 +411,7 @@ export class Bidder {
       return;
     }
     // A new parent must not lose its first snapshot to a queued refresh.
-    if (refresh && kind === "initial" && this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT) {
+    if (refresh && kind !== "refresh" && this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT) {
       for (const [queuedId, entry] of this.alternateQueue) {
         if (entry.kind === "refresh") {
           this.alternateQueue.delete(queuedId);
@@ -462,6 +496,7 @@ export class Bidder {
     this.alternateWake = undefined;
     const {clock, config, orchestrator} = this.modules;
     const primary = this.primary;
+    this.queueReauthorizations(primary);
     const resources = orchestrator.getResources();
     const duration = this.opts.alternateBuildDurationMs ?? 500;
     if (
@@ -547,6 +582,7 @@ export class Bidder {
     }
     const entries = [...this.alternateQueue];
     const next =
+      entries.find(([, queued]) => queued.kind === "initial" && queued.notBefore <= Date.now()) ??
       entries.find(([, queued]) => queued.kind !== "refresh" && queued.notBefore <= Date.now()) ??
       entries.find(([, queued]) => queued.notBefore <= Date.now());
     if (!next) {
@@ -571,6 +607,7 @@ export class Bidder {
     attempts.push({id, kind});
     this.alternateAttempts.set(primary.slot, attempts);
     this.alternateQueue.delete(id);
+    this.alternateReauthorizations.delete(id);
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, primary.controller.signal, this.modules.signal]);
     const deadline = Date.now() + duration;
@@ -589,9 +626,11 @@ export class Bidder {
     this.alternateBuild = alternate;
     const timer = setTimeout(() => controller.abort(), duration);
     let preempted = false;
+    let generationNotReady = false;
     this.alternateTask = this.buildAlternate(`${id}:${attempts.length}`, alternate)
       .catch((error: unknown) => {
         const aborted = signal.aborted && (isErrorAborted(error) || error === signal.reason);
+        generationNotReady = this.modules.orchestrator.supportsRetainedOffers && error instanceof PayloadSourceNotReady;
         preempted = alternate.preemptedBy !== undefined && aborted;
         if (
           aborted &&
@@ -619,9 +658,9 @@ export class Bidder {
         controller.abort();
         this.alternateBuild = undefined;
         this.alternateTask = undefined;
-        const replacement = alternate.preemptedBy;
+        const replacement = alternate.preemptedBy ?? (generationNotReady ? primary : undefined);
         if (
-          preempted &&
+          (preempted || generationNotReady) &&
           replacement &&
           id !== replacement.id &&
           this.primary === replacement &&
@@ -637,7 +676,8 @@ export class Bidder {
           !this.hasRetainedAlternate(event)
         ) {
           this.alternateQueue.set(id, {event: alternate.event, kind: "retry", notBefore: 0, retryFor: replacement});
-          this.modules.logger.debug("Retrying preempted alternate parent bid", {
+          this.modules.logger.debug("Retrying alternate parent bid", {
+            reason: generationNotReady ? "generation_not_ready" : "primary_preempted",
             slot: primary.slot,
             parentBlockRoot: toRootHex(event.data.parentBlockRoot),
             parentBlockHash: toRootHex(event.data.parentBlockHash),
@@ -663,7 +703,54 @@ export class Bidder {
       });
   }
 
+  private queueReauthorizations(primary: PrimaryBuild | undefined): void {
+    for (const [id, event] of this.alternateReauthorizations) {
+      const slot = event.data.proposalSlot;
+      if (
+        this.modules.signal.aborted ||
+        slot <= this.modules.clock.getCurrentSlot() ||
+        (primary && slot < primary.slot) ||
+        (this.alternateAttempts.get(slot)?.length ?? 0) >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT
+      ) {
+        this.alternateReauthorizations.delete(id);
+        continue;
+      }
+      if (!primary?.ready || primary.controller.signal.aborted || primary.dependentRoot === undefined) continue;
+      if (
+        slot !== primary.slot ||
+        event.data.proposerIndex !== primary.data.proposerIndex ||
+        toRootHex(event.context.dependentRoot) !== primary.dependentRoot ||
+        this.getAlternateLimit(event, primary) === null ||
+        this.hasRetainedAlternate(event)
+      ) {
+        this.alternateReauthorizations.delete(id);
+        continue;
+      }
+      if (
+        id === primary.id ||
+        (this.alternateBuild && this.alternateId(this.alternateBuild.event) === id) ||
+        (!this.alternateQueue.has(id) && this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT)
+      )
+        continue;
+      this.alternateQueue.set(id, {event, kind: "reauthorize", notBefore: 0});
+    }
+  }
+
   private hasRetainedAlternate(event: AlternatePayloadAttributesEvent): boolean {
+    if (this.modules.orchestrator.supportsRetainedOffers) {
+      // A transient lease lapse/pause does not surrender ownership. Repeated
+      // attributes must not construct and release a competing copy of the grant.
+      const owner = this.retainedAlternates.get(this.alternateId(event));
+      return (
+        owner !== undefined &&
+        !owner.controller.signal.aborted &&
+        owner.payload.offerEligibility?.retained?.closed !== true
+      );
+    }
+    return this.hasRecordedAlternate(event);
+  }
+
+  private hasRecordedAlternate(event: AlternatePayloadAttributesEvent): boolean {
     const parentBlockRoot = toRootHex(event.data.parentBlockRoot);
     const parentBlockHash = toRootHex(event.data.parentBlockHash);
     return this.modules.ledger
@@ -694,7 +781,9 @@ export class Bidder {
         id: `alt:${id}`,
         request: {
           fork: ForkName.gloas,
-          requireUnleased: true,
+          ...(this.modules.orchestrator.supportsRetainedOffers
+            ? {requireRetainedOffer: true}
+            : {requireUnleased: true}),
           forkchoiceState: {
             headBlockHash: toRootHex(data.parentBlockHash),
             safeBlockHash: toRootHex(data.safeBlockHash),
@@ -710,7 +799,7 @@ export class Bidder {
       },
       async (payload) => {
         signal.throwIfAborted();
-        if (this.primary !== primary || payload.offerEligibility) return;
+        if (this.primary !== primary || (payload.offerEligibility && !payload.offerEligibility.retained)) return;
         if (this.modules.canRetainAlternate?.() !== true) {
           alternate.journalRecheckStarted = true;
           const started = performance.now();
@@ -761,28 +850,72 @@ export class Bidder {
         const coverableGwei = this.getAlternateLimit(alternate.event, primary);
         if (coverableGwei === null) return;
         if (this.modules.proposerPreferencesTracker.get(data.proposalSlot, dependentRoot) !== preferences) return;
+        const incumbent = this.retainedAlternates.get(this.alternateId(alternate.event));
+        const incomingEligibility = payload.offerEligibility;
+        const incumbentEligibility = incumbent?.payload.offerEligibility;
+        const newerGeneration =
+          incomingEligibility?.retained !== undefined &&
+          incumbentEligibility?.retained !== undefined &&
+          incomingEligibility.retained.namespace === incumbentEligibility.retained.namespace &&
+          BigInt(incomingEligibility.generation) > BigInt(incumbentEligibility.generation);
+        // The fresh grant proves this lease is fenced even before its next renewal.
+        // Keep the owner alive so a failed replacement can still earn reconstruction.
+        if (newerGeneration && incumbentEligibility) incumbentEligibility.lease.ready = false;
         const previous = this.modules.bidStore.get(
           data.proposalSlot,
           toRootHex(data.parentBlockHash),
           toRootHex(data.parentBlockRoot)
         );
-        const signed = await this.bidOnPayload(
-          payload,
-          data,
-          preferences.message.feeRecipient,
-          signal,
-          true,
-          this.modules,
-          -1,
-          {
-            coverableGwei,
-            deadline,
-            onRetentionAttempted: () => {
-              alternate.retentionStarted = true;
-            },
+        const minimumValue =
+          incumbent &&
+          !incumbent.controller.signal.aborted &&
+          incumbentEligibility?.retained?.closed !== true &&
+          !newerGeneration
+            ? (incumbent.signed?.message.value ?? -1)
+            : -1;
+        const retained = payload.offerEligibility?.retained
+          ? this.startRetainedAlternate(
+              alternate.event,
+              payload,
+              preferences.message.feeRecipient,
+              preferences.message.targetGasLimit
+            )
+          : undefined;
+        if (payload.offerEligibility?.retained && !retained) return;
+        let signed: gloas.SignedExecutionPayloadBid | null = null;
+        try {
+          signed = await this.bidOnPayload(
+            payload,
+            data,
+            preferences.message.feeRecipient,
+            signal,
+            true,
+            this.modules,
+            minimumValue,
+            {
+              coverableGwei,
+              deadline,
+              onRetentionAttempted: () => {
+                alternate.retentionStarted = true;
+              },
+            }
+          );
+          alternate.retainedOffer =
+            signed !== null &&
+            signed !== previous &&
+            toRootHex(signed.message.blockHash) === toRootHex(payload.executionPayload.blockHash) &&
+            this.modules.bidStore.canOffer(signed);
+          if (retained && alternate.retainedOffer && signed) {
+            retained.signed = signed;
+            // Only retire the preceding exact grant after its replacement has
+            // been durably retained and is eligible. Old signed reveals remain.
+            const old = this.retainedAlternates.get(retained.id);
+            this.retainedAlternates.set(retained.id, retained);
+            if (old && old !== retained) this.stopRetainedAlternate(old);
           }
-        );
-        alternate.retainedOffer = signed !== null && signed !== previous && this.modules.bidStore.canOffer(signed);
+        } finally {
+          if (retained && !alternate.retainedOffer) this.stopRetainedAlternate(retained);
+        }
         if (alternate.kind === "refresh") {
           try {
             this.modules.logger.debug("Alternate parent refresh result", {
@@ -791,7 +924,7 @@ export class Bidder {
               parentBlockRoot: toRootHex(data.parentBlockRoot),
               parentBlockHash: toRootHex(data.parentBlockHash),
               improved: alternate.retainedOffer,
-              previousValueGwei: previous?.message.value,
+              previousValueGwei: incumbent?.signed?.message.value ?? previous?.message.value,
               valueGwei: signed?.message.value,
               secFromSlot: this.modules.clock.secFromSlot(data.proposalSlot),
             });
@@ -799,9 +932,209 @@ export class Bidder {
             // Diagnostic failures cannot change a retained offer.
           }
         }
+        return retained !== undefined && alternate.retainedOffer;
       },
       signal
     );
+  }
+
+  private alternateId(event: AlternatePayloadAttributesEvent): string {
+    return `${event.data.proposalSlot}:${toRootHex(event.data.parentBlockRoot)}:${toRootHex(event.data.parentBlockHash)}`;
+  }
+
+  private retainedContext(retained: RetainedAlternate): "valid" | "pending" | "invalid" {
+    const {clock, config, proposerPreferencesTracker, ledger, getBuilderStatus, signal} = this.modules;
+    const primary = this.primary;
+    const slot = retained.event.data.proposalSlot;
+    if (
+      signal.aborted ||
+      !primary ||
+      primary.controller.signal.aborted ||
+      primary.slot !== slot ||
+      primary.data.proposerIndex !== retained.event.data.proposerIndex ||
+      clock.msToSlot(slot) <= -config.getSlotComponentDurationMs(this.opts.updateCutoffBps ?? 1000)
+    )
+      return "invalid";
+    if (primary.dependentRoot === undefined) return "pending";
+    if (primary.dependentRoot !== retained.dependentRoot) return "invalid";
+    const preferences = proposerPreferencesTracker.get(slot, retained.dependentRoot);
+    if (
+      !preferences ||
+      toHex(preferences.message.feeRecipient) !== toHex(retained.feeRecipient) ||
+      preferences.message.targetGasLimit !== retained.targetGasLimit
+    )
+      return "invalid";
+    const coverable = this.getAlternateLimit(retained.event, primary);
+    const {status, balance} = getBuilderStatus();
+    const value = retained.signed?.message.value ?? 0;
+    if (
+      coverable === null ||
+      coverable < value ||
+      status !== "active" ||
+      balance === undefined ||
+      balance < this.opts.minOperatingBalanceGwei ||
+      balance - MIN_DEPOSIT_AMOUNT - ledger.getUnsettledValueGwei(computeEpochAtSlot(slot)) < value
+    )
+      return "invalid";
+    return "valid";
+  }
+
+  private stopRetainedAlternate(retained: RetainedAlternate): void {
+    const eligibility = retained.payload.offerEligibility;
+    if (eligibility) {
+      eligibility.lease.ready = false;
+      if (eligibility.retained) eligibility.retained.closed = true;
+    }
+    retained.controller.abort();
+  }
+
+  private recheckRetainedContexts(): void {
+    for (const retained of this.retainedOfferOwners) {
+      const context = this.retainedContext(retained);
+      if (context === "invalid") this.stopRetainedAlternate(retained);
+      else this.setRetainedPaused(retained, context === "pending");
+    }
+  }
+
+  private setRetainedPaused(retained: RetainedAlternate, paused: boolean): void {
+    const eligibility = retained.payload.offerEligibility;
+    const offer = eligibility?.retained;
+    if (!offer || !eligibility || offer.closed) return;
+    if (paused) {
+      if (!offer.paused) offer.pauseEpoch = (offer.pauseEpoch ?? 0) + 1;
+      offer.paused = true;
+      eligibility.lease.ready = false;
+    } else if (offer.paused) {
+      offer.paused = false;
+      retained.renewRequested = true;
+      retained.wake?.();
+    }
+  }
+
+  /** One serialized renewal loop; context resolution wakes it without a 100 ms wait. */
+  private async waitRetainedRenewal(retained: RetainedAlternate, signal: AbortSignal): Promise<void> {
+    if (retained.renewRequested || signal.aborted) return;
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", done);
+        if (retained.wake === done) retained.wake = undefined;
+        resolve();
+      };
+      const timer = setTimeout(done, 100);
+      retained.wake = done;
+      signal.addEventListener("abort", done, {once: true});
+    });
+  }
+
+  private shareRetainedPayloadBody(payload: BuiltPayload): void {
+    if (!payload.offerEligibility?.retained) return;
+    const stored = this.modules.payloadStore.get(toRootHex(payload.executionPayload.blockHash))?.payload;
+    if (!stored) return;
+    // Rebind the wrapper captured by renewal/cleanup too. Grant and valuation
+    // remain independent; immutable body ownership stays inside the store budget.
+    payload.executionPayload = stored.executionPayload;
+    payload.executionRequests = stored.executionRequests;
+    payload.blobsBundle = stored.blobsBundle;
+  }
+
+  private startRetainedAlternate(
+    event: AlternatePayloadAttributesEvent,
+    payload: BuiltPayload,
+    feeRecipient: ExecutionAddress,
+    targetGasLimit: bigint
+  ): RetainedAlternate | undefined {
+    const offer = payload.offerEligibility?.retained;
+    if (!offer || this.retainedOfferOwners.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT * 2) return undefined;
+    const retained: RetainedAlternate = {
+      id: this.alternateId(event),
+      event,
+      payload,
+      feeRecipient,
+      targetGasLimit,
+      dependentRoot: toRootHex(event.context.dependentRoot),
+      controller: new AbortController(),
+      renewRequested: false,
+    };
+    if (this.retainedContext(retained) !== "valid") return undefined;
+    this.shareRetainedPayloadBody(payload);
+    this.retainedOfferOwners.add(retained);
+    const signal = AbortSignal.any([retained.controller.signal, this.modules.signal]);
+    void (async () => {
+      let reauthorize = false;
+      try {
+        while (!signal.aborted) {
+          const context = this.retainedContext(retained);
+          if (context === "invalid") break;
+          this.setRetainedPaused(retained, context === "pending");
+          if (context === "valid") {
+            retained.renewRequested = false;
+            try {
+              await this.modules.orchestrator.renewOffer(payload, signal);
+              // The tuple can briefly become primary and re-add this identical
+              // signed root with its session lease. Once that lease ends, the
+              // current tuple owner may restore its independently renewed exact
+              // permission; never overwrite another still-eligible permission.
+              if (
+                retained.signed &&
+                this.retainedAlternates.get(retained.id) === retained &&
+                this.retainedContext(retained) === "valid" &&
+                isOfferEligible(payload.offerEligibility) &&
+                !isOfferEligible(this.modules.bidStore.getOfferEligibility(retained.signed))
+              )
+                this.modules.bidStore.add(retained.signed, payload.offerEligibility);
+            } catch (error) {
+              if (!signal.aborted && !payload.offerEligibility?.retained?.closed)
+                this.modules.logger.debug(
+                  "Retained alternate renewal unavailable",
+                  {slot: event.data.proposalSlot},
+                  error as Error
+                );
+            }
+            if (!signal.aborted && payload.offerEligibility?.retained?.closed) {
+              reauthorize = true;
+              break;
+            }
+          }
+          await this.waitRetainedRenewal(retained, signal);
+        }
+      } catch (error) {
+        if (!signal.aborted)
+          this.modules.logger.debug(
+            "Retained alternate renewal stopped",
+            {slot: event.data.proposalSlot},
+            error as Error
+          );
+      } finally {
+        this.stopRetainedAlternate(retained);
+        await this.modules.orchestrator.releaseOffer(payload).catch(() => {});
+        this.retainedOfferOwners.delete(retained);
+        if (this.retainedAlternates.get(retained.id) === retained) this.retainedAlternates.delete(retained.id);
+        // Only a terminal renewal of an adopted grant earns one reconstruction.
+        // Keep its intent across temporary head/queue changes, but no payload body.
+        const id = this.alternateId(retained.event);
+        if (
+          reauthorize &&
+          retained.signed &&
+          !this.modules.signal.aborted &&
+          this.alternateReauthorizations.size < MAX_ALTERNATE_ATTEMPTS_PER_SLOT
+        ) {
+          this.alternateReauthorizations.set(id, retained.event);
+          this.tryAlternate();
+        }
+      }
+    })().catch((error: unknown) => {
+      // A diagnostic or context-provider exception must not resurrect a grant
+      // or become an unhandled rejection after its owned cleanup completes.
+      try {
+        this.modules.logger.debug(
+          "Retained alternate cleanup stopped",
+          {slot: event.data.proposalSlot},
+          error as Error
+        );
+      } catch {}
+    });
+    return retained;
   }
 
   private getAlternateLimit(event: AlternatePayloadAttributesEvent, primary: PrimaryBuild): number | null {
@@ -1086,7 +1419,10 @@ export class Bidder {
           const signed = await this.bidOnPayload(payload, data, feeRecipient, signal, true);
           if (signed) best = signed;
           gossipBest();
-          primary.ready = signed !== null && payload.offerEligibility === undefined;
+          primary.ready =
+            signed !== null &&
+            (payload.offerEligibility === undefined ||
+              (orchestrator.supportsRetainedOffers && isOfferEligible(payload.offerEligibility)));
           if (this.primary === primary) this.tryAlternate();
         },
         signal
@@ -1191,8 +1527,7 @@ export class Bidder {
     const previous = bidStore.get(slot, parentBlockHash, parentBlockRoot);
     if (apiRevision && previous && value <= previous.message.value) return previous;
     signal.throwIfAborted();
-    const {executionPayload} = payload;
-    const blockHash = toRootHex(executionPayload.blockHash);
+    const blockHash = toRootHex(payload.executionPayload.blockHash);
     if (alternate && this.modules.canRetainAlternate?.() !== true) {
       logger.debug("Skipping alternate parent bid", {...logCtx, reason: "journal_busy"});
       return null;
@@ -1206,6 +1541,7 @@ export class Bidder {
       {slot, parentBlockRoot: data.parentBlockRoot, blockHash, payload},
       alternate ? "alternate" : "offer"
     );
+    this.shareRetainedPayloadBody(payload);
 
     const bid = createExecutionPayloadBid({
       slot,
@@ -1255,8 +1591,8 @@ export class Bidder {
         value: prettyGweiToEth(value),
         payloadValue: prettyGweiToEth(payloadValueGwei),
         feeRecipient: toHex(feeRecipient),
-        gasLimit: executionPayload.gasLimit,
-        transactions: executionPayload.transactions.length,
+        gasLimit: payload.executionPayload.gasLimit,
+        transactions: payload.executionPayload.transactions.length,
         blobs: bid.blobKzgCommitments.length,
         slotBidRevisions: ledger.getRevisionCount(slot),
         retainedPayloads: this.modules.payloadStore.size,
