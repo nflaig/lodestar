@@ -1,9 +1,13 @@
-import {describe, expect, it} from "vitest";
+import {describe, expect, it, vi} from "vitest";
+import {SecretKey} from "@chainsafe/lodestar-z/blst";
+import {Builder} from "@lodestar/builder";
 import {chainConfig} from "@lodestar/config/default";
 import {LogLevel} from "@lodestar/utils";
 import {builderHandler, parseProposerPreferencesUrls} from "../../../../src/cmds/builder/handler.js";
+import * as keyLoader from "../../../../src/cmds/builder/loadKeypair.js";
 import {IBuilderCliArgs, builderOptions} from "../../../../src/cmds/builder/options.js";
 import {GlobalArgs} from "../../../../src/options/index.js";
+import * as cliUtils from "../../../../src/util/index.js";
 import {testFilesDir} from "../../../utils.js";
 
 describe("cmds / builder / args handler", () => {
@@ -112,6 +116,46 @@ describe("cmds / builder / args handler", () => {
     await expect(
       runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateBuildDurationMs": duration})
     ).rejects.toThrow("--bidding.alternateBuildDurationMs must be between 250 and 1000");
+  });
+
+  it.each([-1, 499, 5001, 750.5, NaN, Infinity])("rejects invalid alternate refresh offset %s", async (lead) => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateRefreshBeforeSlotMs": lead})
+    ).rejects.toThrow("--bidding.alternateRefreshBeforeSlotMs must be zero or between 500 and 5000");
+  });
+
+  it("requires alternate branches for a refresh before loading keys", async () => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateRefreshBeforeSlotMs": 750})
+    ).rejects.toThrow("--bidding.alternateRefreshBeforeSlotMs requires --bidding.alternateBranches");
+  });
+
+  it.each([undefined, 800])("forwards alternate refresh %s to Builder initialization", async (lead) => {
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1));
+    const load = vi.spyOn(keyLoader, "loadBuilderKeypair").mockResolvedValue({
+      secretKey,
+      publicKey: secretKey.toPublicKey(),
+    });
+    const shutdown = vi.spyOn(cliUtils, "onGracefulShutdown").mockImplementation(() => {});
+    const init = vi.spyOn(Builder, "init").mockRejectedValue(Error("BUILDER_INIT_CAPTURED"));
+    try {
+      await expect(
+        runBuilderHandler({
+          "params.GLOAS_FORK_EPOCH": "0",
+          "payload.constructorUrl": "http://127.0.0.1:8547",
+          "bidding.updateIntervalMs": 100,
+          "bidding.alternateBranches": true,
+          "bidding.alternateRefreshBeforeSlotMs": lead,
+        })
+      ).rejects.toThrow("BUILDER_INIT_CAPTURED");
+      expect(init).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({bidding: expect.objectContaining({alternateRefreshBeforeSlotMs: lead ?? 0})})
+      );
+    } finally {
+      load.mockRestore();
+      shutdown.mockRestore();
+      init.mockRestore();
+    }
   });
 
   it.each([

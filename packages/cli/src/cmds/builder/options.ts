@@ -47,6 +47,7 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.maxRevisionsPerSlot": number;
   "bidding.alternateBranches": boolean;
   "bidding.alternateBuildDurationMs": number;
+  "bidding.alternateRefreshBeforeSlotMs": number;
   "bidding.minOperatingBalanceGwei": number;
   "reveal.cutoffBps"?: number;
 
@@ -247,6 +248,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     default: defaultOptions.bidding.alternateBuildDurationMs,
     group: "bidding",
   },
+  "bidding.alternateRefreshBeforeSlotMs": {
+    type: "number",
+    description:
+      "Target one alternate refresh this many ms before the slot, after primary gossip plus 100 ms; zero disables",
+    default: defaultOptions.bidding.alternateRefreshBeforeSlotMs,
+    group: "bidding",
+  },
 
   "bidding.shareBps": {
     description: "Share of the payload value offered to the proposer, in basis points",
@@ -385,7 +393,7 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
 
   "builderApi.bidStreamAdaptiveTiming": {
     description:
-      "Adapt bid-stream send deadlines to measured RTT; requires bidStream and verified end-to-end pong forwarding",
+      "Adapt bid-stream send deadlines to measured RTT; requires bid streaming and verified end-to-end pong forwarding",
     type: "boolean",
     default: false,
     group: "builderApi",

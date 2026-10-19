@@ -128,6 +128,15 @@ export class PayloadStore {
     return this.byBlockHash.has(blockHash);
   }
 
+  /** Cheap preflight only; add() still checks the incoming payload's full size. */
+  hasCapacityForAlternate(slot: Slot): boolean {
+    return (
+      this.retainedBytes < Math.floor(this.maxBytes / 2) &&
+      this.byBlockHash.size < Math.floor(this.maxPayloads / 2) &&
+      (this.bytesBySlot.get(slot) ?? 0) < Math.floor(this.maxBytes / ((PAYLOAD_RETENTION_SLOTS + 2) * 2))
+    );
+  }
+
   prune(currentSlot: Slot): void {
     for (const [blockHash, {slot}] of this.byBlockHash) {
       if (slot + KEEP_SLOTS < currentSlot) {

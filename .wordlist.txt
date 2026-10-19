@@ -13,6 +13,7 @@ CTRL
 Casper
 Chai
 ChainSafe
+Cloudflare
 Codespaces
 CoinCashew
 Corepack
@@ -101,6 +102,7 @@ Quickstart
 README
 READMEs
 RPC
+RTT
 Reth
 Ryzen
 SFTP
@@ -122,6 +124,7 @@ VM
 Vitalik
 Vitest
 Wagyu
+WebSocket
 Zig
 addons
 api
@@ -239,6 +242,7 @@ premined
 produceBlockV
 protolambda
 prover
+proxying
 pubsub
 rebased
 recompiles

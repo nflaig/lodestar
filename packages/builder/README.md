@@ -125,7 +125,7 @@ fallback. Reservations are scoped to one native process instance, so a native re
 requires coordinated publisher restart and recovery of its durable reveal journal.
 Routing a reservation to another instance fails closed and keeps its capacity
 uncertain. A cleanup timeout also retains capacity; later reconciliation may recover
-it without restarting either process. Already signed payloads remain revealable.
+it without restarting either process. Already signed payloads remain available for reveal.
 
 ## Experimental alternate parent bids
 
@@ -163,7 +163,7 @@ enable alternate emission on the beacon node.
 Keep `chain.fastConfirmation` disabled (the default). Alternate events are suppressed
 with fast confirmation because its safe execution hash can be ahead of an alternate parent.
 
-Alternates start only after an unleased primary snapshot is retained. One spare native
+Alternates start only after a primary snapshot with no active lease is retained. One spare native
 worker produces one alternate snapshot at a time, with at most four attempts per slot.
 `--bidding.alternateBuildDurationMs` defaults to 500 ms and accepts 250 through 1000 ms.
 Construction stops for a new primary and does not start near scheduled gossip or too
@@ -175,6 +175,48 @@ Without begin reservations, an unknown allocation outcome disables further alter
 With begin reservations, confirmed cancellation recovers capacity after a lost reply.
 Half of the revision, payload-byte and payload-count admission limits remains reserved
 for primary work. Alternates enter the durable journal only while it is idle.
+
+`--bidding.alternateRefreshBeforeSlotMs` defaults to `0` (disabled). With alternate
+branches enabled, values from 500 through 5000 schedule one last refresh for each
+retained alternate tuple, targeting that many milliseconds before the proposal slot.
+The start is clamped to at least 100 ms after the configured primary gossip deadline,
+so a larger lead cannot add work before that deadline.
+This also covers an earlier primary that is subsequently received as an authoritative
+alternate event. Builder eligibility and collateral must come from that event; an old
+primary alone cannot authorize a refresh. Events for the current primary are ignored,
+so a context received only before the primary changes does not schedule a refresh.
+
+Refreshes share the four-attempt limit with initial snapshots and preemption retries.
+Queued branches not yet attempted take priority, and a preempted refresh is not retried.
+A refresh replaces an API offer only when its value increases. Earlier signed payloads
+remain available for reveal. A snapshot that fails to retain an offer does not schedule
+another refresh. Context, preferences, spare-worker capacity and journal availability
+are checked again before retention.
+
+The refresh lead is a scheduling target, not a reserved execution window. It can be
+delayed or skipped by primary work, gossip deadlines or admission limits. It must leave
+more than the build duration plus 50 ms before the slot. For example, with a 500 ms
+build duration, primary gossip at 9250 bps and stages at 9850/10000/10400/10800 bps,
+an 800 ms lead starts 100 ms after the primary deadline, with 70 ms of admission slack
+before the first stage's exclusion window. A 750 ms lead leaves only 20 ms, so a small
+timer delay or busy journal can skip the refresh. A 500 ms lead cannot fit and is
+skipped. Choose a lead against the actual gossip schedule and measure primary
+performance before enabling it.
+
+To qualify the scheduler separately from native construction, run:
+
+```sh
+pnpm --filter '@lodestar/builder...' build
+node --expose-gc packages/builder/test/perf/alternateParentRefresh.mjs > refresh-results.json
+```
+
+This compares refresh off/on over two alternating pairs with identical synthetic
+transaction arrivals, roughly 130 transactions per late payload and real wall-clock
+scheduling, signing and worker-backed durable journals. It reports retained alternate
+value, primary revisions, stage timing, journal costs, CPU time and timer gaps. The fake
+provider performs no transaction execution or proof loading, and its transport has fixed
+delays. Those results cannot establish the native constructor cost or live fee gains;
+follow with an isolated canary while monitoring primary throughput and bid timing.
 
 This initial mode publishes alternate bids through HTTP and WebSocket only. Primary
 and staged gossip behavior is unchanged. Previously advertised payloads remain retained

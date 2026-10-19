@@ -71,6 +71,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     throw new YargsError("--payload.beginReservations requires --payload.constructorUrl");
   }
   const alternateBuildDurationMs = args["bidding.alternateBuildDurationMs"] ?? 500;
+  const alternateRefreshBeforeSlotMs = args["bidding.alternateRefreshBeforeSlotMs"] ?? 0;
   if (
     args["builderApi.bidStreamAdaptiveTiming"] === true &&
     (args.builderApi !== true || args["builderApi.bidStream"] !== true)
@@ -102,6 +103,15 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     alternateBuildDurationMs > 1000
   ) {
     throw new YargsError("--bidding.alternateBuildDurationMs must be between 250 and 1000");
+  }
+  if (
+    !Number.isSafeInteger(alternateRefreshBeforeSlotMs) ||
+    (alternateRefreshBeforeSlotMs !== 0 && (alternateRefreshBeforeSlotMs < 500 || alternateRefreshBeforeSlotMs > 5000))
+  ) {
+    throw new YargsError("--bidding.alternateRefreshBeforeSlotMs must be zero or between 500 and 5000");
+  }
+  if (alternateRefreshBeforeSlotMs > 0 && !alternateBranches) {
+    throw new YargsError("--bidding.alternateRefreshBeforeSlotMs requires --bidding.alternateBranches");
   }
   const proposerPreferencesUrls = parseProposerPreferencesUrls(
     args["proposerPreferences.urls"] ?? [],
@@ -196,6 +206,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       maxRevisionsPerSlot,
       alternateBranches,
       alternateBuildDurationMs,
+      alternateRefreshBeforeSlotMs,
       dryRun: args["payload.dryRun"],
     });
   } else if (transactionsFile && testingUrl) {
@@ -289,6 +300,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       maxRevisionsPerSlot,
       alternateBranches,
       alternateBuildDurationMs,
+      alternateRefreshBeforeSlotMs,
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
     builderApi: builderApiOpts,
