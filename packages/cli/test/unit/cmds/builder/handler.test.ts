@@ -3,6 +3,7 @@ import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {Builder} from "@lodestar/builder";
 import {chainConfig} from "@lodestar/config/default";
 import {LogLevel} from "@lodestar/utils";
+import {BuilderRestApiServer} from "../../../../src/cmds/builder/apiServer.js";
 import {builderHandler, parseProposerPreferencesUrls} from "../../../../src/cmds/builder/handler.js";
 import * as keyLoader from "../../../../src/cmds/builder/loadKeypair.js";
 import {IBuilderCliArgs, builderOptions} from "../../../../src/cmds/builder/options.js";
@@ -37,6 +38,56 @@ describe("cmds / builder / args handler", () => {
 
   it("keeps adaptive stream timing disabled by default", () => {
     expect(builderOptions["builderApi.bidStreamAdaptiveTiming"].default).toBe(false);
+  });
+
+  it.each([
+    {"builderApi.httpReturnReserveCapMs": -1},
+    {"builderApi.httpReturnReserveCapMs": NaN},
+    {"builderApi.httpResponseMarginMs": 0},
+    {"builderApi.httpResponseMarginMs": 1001},
+  ])("rejects invalid HTTP timing before loading keys: %s", async (args) => {
+    await expect(runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", builderApi: true, ...args})).rejects.toThrow(
+      "must be an integer between"
+    );
+  });
+
+  it("requires the API when setting HTTP timing", async () => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "builderApi.httpReturnReserveCapMs": 60})
+    ).rejects.toThrow("HTTP bid response timing options require --builderApi");
+  });
+
+  it("forwards HTTP timing to the authenticated builder API", async () => {
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1));
+    const load = vi.spyOn(keyLoader, "loadBuilderKeypair").mockResolvedValue({
+      secretKey,
+      publicKey: secretKey.toPublicKey(),
+    });
+    const shutdown = vi.spyOn(cliUtils, "onGracefulShutdown").mockImplementation(() => {});
+    const listen = vi.spyOn(BuilderRestApiServer.prototype, "listen").mockResolvedValue();
+    const init = vi.spyOn(Builder, "init").mockRejectedValue(Error("BUILDER_INIT_CAPTURED"));
+    try {
+      await expect(
+        runBuilderHandler({
+          "params.GLOAS_FORK_EPOCH": "0",
+          builderApi: true,
+          "builderApi.authData": "0x1234",
+          "builderApi.httpReturnReserveCapMs": 60,
+          "builderApi.httpResponseMarginMs": 50,
+          "execution.urls": ["http://127.0.0.1:8551"],
+        })
+      ).rejects.toThrow("BUILDER_INIT_CAPTURED");
+      expect(init).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          builderApi: {authData: new Uint8Array([0x12, 0x34]), httpReturnReserveCapMs: 60, httpResponseMarginMs: 50},
+        })
+      );
+    } finally {
+      load.mockRestore();
+      shutdown.mockRestore();
+      listen.mockRestore();
+      init.mockRestore();
+    }
   });
 
   it.each([

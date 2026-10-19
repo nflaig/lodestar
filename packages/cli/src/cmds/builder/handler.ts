@@ -16,6 +16,7 @@ import {
   MAX_BID_REVISIONS_PER_SLOT,
   type PayloadSource,
   getMetrics,
+  validateHttpBidResponseTiming,
 } from "@lodestar/builder";
 import {getNodeLogger} from "@lodestar/logger/node";
 import {fromHex, isValidHttpUrl, toPrintableUrl} from "@lodestar/utils";
@@ -72,6 +73,14 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   }
   const alternateBuildDurationMs = args["bidding.alternateBuildDurationMs"] ?? 500;
   const alternateRefreshBeforeSlotMs = args["bidding.alternateRefreshBeforeSlotMs"] ?? 0;
+  const httpTiming = {
+    httpReturnReserveCapMs: args["builderApi.httpReturnReserveCapMs"],
+    httpResponseMarginMs: args["builderApi.httpResponseMarginMs"],
+  };
+  if (Object.values(httpTiming).some((value) => value !== undefined) && !args.builderApi) {
+    throw new YargsError("HTTP bid response timing options require --builderApi");
+  }
+  validateHttpBidResponseTiming(httpTiming);
   if (
     args["builderApi.bidStreamAdaptiveTiming"] === true &&
     (args.builderApi !== true || args["builderApi.bidStream"] !== true)
@@ -250,7 +259,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     });
   }
 
-  const builderApiOpts = args.builderApi ? {authData: getBuilderApiAuthData(args)} : undefined;
+  const builderApiOpts = args.builderApi ? {authData: getBuilderApiAuthData(args), ...httpTiming} : undefined;
 
   // The builder is only initialized once it is active, which can take until after the fork. The builder
   // API is served before that, so proposers can already reach it

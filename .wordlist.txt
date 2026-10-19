@@ -212,6 +212,7 @@ liveness
 lldb
 llnode
 lockfile
+loopback
 mainnet
 malloc
 mbps

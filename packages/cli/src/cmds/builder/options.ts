@@ -62,6 +62,8 @@ export type IBuilderCliArgs = LogArgs & {
   "builderApi.authData"?: string;
   "builderApi.bidStream"?: boolean;
   "builderApi.bidStreamAdaptiveTiming"?: boolean;
+  "builderApi.httpReturnReserveCapMs"?: number;
+  "builderApi.httpResponseMarginMs"?: number;
 
   metrics?: boolean;
   "metrics.port"?: number;
@@ -403,6 +405,20 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     type: "string",
     description:
       "Auth data agreed with proposers out of band as a hex string, proposers must sign their requests with it. Takes precedence over the hostname of `--builderApi.publicUrl`",
+    group: "builderApi",
+  },
+
+  "builderApi.httpReturnReserveCapMs": {
+    description:
+      "Experimental HTTP reply allowance cap in ms (0-10000). Defaults to request age; a lower cap can improve bids but risks late responses on slower return paths",
+    type: "number",
+    group: "builderApi",
+  },
+
+  "builderApi.httpResponseMarginMs": {
+    description: "HTTP scheduling and serialization allowance in ms (20-1000). Tune independently of the return cap",
+    type: "number",
+    defaultDescription: "50",
     group: "builderApi",
   },
 

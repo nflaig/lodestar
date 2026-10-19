@@ -1,5 +1,5 @@
 export {type BidStreamRequest, type BuilderBidStreamApi, type RetainedBidStream} from "./api/bidStream.js";
-export {type BuilderApi} from "./api/impl.js";
+export {type BuilderApi, validateHttpBidResponseTiming} from "./api/impl.js";
 export {Builder, type BuilderOptions} from "./builder.js";
 export {defaultOptions} from "./defaults.js";
 export {type Metrics, getMetrics} from "./metrics.js";
