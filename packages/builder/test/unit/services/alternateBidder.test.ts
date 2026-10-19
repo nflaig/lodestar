@@ -10,6 +10,9 @@ import type {
   BidderOptions,
   PayloadAttributesEvent,
 } from "../../../src/services/bidder.js";
+import {BidLedger} from "../../../src/services/bidLedger.js";
+import {BidPublisher} from "../../../src/services/bidPublisher.js";
+import {BidStore} from "../../../src/services/bidStore.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import type {BuildRequest, BuiltPayload, PayloadSourceResources} from "../../../src/services/payloadSource.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
@@ -65,7 +68,7 @@ describe("alternate parent bidder", () => {
     vi.useRealTimers();
   });
 
-  function setup(options: Partial<BidderOptions> = {}) {
+  function setup(options: Partial<BidderOptions> = {}, stageDeadlines: number[] = []) {
     const api = getApiClientStub();
     api.validator.getProposerDutiesV2.mockResolvedValue(
       mockApiResponse({
@@ -127,6 +130,29 @@ describe("alternate parent bidder", () => {
       .mockResolvedValue(undefined);
     const logger = getMockedLogger();
     const getBuilderStatus = vi.fn(() => ({status: "active" as const, balance: 10_000_000_000}));
+    const signer = new BuilderSigner(createBeaconConfig(config, Buffer.alloc(32)), {
+      secretKey: key,
+      publicKey: key.toPublicKey(),
+    });
+    const gossipStages = stageDeadlines.map((deadlineBps, i) => {
+      const ledger = new BidLedger();
+      return {
+        deadlineBps,
+        builderIndex: i + 2,
+        ledger,
+        bidStore: new BidStore(),
+        bidPublisher: new BidPublisher({
+          api,
+          config,
+          signer,
+          ledger,
+          builderIndex: i + 2,
+          hasPayload: ({blockHash}) => payloadStore.has(blockHash),
+          retainCommitment,
+        }),
+        getBuilderStatus,
+      };
+    });
     const modules = createBiddingModules({
       api,
       config,
@@ -143,6 +169,7 @@ describe("alternate parent bidder", () => {
       canRetainAlternate,
       retainCommitment,
       getBuilderStatus,
+      gossipStages,
       updateOptions: {updateIntervalMs: 100, alternateBranches: true, ...options},
     });
     const start = (event: PayloadAttributesEvent) => {
@@ -170,6 +197,320 @@ describe("alternate parent bidder", () => {
       getBuilderStatus,
     };
   }
+
+  describe("one refresh before the slot", () => {
+    const alternateRequests = (m: ReturnType<typeof setup>) =>
+      m.payloadSource.prepare.mock.calls.filter(([request]) => request.requireUnleased);
+
+    it.each([-1, 499, 5001, 750.5, NaN, Infinity])("rejects refresh offset %s", (value) => {
+      expect(() => setup({alternateRefreshBeforeSlotMs: value})).toThrow("alternateRefreshBeforeSlotMs");
+    });
+
+    it("requires alternate branches", () => {
+      expect(() => setup({alternateBranches: false, alternateRefreshBeforeSlotMs: 750})).toThrow(
+        "ALTERNATE_REFRESH_REQUIRES_ALTERNATE_BRANCHES"
+      );
+    });
+
+    it.each([0, 750])("refreshes an old primary only when enabled (%s ms)", async (lead) => {
+      const m = setup({alternateRefreshBeforeSlotMs: lead, deadlineBps: 9250});
+      const old = attributes(33, 44);
+      m.start(old);
+      await vi.advanceTimersByTimeAsync(2000);
+      const previous = m.offer(old);
+      if (!previous) throw Error("Missing old primary offer");
+      m.start(attributes(4, 5));
+      await vi.advanceTimersByTimeAsync(350);
+      m.start(attributes(4, 6));
+      m.bidder.onAlternatePayloadAttributes(old);
+      await vi.advanceTimersByTimeAsync(8900);
+      expect(alternateRequests(m)).toHaveLength(lead ? 1 : 0);
+      for (const session of m.sessions.values()) {
+        if (session.request.requireUnleased)
+          session.payload = {...session.payload, executionPayloadValue: 2_000_000_000_000_000_000n};
+      }
+      await vi.advanceTimersByTimeAsync(350);
+      expect(m.offer(old)?.message.value).toBe(lead ? 1_800_000_000 : 900_000_000);
+      expect(m.payloadStore.has(toRootHex(previous.message.blockHash))).toBe(true);
+      const current = m.offer(old);
+      if (!current) throw Error("Missing current offer");
+      expect(m.payloadStore.has(toRootHex(current.message.blockHash))).toBe(true);
+      expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+      expect(
+        toRootHex(
+          m.api.beacon.publishExecutionPayloadBid.mock.calls[0][0].signedExecutionPayloadBid.message.parentBlockHash
+        )
+      ).toBe(toRootHex(attributes(4, 6).data.parentBlockHash));
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it("wakes without a new primary revision and fits the live Plataberget gossip schedule", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250}, [9850, 10000, 10400, 10800]);
+      const alternate = attributes(3, 4);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(11_249);
+      expect(alternateRequests(m)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(alternateRequests(m)).toHaveLength(2);
+      expect(m.sessions.size).toBe(2);
+      const refreshed = [...m.sessions.values()].find((session) => session.request.requireUnleased);
+      if (!refreshed) throw Error("Missing refresh session");
+      refreshed.payload = {...refreshed.payload, executionPayloadValue: 2_000_000_000_000_000_000n};
+      await vi.advanceTimersByTimeAsync(350);
+      expect(m.offer(alternate)?.message.value).toBe(1_800_000_000);
+      expect(Date.now()).toBe(11_600);
+      await vi.advanceTimersByTimeAsync(400);
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      expect(alternateRequests(m)).toHaveLength(2);
+      expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it.each([500, 1000])("skips or defers a refresh with insufficient gossip headroom (%s ms)", async (lead) => {
+      const m = setup({alternateRefreshBeforeSlotMs: lead, deadlineBps: 9250}, [9850, 10000, 10400, 10800]);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(attributes(3, 4));
+      await vi.advanceTimersByTimeAsync(11_150);
+      expect(alternateRequests(m)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(alternateRequests(m)).toHaveLength(lead === 1000 ? 2 : 1);
+      await vi.advanceTimersByTimeAsync(800);
+      expect(alternateRequests(m)).toHaveLength(lead === 1000 ? 2 : 1);
+    });
+
+    it("lets a distinct branch pass a delayed refresh and caps total attempts", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 2000});
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(attributes(3, 4));
+      await vi.advanceTimersByTimeAsync(600);
+      for (let i = 10; i < 13; i++) m.bidder.onAlternatePayloadAttributes(attributes(i, i));
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(alternateRequests(m)).toHaveLength(4);
+      for (let i = 10; i < 13; i++) expect(m.offer(attributes(i, i))).not.toBeNull();
+      await vi.advanceTimersByTimeAsync(9900);
+      expect(alternateRequests(m)).toHaveLength(4);
+    });
+
+    it("starts a due distinct branch before a due retained refresh", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 2000, deadlineBps: 9500});
+      const alternate = attributes(3, 4);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(600);
+      m.canRetainAlternate.mockReturnValue(false);
+      await vi.advanceTimersByTimeAsync(9500);
+      m.bidder.onAlternatePayloadAttributes(attributes(8, 9));
+      m.canRetainAlternate.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(alternateRequests(m).map(([r]) => r.forkchoiceState.headBlockHash)).toEqual([
+        toRootHex(alternate.data.parentBlockHash),
+        toRootHex(attributes(8, 9).data.parentBlockHash),
+      ]);
+    });
+
+    it.each(["lower value", "equal value"] as const)(
+      "keeps the prior offer without persistence for %s",
+      async (change) => {
+        const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250});
+        const alternate = attributes(3, 4);
+        m.start(attributes(4, 5));
+        m.bidder.onAlternatePayloadAttributes(alternate);
+        await vi.advanceTimersByTimeAsync(600);
+        const previous = m.offer(alternate);
+        const writes = m.retainCommitment.mock.calls.length;
+        const revisions = m.ledger.getRevisionCount(1);
+        await vi.advanceTimersByTimeAsync(10_650);
+        const refreshed = [...m.sessions.values()].find((s) => s.request.requireUnleased);
+        if (!refreshed) throw Error("Missing refresh session");
+        if (change === "lower value") refreshed.payload = {...refreshed.payload, executionPayloadValue: 1n};
+        await vi.advanceTimersByTimeAsync(350);
+        expect(m.offer(alternate)).toBe(previous);
+        expect(m.retainCommitment).toHaveBeenCalledTimes(writes);
+        expect(m.ledger.getRevisionCount(1)).toBe(revisions);
+      }
+    );
+
+    it.each(["revision", "payload"] as const)("does not start a refresh without %s capacity", async (kind) => {
+      const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250, maxRevisionsPerSlot: 4});
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(attributes(3, 4));
+      await vi.advanceTimersByTimeAsync(600);
+      if (kind === "payload") {
+        vi.spyOn(m.ledger, "getRevisionCount").mockReturnValue(1);
+        vi.spyOn(m.payloadStore, "hasCapacityForAlternate").mockReturnValue(false);
+      }
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(alternateRequests(m)).toHaveLength(1);
+      expect(m.logger.debug.mock.calls.some(([, context]) => hasReason(context, "refresh_capacity"))).toBe(true);
+    });
+
+    it.each(["inactive", "dependent root", "missing builder"] as const)(
+      "uses updated queued eligibility (%s)",
+      async (change) => {
+        const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250});
+        const alternate = attributes(3, 4);
+        m.start(attributes(4, 5));
+        m.bidder.onAlternatePayloadAttributes(alternate);
+        await vi.advanceTimersByTimeAsync(600);
+        const updated = structuredClone(alternate);
+        if (change === "inactive") updated.context.builders[0].active = false;
+        if (change === "dependent root") updated.context.dependentRoot = Buffer.alloc(32, 9);
+        if (change === "missing builder") updated.context.builders = [];
+        m.bidder.onAlternatePayloadAttributes(updated);
+        await vi.advanceTimersByTimeAsync(11_000);
+        expect(alternateRequests(m)).toHaveLength(1);
+        expect(m.offer(alternate)?.message.value).toBe(900_000_000);
+      }
+    );
+
+    it("rechecks fresh metadata delivered while the refresh is running", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250});
+      const alternate = attributes(3, 4);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(11_250);
+      const updated = structuredClone(alternate);
+      updated.context.builders[0].active = false;
+      m.bidder.onAlternatePayloadAttributes(updated);
+      await vi.advanceTimersByTimeAsync(350);
+      expect(alternateRequests(m)).toHaveLength(2);
+      expect(m.offer(alternate)?.message.value).toBe(900_000_000);
+      expect(m.retainCommitment).toHaveBeenCalledTimes(2);
+    });
+
+    it("preempts a refresh for a new primary without retrying it", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 2000, deadlineBps: 9500});
+      const alternate = attributes(3, 4);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(10_100);
+      expect(alternateRequests(m)).toHaveLength(2);
+      m.start(attributes(8, 9));
+      await vi.advanceTimersByTimeAsync(900);
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(900);
+      expect(alternateRequests(m)).toHaveLength(2);
+      expect(m.offer(attributes(8, 9))).not.toBeNull();
+    });
+
+    it("admits a distinct branch even when retained refreshes fill the queue", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 2000});
+      const retained = Array.from({length: 4}, (_, i) => attributes(20 + i, 30 + i));
+      for (const event of retained) {
+        m.start(event);
+        await vi.advanceTimersByTimeAsync(100);
+      }
+      m.start(attributes(40, 50));
+      await vi.advanceTimersByTimeAsync(100);
+      m.canRetainAlternate.mockReturnValue(false);
+      for (const event of retained) m.bidder.onAlternatePayloadAttributes(event);
+      const distinct = attributes(60, 70);
+      m.bidder.onAlternatePayloadAttributes(distinct);
+      m.canRetainAlternate.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(550);
+      expect(alternateRequests(m)).toHaveLength(1);
+      expect(alternateRequests(m)[0][0].forkchoiceState.headBlockHash).toBe(toRootHex(distinct.data.parentBlockHash));
+      expect(m.offer(distinct)).not.toBeNull();
+    });
+
+    it("does not reuse a queued refresh when that tuple becomes primary again", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250});
+      const alternate = attributes(33, 44);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(600);
+      m.start(alternate);
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(alternateRequests(m)).toHaveLength(1);
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it("waits for the superseded primary's cleanup even after its release times out", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250});
+      const old = attributes(33, 44);
+      const released = defer<void>();
+      m.payloadSource.release.mockImplementation(async (handle) => {
+        if (handle.payloadId === "1") await released.promise;
+        m.sessions.delete(handle.payloadId);
+      });
+      m.start(old);
+      await vi.advanceTimersByTimeAsync(2000);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(old);
+      await vi.advanceTimersByTimeAsync(9250);
+      expect(alternateRequests(m)).toHaveLength(0);
+      expect(m.sessions.size).toBe(2);
+      released.resolve();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(alternateRequests(m)).toHaveLength(1);
+      expect(m.sessions.size).toBe(1);
+    });
+
+    it.each(["preferences", "branch balance"] as const)("rechecks %s at refresh retention", async (change) => {
+      const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250});
+      const alternate = attributes(33, 44);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(11_250);
+      const session = [...m.sessions.values()].find((s) => s.request.requireUnleased);
+      if (!session) throw Error("Missing refresh session");
+      session.payload = {...session.payload, executionPayloadValue: 2_000_000_000_000_000_000n};
+      if (change === "preferences") m.proposerPreferencesTracker.prune(2);
+      else {
+        const updated = structuredClone(alternate);
+        updated.context.builders[0].availableGwei = 1_000_000_000;
+        m.bidder.onAlternatePayloadAttributes(updated);
+      }
+      await vi.advanceTimersByTimeAsync(350);
+      expect(m.offer(alternate)?.message.value).toBe(900_000_000);
+      expect(m.retainCommitment).toHaveBeenCalledTimes(2);
+    });
+
+    it("retains a durable refresh for reveal only if branch eligibility changes during persistence", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250});
+      const alternate = attributes(33, 44);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(11_250);
+      const session = [...m.sessions.values()].find((s) => s.request.requireUnleased);
+      if (!session) throw Error("Missing refresh session");
+      session.payload = {...session.payload, executionPayloadValue: 2_000_000_000_000_000_000n};
+      const retained = defer<void>();
+      m.retainCommitment.mockImplementation(() => retained.promise);
+      await vi.advanceTimersByTimeAsync(350);
+      const refreshed = m.retainCommitment.mock.calls.at(-1)?.[0];
+      if (!refreshed) throw Error("Missing refresh commitment");
+      const updated = structuredClone(alternate);
+      updated.context.builders[0].active = false;
+      m.bidder.onAlternatePayloadAttributes(updated);
+      retained.resolve();
+      await vi.advanceTimersByTimeAsync(20);
+      expect(m.bidStore.has(refreshed)).toBe(true);
+      expect(m.bidStore.canOffer(refreshed)).toBe(false);
+      expect(m.payloadStore.has(toRootHex(refreshed.message.blockHash))).toBe(true);
+      expect(m.offer(alternate)?.message.value).toBe(900_000_000);
+      expect(alternateRequests(m)).toHaveLength(2);
+    });
+
+    it.each(["releasing", "uncertain"] as const)("waits for confirmed cleanup before refresh (%s)", async (kind) => {
+      const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250});
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(attributes(3, 4));
+      await vi.advanceTimersByTimeAsync(600);
+      m.payloadSource.getResources.mockReturnValue({
+        capacity: 2,
+        active: 1,
+        preparing: 0,
+        releasing: 0,
+        uncertain: 0,
+        alternatesDisabled: false,
+        [kind]: 1,
+      });
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(alternateRequests(m)).toHaveLength(1);
+    });
+  });
 
   describe("bounded journal recheck", () => {
     function startBusyAlternate(options: Partial<BidderOptions> = {}) {

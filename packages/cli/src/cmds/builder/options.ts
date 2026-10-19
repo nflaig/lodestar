@@ -47,6 +47,7 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.maxRevisionsPerSlot": number;
   "bidding.alternateBranches": boolean;
   "bidding.alternateBuildDurationMs": number;
+  "bidding.alternateRefreshBeforeSlotMs": number;
   "bidding.minOperatingBalanceGwei": number;
   "reveal.cutoffBps"?: number;
 
@@ -245,6 +246,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     type: "number",
     description: "Maximum construction time per alternate parent snapshot, in milliseconds",
     default: defaultOptions.bidding.alternateBuildDurationMs,
+    group: "bidding",
+  },
+  "bidding.alternateRefreshBeforeSlotMs": {
+    type: "number",
+    description:
+      "Refresh retained alternate parents once starting this many milliseconds before the slot; zero disables",
+    default: defaultOptions.bidding.alternateRefreshBeforeSlotMs,
     group: "bidding",
   },
 

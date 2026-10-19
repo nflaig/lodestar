@@ -17,10 +17,14 @@ describe("PayloadStore", () => {
     expect(store.get(blockHash)).toBe(first);
     expect(store.size).toBe(2);
     const countLimited = new PayloadStore(256 * 1024 * 1024, 2);
+    expect(countLimited.hasCapacityForAlternate(5)).toBe(true);
     countLimited.add(first, "alternate");
+    expect(countLimited.hasCapacityForAlternate(5)).toBe(false);
     expect(() => countLimited.add(second, "alternate")).toThrow();
     countLimited.add(second);
     expect(countLimited.size).toBe(2);
+    countLimited.prune(8);
+    expect(countLimited.hasCapacityForAlternate(8)).toBe(true);
   });
 
   it("shares blob bytes across a full revision window and preserves earlier sidecars", () => {

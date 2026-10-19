@@ -46,7 +46,16 @@ type AlternateDiagnosticReason =
   | "gossip_headroom"
   | "queued_context_changed"
   | "preferences_unavailable"
-  | "builder_ineligible";
+  | "builder_ineligible"
+  | "refresh_capacity";
+
+type AlternateKind = "initial" | "retry" | "refresh";
+type QueuedAlternate = {
+  event: AlternatePayloadAttributesEvent;
+  kind: AlternateKind;
+  notBefore: number;
+  retryFor?: PrimaryBuild;
+};
 
 type PrimaryBuild = {
   id: string;
@@ -59,6 +68,7 @@ type PrimaryBuild = {
 };
 
 type AlternateBuild = {
+  kind: AlternateKind;
   event: AlternatePayloadAttributesEvent;
   primary: PrimaryBuild;
   controller: AbortController;
@@ -67,6 +77,7 @@ type AlternateBuild = {
   getPayloadAt: number;
   retentionStarted: boolean;
   journalRecheckStarted: boolean;
+  retainedOffer: boolean;
   preemptedBy?: PrimaryBuild;
 };
 
@@ -84,6 +95,8 @@ export type BidderOptions = {
   /** Build one bounded API/stream snapshot for each supported alternate parent tuple. */
   alternateBranches?: boolean;
   alternateBuildDurationMs?: number;
+  /** Refresh each retained alternate once, starting this many ms before the slot. Zero disables it. */
+  alternateRefreshBeforeSlotMs?: number;
   /** Point within the slot before the proposal slot at which the payload is retrieved and bid on, in basis points */
   deadlineBps: number;
   /** Do not bid while the builder balance is below this value */
@@ -121,11 +134,8 @@ export type BidderModules = {
 export class Bidder {
   private readonly activeBuilds = new Map<string, {slot: number; controller: AbortController}>();
   private primary: PrimaryBuild | undefined;
-  private readonly alternateQueue = new Map<
-    string,
-    {event: AlternatePayloadAttributesEvent; retryFor?: PrimaryBuild}
-  >();
-  private readonly alternateAttempts = new Map<number, string[]>();
+  private readonly alternateQueue = new Map<string, QueuedAlternate>();
+  private readonly alternateAttempts = new Map<number, {id: string; kind: AlternateKind}[]>();
   private alternateBuild: AlternateBuild | undefined;
   private alternateTask: Promise<void> | undefined;
   private alternateWake: ReturnType<typeof setTimeout> | undefined;
@@ -155,6 +165,10 @@ export class Bidder {
     const duration = opts.alternateBuildDurationMs ?? 500;
     if (!Number.isSafeInteger(duration) || duration < 250 || duration > 1000)
       throw new RangeError("alternateBuildDurationMs must be between 250 and 1000");
+    const refresh = opts.alternateRefreshBeforeSlotMs ?? 0;
+    if (!Number.isSafeInteger(refresh) || (refresh !== 0 && (refresh < 500 || refresh > 5000)))
+      throw new RangeError("alternateRefreshBeforeSlotMs must be zero or between 500 and 5000");
+    if (refresh > 0 && !opts.alternateBranches) throw Error("ALTERNATE_REFRESH_REQUIRES_ALTERNATE_BRANCHES");
     if (
       opts.alternateBranches &&
       (!(opts.updateIntervalMs && opts.updateIntervalMs > 0) ||
@@ -314,18 +328,62 @@ export class Bidder {
       return;
     }
     const id = `${data.proposalSlot}:${toRootHex(data.parentBlockRoot)}:${toRootHex(data.parentBlockHash)}`;
+    const refresh = (this.opts.alternateRefreshBeforeSlotMs ?? 0) > 0;
+    const active = this.alternateBuild;
+    if (
+      refresh &&
+      active &&
+      active.event.data.proposalSlot === data.proposalSlot &&
+      toRootHex(active.event.data.parentBlockRoot) === toRootHex(data.parentBlockRoot) &&
+      toRootHex(active.event.data.parentBlockHash) === toRootHex(data.parentBlockHash)
+    ) {
+      const previousLimit = this.getAlternateLimit(active.event, active.primary);
+      active.event = event;
+      const nextLimit = this.getAlternateLimit(event, active.primary);
+      if (nextLimit === null || (active.retentionStarted && previousLimit !== null && nextLimit < previousLimit)) {
+        active.controller.abort();
+      }
+      return;
+    }
+    const attempts = this.alternateAttempts.get(data.proposalSlot) ?? [];
+    const queued = this.alternateQueue.get(id);
+    if (refresh && queued) {
+      queued.event = event;
+      this.tryAlternate();
+      return;
+    }
+    const retained = this.hasRetainedAlternate(event);
+    const kind: AlternateKind = refresh && retained ? "refresh" : "initial";
+    // A new parent must not lose its first snapshot to a queued refresh.
+    if (refresh && kind === "initial" && this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT) {
+      for (const [queuedId, entry] of this.alternateQueue) {
+        if (entry.kind === "refresh") {
+          this.alternateQueue.delete(queuedId);
+          break;
+        }
+      }
+    }
     if (
       id === primary.id ||
-      this.alternateAttempts.get(data.proposalSlot)?.includes(id) ||
+      attempts.some((attempt) => attempt.id === id && (kind !== "refresh" || attempt.kind === "refresh")) ||
       this.alternateQueue.has(id) ||
       this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
-      this.modules.bidStore.get(data.proposalSlot, toRootHex(data.parentBlockHash), toRootHex(data.parentBlockRoot))
+      (!refresh &&
+        this.modules.bidStore.get(data.proposalSlot, toRootHex(data.parentBlockHash), toRootHex(data.parentBlockRoot)))
     ) {
       this.logAlternateDiagnostic("duplicate_or_queue_full", data);
       return;
     }
-    this.alternateQueue.set(id, {event});
+    this.alternateQueue.set(id, {
+      event,
+      kind,
+      notBefore: kind === "refresh" ? this.alternateRefreshAt(data.proposalSlot) : 0,
+    });
     this.tryAlternate();
+  }
+
+  private alternateRefreshAt(slot: number): number {
+    return Date.now() + this.modules.clock.msToSlot(slot) - (this.opts.alternateRefreshBeforeSlotMs ?? 0);
   }
 
   private logAlternateDiagnostic(
@@ -451,31 +509,50 @@ export class Bidder {
       return;
     }
     for (const [id, queued] of this.alternateQueue) {
-      const {event, retryFor} = queued;
+      const {event, retryFor, kind} = queued;
       if (
         id === primary.id ||
         event.data.proposalSlot !== primary.slot ||
         event.data.proposerIndex !== primary.data.proposerIndex ||
         toRootHex(event.context.dependentRoot) !== primary.dependentRoot ||
         (retryFor !== undefined && retryFor !== primary) ||
-        this.hasRetainedAlternate(event)
+        (kind !== "refresh" && this.hasRetainedAlternate(event))
       ) {
         this.logAlternateDiagnostic("queued_context_changed", event.data, resources);
         this.alternateQueue.delete(id);
       }
     }
-    const next = this.alternateQueue.entries().next().value;
-    if (!next) return;
-    const [id, {event}] = next;
+    const entries = [...this.alternateQueue];
+    const next =
+      entries.find(([, queued]) => queued.kind !== "refresh" && queued.notBefore <= Date.now()) ??
+      entries.find(([, queued]) => queued.notBefore <= Date.now());
+    if (!next) {
+      const wakeAt = Math.min(...entries.map(([, queued]) => queued.notBefore));
+      if (Number.isFinite(wakeAt)) this.alternateWake = setTimeout(() => this.tryAlternate(), wakeAt - Date.now());
+      return;
+    }
+    const [id, {event, kind}] = next;
     const attempts = this.alternateAttempts.get(primary.slot) ?? [];
     if (attempts.length >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT) return;
-    attempts.push(id);
+    if (
+      kind === "refresh" &&
+      (attempts.length + entries.filter(([, queued]) => queued.kind !== "refresh").length >=
+        MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
+        this.modules.ledger.getRevisionCount(primary.slot) >=
+          Math.floor((this.opts.maxRevisionsPerSlot ?? MAX_BID_REVISIONS_PER_SLOT) / 2) ||
+        !this.modules.payloadStore.hasCapacityForAlternate(primary.slot))
+    ) {
+      this.logAlternateDiagnostic("refresh_capacity", event.data, resources);
+      return;
+    }
+    attempts.push({id, kind});
     this.alternateAttempts.set(primary.slot, attempts);
     this.alternateQueue.delete(id);
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, primary.controller.signal, this.modules.signal]);
     const deadline = Date.now() + duration;
     const alternate: AlternateBuild = {
+      kind,
       event,
       primary,
       controller,
@@ -484,11 +561,12 @@ export class Bidder {
       getPayloadAt: deadline - Math.min(ALTERNATE_RETENTION_BUDGET_MS, Math.floor(duration / 2)),
       retentionStarted: false,
       journalRecheckStarted: false,
+      retainedOffer: false,
     };
     this.alternateBuild = alternate;
     const timer = setTimeout(() => controller.abort(), duration);
     let preempted = false;
-    this.alternateTask = this.buildAlternate(id, alternate)
+    this.alternateTask = this.buildAlternate(`${id}:${attempts.length}`, alternate)
       .catch((error: unknown) => {
         const aborted = signal.aborted && (isErrorAborted(error) || error === signal.reason);
         preempted = alternate.preemptedBy !== undefined && aborted;
@@ -528,17 +606,34 @@ export class Bidder {
           !this.modules.signal.aborted &&
           !alternate.retentionStarted &&
           !alternate.journalRecheckStarted &&
-          attempts.filter((attemptedId) => attemptedId === id).length === 1 &&
+          kind !== "refresh" &&
+          attempts.filter((attempt) => attempt.id === id).length === 1 &&
           attempts.length < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
           clock.getCurrentSlot() < primary.slot &&
           this.alternateQueue.size < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
           !this.hasRetainedAlternate(event)
         ) {
-          this.alternateQueue.set(id, {event, retryFor: replacement});
+          this.alternateQueue.set(id, {event, kind: "retry", notBefore: 0, retryFor: replacement});
           this.modules.logger.debug("Retrying preempted alternate parent bid", {
             slot: primary.slot,
             parentBlockRoot: toRootHex(event.data.parentBlockRoot),
             parentBlockHash: toRootHex(event.data.parentBlockHash),
+          });
+        }
+        if (
+          kind !== "refresh" &&
+          alternate.retainedOffer &&
+          (this.opts.alternateRefreshBeforeSlotMs ?? 0) > 0 &&
+          alternate.getPayloadAt < this.alternateRefreshAt(primary.slot) &&
+          this.primary?.slot === primary.slot &&
+          !this.modules.signal.aborted &&
+          this.alternateQueue.size < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
+          !this.alternateQueue.has(id)
+        ) {
+          this.alternateQueue.set(id, {
+            event: alternate.event,
+            kind: "refresh",
+            notBefore: this.alternateRefreshAt(primary.slot),
           });
         }
         this.tryAlternate();
@@ -640,15 +735,47 @@ export class Bidder {
         }
         signal.throwIfAborted();
         if (this.primary !== primary || dependentRoot !== primary.dependentRoot) return;
-        const coverableGwei = this.getAlternateLimit(event, primary);
+        const coverableGwei = this.getAlternateLimit(alternate.event, primary);
         if (coverableGwei === null) return;
-        await this.bidOnPayload(payload, data, preferences.message.feeRecipient, signal, true, this.modules, -1, {
-          coverableGwei,
-          deadline,
-          onRetentionAttempted: () => {
-            alternate.retentionStarted = true;
-          },
-        });
+        if (this.modules.proposerPreferencesTracker.get(data.proposalSlot, dependentRoot) !== preferences) return;
+        const previous = this.modules.bidStore.get(
+          data.proposalSlot,
+          toRootHex(data.parentBlockHash),
+          toRootHex(data.parentBlockRoot)
+        );
+        const signed = await this.bidOnPayload(
+          payload,
+          data,
+          preferences.message.feeRecipient,
+          signal,
+          true,
+          this.modules,
+          -1,
+          {
+            coverableGwei,
+            deadline,
+            onRetentionAttempted: () => {
+              alternate.retentionStarted = true;
+            },
+          }
+        );
+        alternate.retainedOffer = signed !== null && signed !== previous && this.modules.bidStore.canOffer(signed);
+        if (alternate.kind === "refresh") {
+          try {
+            this.modules.logger.debug("Alternate parent refresh result", {
+              code: "BUILDER_ALTERNATE_REFRESH",
+              slot: data.proposalSlot,
+              parentBlockRoot: toRootHex(data.parentBlockRoot),
+              parentBlockHash: toRootHex(data.parentBlockHash),
+              improved: alternate.retainedOffer,
+              previousValueGwei: previous?.message.value,
+              valueGwei: signed?.message.value,
+              secFromSlot: this.modules.clock.secFromSlot(data.proposalSlot),
+            });
+          } catch {
+            // Diagnostic failures cannot change a retained offer.
+          }
+        }
       },
       signal
     );

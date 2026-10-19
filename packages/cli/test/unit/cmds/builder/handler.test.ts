@@ -114,6 +114,18 @@ describe("cmds / builder / args handler", () => {
     ).rejects.toThrow("--bidding.alternateBuildDurationMs must be between 250 and 1000");
   });
 
+  it.each([-1, 499, 5001, 750.5, NaN, Infinity])("rejects invalid alternate refresh offset %s", async (lead) => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateRefreshBeforeSlotMs": lead})
+    ).rejects.toThrow("--bidding.alternateRefreshBeforeSlotMs must be zero or between 500 and 5000");
+  });
+
+  it("requires alternate branches for a refresh before loading keys", async () => {
+    await expect(
+      runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateRefreshBeforeSlotMs": 750})
+    ).rejects.toThrow("--bidding.alternateRefreshBeforeSlotMs requires --bidding.alternateBranches");
+  });
+
   it.each([
     [
       {"proposerPreferences.urls": ["http://a:9596", "http://b:9596", "http://c:9596", "http://d:9596"]},
