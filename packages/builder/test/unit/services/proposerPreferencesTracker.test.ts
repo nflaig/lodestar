@@ -38,6 +38,9 @@ describe("ProposerPreferencesTracker", () => {
     expect(tracker.onProposerPreferences(first)).toBe(true);
     expect(tracker.onProposerPreferences(duplicate)).toBe(false);
     expect(tracker.get(4, root(1))).toEqual(first);
+    expect(tracker.get(4, root(1))).toBe(first);
+    expect(tracker.onProposerPreferences(structuredClone(first))).toBe(false);
+    expect(tracker.get(4, root(1))).toBe(first);
   });
 
   it("prunes past proposal slots while retaining current and future preferences", () => {

@@ -27,6 +27,7 @@ const MAX_ALTERNATE_RECEIVED_DIAGNOSTICS_PER_SLOT = 4;
 const ALTERNATE_RETENTION_BUDGET_MS = 150;
 const ALTERNATE_JOURNAL_RECHECK_MS = 10;
 const ALTERNATE_JOURNAL_RECHECK_HEADROOM_MS = 100;
+const ALTERNATE_REFRESH_PRIMARY_MARGIN_MS = 100;
 
 type AlternateDiagnosticReason =
   | "received"
@@ -95,7 +96,7 @@ export type BidderOptions = {
   /** Build one bounded API/stream snapshot for each supported alternate parent tuple. */
   alternateBranches?: boolean;
   alternateBuildDurationMs?: number;
-  /** Refresh each retained alternate once, starting this many ms before the slot. Zero disables it. */
+  /** Target one refresh this many ms before the slot, after primary gossip plus 100 ms. Zero disables it. */
   alternateRefreshBeforeSlotMs?: number;
   /** Point within the slot before the proposal slot at which the payload is retrieved and bid on, in basis points */
   deadlineBps: number;
@@ -354,6 +355,16 @@ export class Bidder {
     }
     const retained = this.hasRetainedAlternate(event);
     const kind: AlternateKind = refresh && retained ? "refresh" : "initial";
+    if (
+      id === primary.id ||
+      attempts.some((attempt) => attempt.id === id && (kind !== "refresh" || attempt.kind === "refresh")) ||
+      this.alternateQueue.has(id) ||
+      (!refresh &&
+        this.modules.bidStore.get(data.proposalSlot, toRootHex(data.parentBlockHash), toRootHex(data.parentBlockRoot)))
+    ) {
+      this.logAlternateDiagnostic("duplicate_or_queue_full", data);
+      return;
+    }
     // A new parent must not lose its first snapshot to a queued refresh.
     if (refresh && kind === "initial" && this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT) {
       for (const [queuedId, entry] of this.alternateQueue) {
@@ -363,14 +374,7 @@ export class Bidder {
         }
       }
     }
-    if (
-      id === primary.id ||
-      attempts.some((attempt) => attempt.id === id && (kind !== "refresh" || attempt.kind === "refresh")) ||
-      this.alternateQueue.has(id) ||
-      this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
-      (!refresh &&
-        this.modules.bidStore.get(data.proposalSlot, toRootHex(data.parentBlockHash), toRootHex(data.parentBlockRoot)))
-    ) {
+    if (this.alternateQueue.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT) {
       this.logAlternateDiagnostic("duplicate_or_queue_full", data);
       return;
     }
@@ -383,7 +387,15 @@ export class Bidder {
   }
 
   private alternateRefreshAt(slot: number): number {
-    return Date.now() + this.modules.clock.msToSlot(slot) - (this.opts.alternateRefreshBeforeSlotMs ?? 0);
+    const {clock, config} = this.modules;
+    const slotStart = Date.now() + clock.msToSlot(slot);
+    return Math.max(
+      slotStart - (this.opts.alternateRefreshBeforeSlotMs ?? 0),
+      slotStart -
+        config.SLOT_DURATION_MS +
+        config.getSlotComponentDurationMs(this.opts.deadlineBps) +
+        ALTERNATE_REFRESH_PRIMARY_MARGIN_MS
+    );
   }
 
   private logAlternateDiagnostic(

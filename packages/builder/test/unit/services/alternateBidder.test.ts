@@ -245,11 +245,11 @@ describe("alternate parent bidder", () => {
     });
 
     it("wakes without a new primary revision and fits the live Plataberget gossip schedule", async () => {
-      const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250}, [9850, 10000, 10400, 10800]);
+      const m = setup({alternateRefreshBeforeSlotMs: 800, deadlineBps: 9250}, [9850, 10000, 10400, 10800]);
       const alternate = attributes(3, 4);
       m.start(attributes(4, 5));
       m.bidder.onAlternatePayloadAttributes(alternate);
-      await vi.advanceTimersByTimeAsync(11_249);
+      await vi.advanceTimersByTimeAsync(11_199);
       expect(alternateRequests(m)).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(1);
       expect(alternateRequests(m)).toHaveLength(2);
@@ -259,12 +259,54 @@ describe("alternate parent bidder", () => {
       refreshed.payload = {...refreshed.payload, executionPayloadValue: 2_000_000_000_000_000_000n};
       await vi.advanceTimersByTimeAsync(350);
       expect(m.offer(alternate)?.message.value).toBe(1_800_000_000);
-      expect(Date.now()).toBe(11_600);
+      expect(Date.now()).toBe(11_550);
       await vi.advanceTimersByTimeAsync(400);
       m.bidder.onAlternatePayloadAttributes(alternate);
       expect(alternateRequests(m)).toHaveLength(2);
       expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
       expect(m.sessions.size).toBe(1);
+    });
+
+    it.each(["timer jitter", "busy journal"] as const)("fits an 800 ms lead after %s", async (delay) => {
+      const m = setup({alternateRefreshBeforeSlotMs: 800, deadlineBps: 9250}, [9850, 10000, 10400, 10800]);
+      const alternate = attributes(33, 44);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(11_199);
+      if (delay === "timer jitter") {
+        vi.setSystemTime(11_229);
+        await vi.advanceTimersByTimeAsync(1);
+      } else {
+        m.canRetainAlternate.mockReturnValue(false);
+        await vi.advanceTimersByTimeAsync(31);
+        expect(alternateRequests(m)).toHaveLength(1);
+        m.canRetainAlternate.mockReturnValue(true);
+        await vi.advanceTimersByTimeAsync(20);
+      }
+      expect(alternateRequests(m)).toHaveLength(2);
+      const session = [...m.sessions.values()].find((s) => s.request.requireUnleased);
+      if (!session) throw Error("Missing delayed refresh session");
+      session.payload = {...session.payload, executionPayloadValue: 2_000_000_000_000_000_000n};
+      await vi.advanceTimersByTimeAsync(350);
+      expect(m.offer(alternate)?.message.value).toBe(1_800_000_000);
+      expect(Date.now()).toBeLessThanOrEqual(11_600);
+      expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+    });
+
+    it("clamps a large refresh lead until after primary gossip and its safety margin", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 5000, deadlineBps: 9250}, [9850, 10000, 10400, 10800]);
+      const old = attributes(33, 44);
+      m.start(old);
+      await vi.advanceTimersByTimeAsync(100);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(old);
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(alternateRequests(m)).toHaveLength(0);
+      expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(99);
+      expect(alternateRequests(m)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(alternateRequests(m)).toHaveLength(1);
     });
 
     it.each([500, 1000])("skips or defers a refresh with insufficient gossip headroom (%s ms)", async (lead) => {
@@ -293,13 +335,13 @@ describe("alternate parent bidder", () => {
     });
 
     it("starts a due distinct branch before a due retained refresh", async () => {
-      const m = setup({alternateRefreshBeforeSlotMs: 2000, deadlineBps: 9500});
+      const m = setup({alternateRefreshBeforeSlotMs: 2000, deadlineBps: 8500});
       const alternate = attributes(3, 4);
       m.start(attributes(4, 5));
       m.bidder.onAlternatePayloadAttributes(alternate);
       await vi.advanceTimersByTimeAsync(600);
       m.canRetainAlternate.mockReturnValue(false);
-      await vi.advanceTimersByTimeAsync(9500);
+      await vi.advanceTimersByTimeAsync(9750);
       m.bidder.onAlternatePayloadAttributes(attributes(8, 9));
       m.canRetainAlternate.mockReturnValue(true);
       await vi.advanceTimersByTimeAsync(50);
@@ -380,11 +422,11 @@ describe("alternate parent bidder", () => {
     });
 
     it("preempts a refresh for a new primary without retrying it", async () => {
-      const m = setup({alternateRefreshBeforeSlotMs: 2000, deadlineBps: 9500});
+      const m = setup({alternateRefreshBeforeSlotMs: 2000, deadlineBps: 8500});
       const alternate = attributes(3, 4);
       m.start(attributes(4, 5));
       m.bidder.onAlternatePayloadAttributes(alternate);
-      await vi.advanceTimersByTimeAsync(10_100);
+      await vi.advanceTimersByTimeAsync(10_400);
       expect(alternateRequests(m)).toHaveLength(2);
       m.start(attributes(8, 9));
       await vi.advanceTimersByTimeAsync(900);
@@ -427,6 +469,28 @@ describe("alternate parent bidder", () => {
       expect(alternateRequests(m)).toHaveLength(1);
       expect(alternateRequests(m)[0][0].forkchoiceState.headBlockHash).toBe(toRootHex(distinct.data.parentBlockHash));
       expect(m.offer(distinct)).not.toBeNull();
+    });
+
+    it("does not evict a refresh for an already attempted failed tuple", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 800, deadlineBps: 9250});
+      const retained = Array.from({length: 4}, (_, i) => attributes(20 + i, 30 + i));
+      for (const event of retained) {
+        m.start(event);
+        await vi.advanceTimersByTimeAsync(100);
+      }
+      m.start(attributes(40, 50));
+      await vi.advanceTimersByTimeAsync(100);
+      const failed = attributes(60, 70);
+      failed.context.builders[0].active = false;
+      m.bidder.onAlternatePayloadAttributes(failed);
+      await vi.advanceTimersByTimeAsync(0);
+      for (const event of retained) m.bidder.onAlternatePayloadAttributes(event);
+      m.bidder.onAlternatePayloadAttributes(failed);
+      await vi.advanceTimersByTimeAsync(10_700);
+      expect(alternateRequests(m)).toHaveLength(1);
+      expect(alternateRequests(m)[0][0].forkchoiceState.headBlockHash).toBe(
+        toRootHex(retained[0].data.parentBlockHash)
+      );
     });
 
     it("does not reuse a queued refresh when that tuple becomes primary again", async () => {
@@ -481,6 +545,23 @@ describe("alternate parent bidder", () => {
       expect(m.offer(alternate)?.message.value).toBe(900_000_000);
       expect(m.retainCommitment).toHaveBeenCalledTimes(2);
     });
+
+    it.each([0, 800])(
+      "keeps an alternate eligible after identical preferences are received again (%s)",
+      async (lead) => {
+        const m = setup({alternateRefreshBeforeSlotMs: lead});
+        const alternate = attributes(33, 44);
+        m.start(attributes(4, 5));
+        m.bidder.onAlternatePayloadAttributes(alternate);
+        await vi.advanceTimersByTimeAsync(200);
+        const original = m.proposerPreferencesTracker.get(1, toRootHex(dependentRoot));
+        if (!original) throw Error("Missing proposer preferences");
+        expect(m.proposerPreferencesTracker.onProposerPreferences(structuredClone(original))).toBe(false);
+        expect(m.proposerPreferencesTracker.get(1, toRootHex(dependentRoot))).toBe(original);
+        await vi.advanceTimersByTimeAsync(400);
+        expect(m.offer(alternate)?.message.value).toBe(900_000_000);
+      }
+    );
 
     it("retains a durable refresh for reveal only if branch eligibility changes during persistence", async () => {
       const m = setup({alternateRefreshBeforeSlotMs: 750, deadlineBps: 9250});

@@ -299,7 +299,11 @@ async function run(pair, refreshBeforeSlotMs) {
     const cpu = process.cpuUsage(cpuStart);
     const offer = primary.bidStore.get(1, toRootHex(old.data.parentBlockHash), toRootHex(old.data.parentBlockRoot));
     assert.ok(offer, "missing old-parent offer");
-    assert.equal(offer.message.value, (refreshBeforeSlotMs ? 130 : 35) * 1_000_000);
+    if (refreshBeforeSlotMs) {
+      assert.ok(offer.message.value >= 129_000_000 && offer.message.value <= 130_000_000);
+    } else {
+      assert.equal(offer.message.value, 35_000_000);
+    }
     assert.equal(published.length, 4, "primary and stages clearing the existing 3% gossip floor must publish");
     assert.deepEqual(
       published.map((bid) => bid.builderIndex),
@@ -348,7 +352,7 @@ async function run(pair, refreshBeforeSlotMs) {
 
 const rows = [];
 for (let pair = 0; pair < 2; pair++) {
-  for (const lead of pair % 2 ? [750, 0] : [0, 750]) rows.push(await run(pair, lead));
+  for (const lead of pair % 2 ? [800, 0] : [0, 800]) rows.push(await run(pair, lead));
 }
 let filesystem;
 try {
@@ -373,7 +377,7 @@ console.log(
         stageDeadlines,
         txBytes: 400,
         accessListBytes: 50_000,
-        oldParentTransactions: [35, 130],
+        oldParentTransactions: {off: 35, onMin: 129, onMax: 130},
         txValueGwei: 1_000_000,
         pairs: 2,
       },

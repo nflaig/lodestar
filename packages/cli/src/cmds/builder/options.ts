@@ -251,7 +251,7 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
   "bidding.alternateRefreshBeforeSlotMs": {
     type: "number",
     description:
-      "Refresh retained alternate parents once starting this many milliseconds before the slot; zero disables",
+      "Target one alternate refresh this many ms before the slot, after primary gossip plus 100 ms; zero disables",
     default: defaultOptions.bidding.alternateRefreshBeforeSlotMs,
     group: "bidding",
   },

@@ -300,6 +300,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       maxRevisionsPerSlot,
       alternateBranches,
       alternateBuildDurationMs,
+      alternateRefreshBeforeSlotMs,
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
     builderApi: builderApiOpts,

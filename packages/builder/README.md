@@ -178,7 +178,9 @@ for primary work. Alternates enter the durable journal only while it is idle.
 
 `--bidding.alternateRefreshBeforeSlotMs` defaults to `0` (disabled). With alternate
 branches enabled, values from 500 through 5000 schedule one last refresh for each
-retained alternate tuple, starting that many milliseconds before the proposal slot.
+retained alternate tuple, targeting that many milliseconds before the proposal slot.
+The start is clamped to at least 100 ms after the configured primary gossip deadline,
+so a larger lead cannot add work before that deadline.
 This also covers an earlier primary that is subsequently received as an authoritative
 alternate event. Builder eligibility and collateral must come from that event; an old
 primary alone cannot authorize a refresh. Events for the current primary are ignored,
@@ -195,9 +197,11 @@ The refresh lead is a scheduling target, not a reserved execution window. It can
 delayed or skipped by primary work, gossip deadlines or admission limits. It must leave
 more than the build duration plus 50 ms before the slot. For example, with a 500 ms
 build duration, primary gossip at 9250 bps and stages at 9850/10000/10400/10800 bps,
-a 750 ms lead starts after the primary's exclusion window and finishes before the
-first stage's exclusion window. A 500 ms lead cannot fit and is skipped. Choose a lead
-against the actual gossip schedule and measure primary performance before enabling it.
+an 800 ms lead starts 100 ms after the primary deadline, with 70 ms of admission slack
+before the first stage's exclusion window. A 750 ms lead leaves only 20 ms, so a small
+timer delay or busy journal can skip the refresh. A 500 ms lead cannot fit and is
+skipped. Choose a lead against the actual gossip schedule and measure primary
+performance before enabling it.
 
 To qualify the scheduler separately from native construction, run:
 
