@@ -613,7 +613,7 @@ export class Bidder {
           this.alternateQueue.size < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
           !this.hasRetainedAlternate(event)
         ) {
-          this.alternateQueue.set(id, {event, kind: "retry", notBefore: 0, retryFor: replacement});
+          this.alternateQueue.set(id, {event: alternate.event, kind: "retry", notBefore: 0, retryFor: replacement});
           this.modules.logger.debug("Retrying preempted alternate parent bid", {
             slot: primary.slot,
             parentBlockRoot: toRootHex(event.data.parentBlockRoot),

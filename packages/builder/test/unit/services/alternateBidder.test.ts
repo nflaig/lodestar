@@ -394,6 +394,21 @@ describe("alternate parent bidder", () => {
       expect(m.offer(attributes(8, 9))).not.toBeNull();
     });
 
+    it("preserves updated branch collateral when an initial attempt is retried", async () => {
+      const m = setup({alternateRefreshBeforeSlotMs: 750});
+      const alternate = attributes(33, 44);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(200);
+      const updated = structuredClone(alternate);
+      updated.context.builders[0].availableGwei = 500_000_000;
+      m.bidder.onAlternatePayloadAttributes(updated);
+      m.start(attributes(4, 6));
+      await vi.advanceTimersByTimeAsync(800);
+      expect(alternateRequests(m)).toHaveLength(2);
+      expect(m.offer(alternate)).toBeNull();
+    });
+
     it("admits a distinct branch even when retained refreshes fill the queue", async () => {
       const m = setup({alternateRefreshBeforeSlotMs: 2000});
       const retained = Array.from({length: 4}, (_, i) => attributes(20 + i, 30 + i));
