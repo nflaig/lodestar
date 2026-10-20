@@ -278,6 +278,238 @@ describe("alternate parent bidder", () => {
     };
   }
 
+  describe("alternate gossip", () => {
+    async function ready(options: Partial<BidderOptions> = {}) {
+      const m = setup({alternateGossip: true, ...options}, [], true);
+      const alternate = attributes(4, 6);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(1500);
+      const signed = m.offer(alternate);
+      if (!signed) throw Error("Missing durable alternate");
+      const eligibility = m.bidStore.getOfferEligibility(signed);
+      if (!eligibility?.retained) throw Error("Missing retained permission");
+      const alternateCalls = () =>
+        m.api.beacon.publishExecutionPayloadBid.mock.calls.filter(
+          ([args]) =>
+            toRootHex(args.signedExecutionPayloadBid.message.parentBlockHash) ===
+            toRootHex(alternate.data.parentBlockHash)
+        );
+      return {...m, alternate, signed, eligibility, retained: eligibility.retained, alternateCalls};
+    }
+
+    it.each([false, true])(
+      "gossips durable branch tuples only when enabled=%s, without new retention",
+      async (enabled) => {
+        const m = setup({alternateGossip: enabled}, [9500], true);
+        const contexts = [attributes(4, 5), attributes(4, 6), attributes(3, 6), attributes(3, 7)];
+        const sentAt: number[] = [];
+        m.api.beacon.publishExecutionPayloadBid.mockImplementation(async (_args, init) => {
+          init?.beforeRequest?.();
+          sentAt.push(Date.now());
+          return mockApiResponse({});
+        });
+        m.start(contexts[0]);
+        for (const event of contexts.slice(1)) m.bidder.onAlternatePayloadAttributes(event);
+        await vi.advanceTimersByTimeAsync(1500);
+        const retained = contexts.map((event) => m.offer(event));
+        expect(retained.every(Boolean)).toBe(true);
+        const journalWrites = m.retainCommitment.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(8699);
+        expect(m.api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        const sent = m.api.beacon.publishExecutionPayloadBid.mock.calls.map(([args]) => args.signedExecutionPayloadBid);
+        expect(sent).toHaveLength(enabled ? 4 : 1);
+        expect(sentAt.every((time) => time === 10_200)).toBe(true);
+        expect(sent.map((bid) => bid.message.builderIndex)).toEqual(enabled ? [1, 1, 1, 1] : [1]);
+        expect(m.retainCommitment).toHaveBeenCalledTimes(journalWrites);
+        expect(m.payloadSource.prepare).toHaveBeenCalledTimes(4);
+        if (enabled) expect(new Set(sent)).toEqual(new Set(retained));
+        for (const signed of retained) {
+          if (!signed) throw Error("Missing retained fixture");
+          expect(m.payloadStore.has(toRootHex(signed.message.blockHash))).toBe(true);
+        }
+        await vi.advanceTimersByTimeAsync(100);
+        expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledTimes(enabled ? 4 : 1);
+      }
+    );
+
+    it.each([
+      "closed",
+      "generation",
+      "balance",
+      "preferences",
+      "proposer",
+      "shutdown",
+      "cutoff",
+      "capability",
+    ] as const)("retains reveal ownership but does not gossip after %s changes", async (reason) => {
+      const m = await ready();
+      await vi.advanceTimersByTimeAsync(8699);
+      if (reason === "closed") m.retained.closed = true;
+      if (reason === "generation") {
+        m.advanceGeneration();
+        m.eligibility.lease.generation = "0x1";
+      }
+      if (reason === "balance") m.getBuilderStatus.mockReturnValue({status: "active", balance: 1_100_000_000});
+      if (reason === "preferences") m.proposerPreferencesTracker.prune(2);
+      if (reason === "proposer") {
+        const changed = attributes(4, 6);
+        changed.data.proposerIndex = 99;
+        m.start(changed);
+      }
+      if (reason === "shutdown") controller.abort();
+      if (reason === "cutoff") vi.setSystemTime(13_200);
+      if (reason === "capability") m.payloadSource.supportsRetainedOffers = false;
+      await vi.advanceTimersByTimeAsync(1);
+      expect(m.alternateCalls()).toHaveLength(0);
+      expect(m.bidStore.has(m.signed)).toBe(true);
+      expect(m.payloadStore.has(toRootHex(m.signed.message.blockHash))).toBe(true);
+    });
+
+    it("does not gossip in dry-run mode", async () => {
+      const m = setup({alternateGossip: true, dryRun: true}, [], true);
+      m.start(attributes(4, 5));
+      m.bidder.onAlternatePayloadAttributes(attributes(4, 6));
+      await vi.advanceTimersByTimeAsync(10_300);
+      expect(m.api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+      expect(m.retainCommitment).not.toHaveBeenCalled();
+    });
+
+    it("selects the replacement owner before the deadline and preserves the old reveal", async () => {
+      const m = await ready();
+      m.advanceGeneration();
+      await vi.advanceTimersByTimeAsync(1000);
+      const replacement = m.offer(m.alternate);
+      expect(replacement).not.toBeNull();
+      expect(replacement).not.toBe(m.signed);
+      const writes = m.retainCommitment.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(7700);
+      expect(m.alternateCalls()).toHaveLength(1);
+      expect(m.alternateCalls()[0][0].signedExecutionPayloadBid).toBe(replacement);
+      expect(m.retainCommitment).toHaveBeenCalledTimes(writes);
+      expect(m.bidStore.has(m.signed)).toBe(true);
+      expect(m.payloadStore.has(toRootHex(m.signed.message.blockHash))).toBe(true);
+    });
+
+    it.each(["resolved", "lost"] as const)(
+      "keeps renewal independent of %s transport and never retries",
+      async (outcome) => {
+        const m = await ready();
+        const response = defer<void>();
+        let requestSignal: AbortSignal | undefined;
+        m.api.beacon.publishExecutionPayloadBid.mockImplementation(async (args, init) => {
+          init?.beforeRequest?.();
+          if (args.signedExecutionPayloadBid === m.signed) {
+            requestSignal = init?.signal ?? undefined;
+            await response.promise;
+          }
+          return mockApiResponse({});
+        });
+        await vi.advanceTimersByTimeAsync(8700);
+        expect(m.alternateCalls()).toHaveLength(1);
+        const renewals = m.payloadSource.renewOffer.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(500);
+        expect(m.payloadSource.renewOffer.mock.calls.length).toBeGreaterThan(renewals);
+        expect(m.bidStore.canOffer(m.signed)).toBe(true);
+        expect(m.alternateCalls()).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(2500);
+        expect(requestSignal?.aborted).toBe(true);
+        if (outcome === "lost") response.reject(Error("transport acknowledgement lost"));
+        else response.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(m.alternateCalls()).toHaveLength(1);
+        expect(
+          m.ledger.hasSubmitted(
+            1,
+            toRootHex(m.alternate.data.parentBlockHash),
+            toRootHex(m.alternate.data.parentBlockRoot)
+          )
+        ).toBe(true);
+        expect(m.payloadStore.has(toRootHex(m.signed.message.blockHash))).toBe(true);
+      }
+    );
+
+    it.each(["context", "lease", "cutoff"] as const)(
+      "fences %s changes between ledger reservation and transport",
+      async (reason) => {
+        const m = await ready();
+        let transported = false;
+        m.api.beacon.publishExecutionPayloadBid.mockImplementation(async (args, init) => {
+          if (args.signedExecutionPayloadBid === m.signed) {
+            if (reason === "context") m.proposerPreferencesTracker.prune(2);
+            if (reason === "lease") m.eligibility.lease.ready = false;
+            if (reason === "cutoff") vi.setSystemTime(13_200);
+            init?.beforeRequest?.();
+            transported = true;
+          }
+          return mockApiResponse({});
+        });
+        await vi.advanceTimersByTimeAsync(8700);
+        expect(m.alternateCalls()).toHaveLength(1);
+        expect(transported).toBe(false);
+        expect(
+          m.ledger.hasSubmitted(
+            1,
+            toRootHex(m.alternate.data.parentBlockHash),
+            toRootHex(m.alternate.data.parentBlockRoot)
+          )
+        ).toBe(true);
+        expect(m.payloadStore.has(toRootHex(m.signed.message.blockHash))).toBe(true);
+      }
+    );
+
+    it("skips a conservatively recovered journal tuple", async () => {
+      const m = await ready();
+      const record = m.ledger.getBidsForSlot(1).find((bid) => bid.blockHash === toRootHex(m.signed.message.blockHash));
+      if (!record) throw Error("Missing journal record");
+      m.ledger.recordBid(record);
+      await vi.advanceTimersByTimeAsync(8700);
+      expect(m.alternateCalls()).toHaveLength(0);
+      expect(m.payloadStore.has(record.blockHash)).toBe(true);
+    });
+
+    it("keeps renewal alive when detached transport diagnostics throw", async () => {
+      const m = await ready();
+      m.api.beacon.publishExecutionPayloadBid.mockImplementation(async (args) => {
+        if (args.signedExecutionPayloadBid === m.signed) throw Error("transport failed");
+        return mockApiResponse({});
+      });
+      m.logger.error.mockImplementation(() => {
+        throw Error("diagnostic failed");
+      });
+      await vi.advanceTimersByTimeAsync(8700);
+      const renewals = m.payloadSource.renewOffer.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(m.alternateCalls()).toHaveLength(1);
+      expect(m.payloadSource.renewOffer.mock.calls.length).toBeGreaterThan(renewals);
+      expect(m.bidStore.canOffer(m.signed)).toBe(true);
+    });
+
+    it.each([true, false])(
+      "reuses a transferred primary only when its tuple has not gossiped: prior=%s",
+      async (prior) => {
+        const m = setup({alternateGossip: true, primaryHandoff: true}, [], true);
+        const old = attributes(1, 40);
+        m.start(old);
+        await vi.advanceTimersByTimeAsync(prior ? 10_200 : 1);
+        const signed = m.offer(old);
+        if (!signed) throw Error("Missing primary bid");
+        m.start(attributes(3, 40));
+        m.bidder.onAlternatePayloadAttributes(old);
+        await vi.advanceTimersByTimeAsync(prior ? 200 : 10_399);
+        const calls = m.api.beacon.publishExecutionPayloadBid.mock.calls.filter(
+          ([args]) =>
+            toRootHex(args.signedExecutionPayloadBid.message.parentBlockRoot) === toRootHex(old.data.parentBlockRoot)
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0][0].signedExecutionPayloadBid).toBe(signed);
+        expect(m.retainCommitment.mock.calls.filter(([bid]) => bid === signed)).toHaveLength(1);
+        expect(m.payloadSource.retainPrimaryPayload).toHaveBeenCalledOnce();
+      }
+    );
+  });
+
   describe("primary handoff", () => {
     async function started(options: Partial<BidderOptions> = {primaryHandoff: true}) {
       const m = setup(options, [], true);

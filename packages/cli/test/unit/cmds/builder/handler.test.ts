@@ -165,6 +165,51 @@ describe("cmds / builder / args handler", () => {
     );
   });
 
+  it.each([{}, {"bidding.alternateBranches": true}, {"payload.alternateOrderGenerations": true}])(
+    "keeps alternate gossip disabled by default and requires both retained branch flags %j",
+    async (args) => {
+      expect(builderOptions["bidding.alternateGossip"].default).toBe(false);
+      await expect(
+        runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.alternateGossip": true, ...args})
+      ).rejects.toThrow(
+        "--bidding.alternateGossip requires --bidding.alternateBranches and --payload.alternateOrderGenerations"
+      );
+    }
+  );
+
+  it("forwards alternate gossip without enabling primary transfer or changing deadlines", async () => {
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1));
+    const load = vi
+      .spyOn(keyLoader, "loadBuilderKeypair")
+      .mockResolvedValue({secretKey, publicKey: secretKey.toPublicKey()});
+    const shutdown = vi.spyOn(cliUtils, "onGracefulShutdown").mockImplementation(() => {});
+    const init = vi.spyOn(Builder, "init").mockRejectedValue(Error("BUILDER_INIT_CAPTURED"));
+    try {
+      await expect(
+        runBuilderHandler({
+          "params.GLOAS_FORK_EPOCH": "0",
+          "payload.constructorUrl": "http://127.0.0.1:8547",
+          "bidding.updateIntervalMs": 100,
+          "bidding.deadlineBps": 9250,
+          "bidding.alternateBranches": true,
+          "payload.alternateOrderGenerations": true,
+          "bidding.alternateGossip": true,
+        })
+      ).rejects.toThrow("BUILDER_INIT_CAPTURED");
+      expect(init.mock.calls[0][0].bidding).toMatchObject({
+        alternateGossip: true,
+        alternateBranches: true,
+        primaryHandoff: false,
+        deadlineBps: 9250,
+        updateCutoffBps: 1000,
+      });
+    } finally {
+      load.mockRestore();
+      shutdown.mockRestore();
+      init.mockRestore();
+    }
+  });
+
   it("requires a constructor for recoverable begins", async () => {
     await expect(
       runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "payload.beginReservations": true})

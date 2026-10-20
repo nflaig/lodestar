@@ -152,6 +152,26 @@ alternate branches and continuous primary updates. The publisher first requires
 An older constructor cannot be treated as supporting the new permission protocol.
 With generations disabled, the existing unleased alternate path remains in use.
 
+`--bidding.alternateGossip true` also offers those durable alternate bids over P2P
+using the primary builder identity. It defaults to false and requires both
+`--bidding.alternateBranches` and `--payload.alternateOrderGenerations`. Publication
+starts no earlier than the unchanged primary gossip deadline and stops at the
+ordinary update cutoff. It reuses a signed, retained bid without another build,
+signature or journal write. The latest retained owner for each parent tuple must
+still have valid branch metadata, proposer preferences, collateral and a current
+generation lease when transport starts. Transport never blocks lease renewal.
+Each `(slot, builder index, EL parent hash, CL parent root)` gets one attempt,
+including uncertain sends; previously signed payloads remain available for reveal.
+Recovered journal tuples conservatively do not gossip again. Additional staged
+identities continue to serve only the primary construction path.
+
+The [Gloas gossip rules](https://github.com/ethereum/consensus-specs/blob/d9663f85be248c4fd0ae95806da6070e17c2442b/specs/gloas/p2p-interface.md#new-execution_payload_bid)
+allow distinct parent tuples for one identity, but receivers forward only branches
+compatible with their own head choice. FULL and EMPTY variants can therefore
+reach different peers; publication acknowledgement does not establish reception
+or proposer selection. Lodestar also checks its predicted parent for a direct-parent
+bid at an epoch boundary. This option does not relax those beacon rules.
+
 `--bidding.primaryHandoff true` additionally allows an already durable primary bid
 to survive a same-slot, same-proposer change of primary parent. It defaults to
 false and requires retained alternate permissions plus the constructor's explicit

@@ -47,6 +47,7 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.updateCutoffBps": number;
   "bidding.maxRevisionsPerSlot": number;
   "bidding.alternateBranches": boolean;
+  "bidding.alternateGossip": boolean;
   "bidding.primaryHandoff": boolean;
   "bidding.alternateBuildDurationMs": number;
   "bidding.alternateRefreshBeforeSlotMs": number;
@@ -258,6 +259,12 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     type: "boolean",
     description: "Build bounded alternate parent snapshots for API and streaming bids",
     default: defaultOptions.bidding.alternateBranches,
+    group: "bidding",
+  },
+  "bidding.alternateGossip": {
+    type: "boolean",
+    description: "Gossip durable alternate bids at the primary deadline (requires retained order generations)",
+    default: defaultOptions.bidding.alternateGossip,
     group: "bidding",
   },
   "bidding.alternateBuildDurationMs": {

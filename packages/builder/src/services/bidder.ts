@@ -113,6 +113,7 @@ type RetainedAlternate = {
   targetGasLimit: bigint;
   controller: AbortController;
   signed?: gloas.SignedExecutionPayloadBid;
+  gossipStarted?: boolean;
   renewRequested: boolean;
   wake?: () => void;
 };
@@ -130,6 +131,8 @@ export type BidderOptions = {
   maxRevisionsPerSlot?: number;
   /** Build one bounded API/stream snapshot for each supported alternate parent tuple. */
   alternateBranches?: boolean;
+  /** Gossip durable retained alternates with the primary identity at its existing deadline. */
+  alternateGossip?: boolean;
   /** Reuse an exact durable primary bid after a validated same-slot demotion. */
   primaryHandoff?: boolean;
   alternateBuildDurationMs?: number;
@@ -212,6 +215,7 @@ export class Bidder {
     if (!Number.isSafeInteger(refresh) || (refresh !== 0 && (refresh < 500 || refresh > 5000)))
       throw new RangeError("alternateRefreshBeforeSlotMs must be zero or between 500 and 5000");
     if (refresh > 0 && !opts.alternateBranches) throw Error("ALTERNATE_REFRESH_REQUIRES_ALTERNATE_BRANCHES");
+    if (opts.alternateGossip && !opts.alternateBranches) throw Error("ALTERNATE_GOSSIP_REQUIRES_ALTERNATE_BRANCHES");
     if (opts.primaryHandoff && !opts.alternateBranches) throw Error("PRIMARY_HANDOFF_REQUIRES_ALTERNATE_BRANCHES");
     if (
       opts.alternateBranches &&
@@ -1056,10 +1060,75 @@ export class Bidder {
         if (retained.wake === done) retained.wake = undefined;
         resolve();
       };
-      const timer = setTimeout(done, 100);
+      const msToGossip = this.opts.alternateGossip ? this.msToAlternateGossip(retained.event.data.proposalSlot) : 0;
+      const timer = setTimeout(done, msToGossip > 0 ? Math.min(100, msToGossip) : 100);
       retained.wake = done;
       signal.addEventListener("abort", done, {once: true});
     });
+  }
+
+  private msToAlternateGossip(slot: number): number {
+    const {clock, config} = this.modules;
+    return clock.msToSlot(slot) - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(this.opts.deadlineBps);
+  }
+
+  private gossipRetainedAlternate(retained: RetainedAlternate): void {
+    if (!this.opts.alternateGossip || retained.gossipStarted || this.opts.dryRun) return;
+    const {signed} = retained;
+    if (!signed || !this.modules.orchestrator.supportsRetainedOffers) return;
+    const {slot} = signed.message;
+    const parentBlockHash = toRootHex(signed.message.parentBlockHash);
+    const parentBlockRoot = toRootHex(signed.message.parentBlockRoot);
+    const {bidStore, ledger, config, clock, logger, metrics} = this.modules;
+    const contextValid = (): boolean =>
+      !retained.controller.signal.aborted &&
+      !this.modules.signal.aborted &&
+      this.retainedAlternates.get(retained.id) === retained &&
+      retained.signed === signed &&
+      this.primary?.id !== retained.id &&
+      this.msToAlternateGossip(slot) <= 0 &&
+      this.retainedContext(retained) === "valid" &&
+      signed.message.executionPayment === 0n &&
+      bidStore.getOfferEligibility(signed) === retained.payload.offerEligibility &&
+      bidStore.canOffer(signed);
+    if (ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot) || !contextValid()) return;
+    retained.gossipStarted = true;
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, retained.controller.signal, this.modules.signal]);
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.max(0, clock.msToSlot(slot) + config.getSlotComponentDurationMs(this.opts.updateCutoffBps ?? 1000))
+    );
+    // The ledger consumes the tuple before transport. Neither uncertainty nor a
+    // replacement owner may retry it; renewal and historical reveals stay independent.
+    void this.modules.bidPublisher
+      .gossip(signed, signal, retained.payload.offerEligibility, () => {
+        if (!contextValid()) throw Error("ALTERNATE_GOSSIP_CONTEXT_UNAVAILABLE");
+      })
+      .then(() => {
+        metrics?.bids.total.inc({result: BidResult.published});
+        logger.info("Gossiped execution payload bid", {
+          slot,
+          parentBlockHash,
+          parentBlockRoot,
+          blockHash: toRootHex(signed.message.blockHash),
+          value: prettyGweiToEth(signed.message.value),
+          builderIndex: signed.message.builderIndex,
+          alternate: true,
+        });
+      })
+      .catch((error: unknown) => {
+        if (!isErrorAborted(error))
+          logger.error(
+            "Failed to gossip alternate execution payload bid",
+            {code: "BUILDER_ALTERNATE_GOSSIP", slot, parentBlockHash, parentBlockRoot},
+            error as Error
+          );
+      })
+      .finally(() => clearTimeout(timer))
+      .catch(() => {
+        // Detached transport diagnostics cannot stop renewal or escape shutdown.
+      });
   }
 
   private shareRetainedPayloadBody(payload: BuiltPayload): void {
@@ -1294,6 +1363,7 @@ export class Bidder {
           if (context === "invalid") break;
           this.setRetainedPaused(retained, context === "pending");
           if (context === "valid") {
+            this.gossipRetainedAlternate(retained);
             retained.renewRequested = false;
             try {
               await this.modules.orchestrator.renewOffer(payload, signal);
@@ -1309,6 +1379,7 @@ export class Bidder {
                 !isOfferEligible(this.modules.bidStore.getOfferEligibility(retained.signed))
               )
                 this.modules.bidStore.add(retained.signed, payload.offerEligibility);
+              this.gossipRetainedAlternate(retained);
               if (
                 signed &&
                 !handoffOffered &&
