@@ -156,7 +156,14 @@ With generations disabled, the existing unleased alternate path remains in use.
 using the primary builder identity. It defaults to false and requires both
 `--bidding.alternateBranches` and `--payload.alternateOrderGenerations`. Publication
 starts no earlier than the unchanged primary gossip deadline and stops at the
-ordinary update cutoff. It reuses a signed, retained bid without another build,
+ordinary update cutoff. It waits for that primary publication to settle, or for
+the primary to skip a previously prepared bid that is no longer eligible. A
+primary that has not produced a prepared bid for its current tuple keeps the
+gate closed until cutoff, including when its policy declines every snapshot or
+after a late parent change. A slow primary request can prevent alternate gossip
+for that slot; there is no timeout that releases competing requests while it
+remains pending. Lease renewal continues during the wait.
+It reuses a signed, retained bid without another build,
 signature or journal write. The latest retained owner for each parent tuple must
 still have valid branch metadata, proposer preferences, collateral and a current
 generation lease when transport starts. Transport never blocks lease renewal.

@@ -193,6 +193,41 @@ describe("Builder", () => {
     expect(api.events.eventstream).not.toHaveBeenCalled();
   });
 
+  it("forwards alternate gossip options through initialization to the bidder", async () => {
+    api.beacon.getGenesis.mockResolvedValue(
+      mockApiResponse({
+        data: {...ssz.phase0.Genesis.defaultValue(), genesisTime: Math.floor(Date.now() / 1000)},
+      })
+    );
+    Object.assign(api, {config: {getSpec: vi.fn().mockResolvedValue(mockApiResponse({data: {}, meta: undefined}))}});
+    api.node.getSyncingStatus.mockResolvedValue(
+      mockApiResponse({
+        data: {headSlot: 0, syncDistance: 0, isSyncing: false, isOptimistic: false, elOffline: false},
+      })
+    );
+    api.beacon.getStateBuilders.mockResolvedValue(
+      mockApiResponse({
+        data: [
+          {
+            index: 1,
+            status: "active",
+            builder: {
+              ...ssz.gloas.Builder.defaultValue(),
+              pubkey: modules.opts.keypair.publicKey.toBytes(),
+              balance: 10_000_000_000,
+            },
+          },
+        ],
+        meta: {executionOptimistic: false, finalized: false},
+      })
+    );
+    await expect(Builder.init({...modules.opts, bidding: {...biddingOptions, alternateGossip: true}})).rejects.toThrow(
+      "ALTERNATE_GOSSIP_REQUIRES_ALTERNATE_BRANCHES"
+    );
+    expect(api.beacon.getStateBuilders).toHaveBeenCalled();
+    expect(api.events.eventstream).not.toHaveBeenCalled();
+  });
+
   it("releases signer ownership when initialization fails before serving offers", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "builder-startup-guard-"));
     try {

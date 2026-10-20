@@ -320,6 +320,7 @@ describe("alternate parent bidder", () => {
         await vi.advanceTimersByTimeAsync(1);
         const sent = m.api.beacon.publishExecutionPayloadBid.mock.calls.map(([args]) => args.signedExecutionPayloadBid);
         expect(sent).toHaveLength(enabled ? 4 : 1);
+        expect(sent[0]).toBe(retained[0]);
         expect(sentAt.every((time) => time === 10_200)).toBe(true);
         expect(sent.map((bid) => bid.message.builderIndex)).toEqual(enabled ? [1, 1, 1, 1] : [1]);
         expect(m.retainCommitment).toHaveBeenCalledTimes(journalWrites);
@@ -366,6 +367,186 @@ describe("alternate parent bidder", () => {
       expect(m.bidStore.has(m.signed)).toBe(true);
       expect(m.payloadStore.has(toRootHex(m.signed.message.blockHash))).toBe(true);
     });
+
+    it.each(["success", "rejected", "cutoff"] as const)(
+      "protects a slow primary until its publication settles (%s)",
+      async (outcome) => {
+        const m = await ready();
+        const response = defer<void>();
+        const primary = m.offer(attributes(4, 5));
+        m.api.beacon.publishExecutionPayloadBid.mockImplementation(async (args, init) => {
+          init?.beforeRequest?.();
+          if (args.signedExecutionPayloadBid === primary) await response.promise;
+          return mockApiResponse({});
+        });
+        try {
+          await vi.advanceTimersByTimeAsync(8700);
+          expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+          expect(m.alternateCalls()).toHaveLength(0);
+          const renewals = m.payloadSource.renewOffer.mock.calls.length;
+          await vi.advanceTimersByTimeAsync(outcome === "cutoff" ? 3000 : 250);
+          expect(m.payloadSource.renewOffer.mock.calls.length).toBeGreaterThan(renewals);
+          expect(m.alternateCalls()).toHaveLength(0);
+          if (outcome === "rejected") response.reject(Error("primary transport failed"));
+          else response.resolve();
+          await vi.advanceTimersByTimeAsync(0);
+          expect(m.alternateCalls()).toHaveLength(outcome === "cutoff" ? 0 : 1);
+          expect(m.api.beacon.publishExecutionPayloadBid.mock.calls[0][0].signedExecutionPayloadBid).toBe(primary);
+        } finally {
+          response.resolve();
+        }
+      }
+    );
+
+    it("releases alternate gossip when the primary has no eligible bid at its deadline", async () => {
+      const m = await ready();
+      await vi.advanceTimersByTimeAsync(8699);
+      const primary = m.offer(attributes(4, 5));
+      if (!primary) throw Error("Missing primary bid");
+      const eligibility = m.bidStore.getOfferEligibility(primary);
+      if (!eligibility) throw Error("Missing primary permission");
+      eligibility.lease.ready = false;
+      m.payloadSource.getPayload.mockRejectedValue(new PayloadSourceNotReady());
+      await vi.advanceTimersByTimeAsync(1);
+      expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+      expect(m.alternateCalls()).toHaveLength(1);
+    });
+
+    it("waits for the current primary instead of releasing on a replaced primary acknowledgement", async () => {
+      const m = await ready();
+      const firstResponse = defer<void>();
+      const replacementResponse = defer<void>();
+      const first = m.offer(attributes(4, 5));
+      m.api.beacon.publishExecutionPayloadBid.mockImplementation(async (args, init) => {
+        init?.beforeRequest?.();
+        if (args.signedExecutionPayloadBid === first) await firstResponse.promise;
+        else if (toRootHex(args.signedExecutionPayloadBid.message.parentBlockHash) === toRootHex(Buffer.alloc(32, 8)))
+          await replacementResponse.promise;
+        return mockApiResponse({});
+      });
+      try {
+        await vi.advanceTimersByTimeAsync(8700);
+        m.start(attributes(7, 8));
+        await vi.advanceTimersByTimeAsync(1);
+        firstResponse.resolve();
+        await vi.advanceTimersByTimeAsync(250);
+        expect(m.alternateCalls()).toHaveLength(0);
+        expect(
+          m.api.beacon.publishExecutionPayloadBid.mock.calls.some(
+            ([args]) =>
+              toRootHex(args.signedExecutionPayloadBid.message.parentBlockHash) === toRootHex(Buffer.alloc(32, 8))
+          )
+        ).toBe(true);
+        replacementResponse.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(m.alternateCalls()).toHaveLength(1);
+      } finally {
+        firstResponse.resolve();
+        replacementResponse.resolve();
+      }
+    });
+
+    it("does not block a late primary behind alternate transport and gates further alternates", async () => {
+      const m = await ready();
+      const primary = m.offer(attributes(4, 5));
+      if (!primary) throw Error("Missing primary bid");
+      const eligibility = m.bidStore.getOfferEligibility(primary);
+      if (!eligibility) throw Error("Missing primary permission");
+      const getPayload = m.payloadSource.getPayload.getMockImplementation();
+      if (!getPayload) throw Error("Missing payload fixture");
+      const alternateResponse = defer<void>();
+      const primaryResponse = defer<void>();
+      m.api.beacon.publishExecutionPayloadBid.mockImplementation(async (args, init) => {
+        init?.beforeRequest?.();
+        if (args.signedExecutionPayloadBid === m.signed) await alternateResponse.promise;
+        if (args.signedExecutionPayloadBid === primary) await primaryResponse.promise;
+        return mockApiResponse({});
+      });
+      try {
+        await vi.advanceTimersByTimeAsync(8699);
+        eligibility.lease.ready = false;
+        m.payloadSource.getPayload.mockRejectedValue(new PayloadSourceNotReady());
+        await vi.advanceTimersByTimeAsync(1);
+        expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+        expect(m.alternateCalls()).toHaveLength(1);
+        m.payloadSource.getPayload.mockImplementation(getPayload);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledTimes(2);
+        expect(m.api.beacon.publishExecutionPayloadBid.mock.calls[1][0].signedExecutionPayloadBid).toBe(primary);
+        const later = attributes(3, 6);
+        m.bidder.onAlternatePayloadAttributes(later);
+        await vi.advanceTimersByTimeAsync(1000);
+        const signed = m.offer(later);
+        expect(signed).not.toBeNull();
+        expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledTimes(2);
+        primaryResponse.resolve();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledTimes(3);
+        expect(m.api.beacon.publishExecutionPayloadBid.mock.calls[2][0].signedExecutionPayloadBid).toBe(signed);
+      } finally {
+        alternateResponse.resolve();
+        primaryResponse.resolve();
+      }
+    });
+
+    it.each(["prepare", "getPayload"] as const)(
+      "does not release alternates while a late replacement is still awaiting its first %s",
+      async (phase) => {
+        const m = await ready();
+        const first = m.offer(attributes(4, 5));
+        const firstResponse = defer<void>();
+        const replacementResponse = defer<void>();
+        const result = defer<void>();
+        const prepare = m.payloadSource.prepare.getMockImplementation();
+        const getPayload = m.payloadSource.getPayload.getMockImplementation();
+        if (!prepare || !getPayload) throw Error("Missing payload fixture");
+        const replacementParent = toRootHex(Buffer.alloc(32, 8));
+        m.payloadSource.prepare.mockImplementation(async (...args) => {
+          if (phase === "prepare" && args[0].forkchoiceState.headBlockHash === replacementParent) await result.promise;
+          return prepare(...args);
+        });
+        m.payloadSource.getPayload.mockImplementation(async (...args) => {
+          const session = m.sessions.get(args[0].payloadId);
+          if (phase === "getPayload" && session?.request.forkchoiceState.headBlockHash === replacementParent)
+            await result.promise;
+          return getPayload(...args);
+        });
+        m.api.beacon.publishExecutionPayloadBid.mockImplementation(async (args, init) => {
+          init?.beforeRequest?.();
+          if (args.signedExecutionPayloadBid === first) await firstResponse.promise;
+          else if (toRootHex(args.signedExecutionPayloadBid.message.parentBlockHash) === replacementParent)
+            await replacementResponse.promise;
+          return mockApiResponse({});
+        });
+        try {
+          await vi.advanceTimersByTimeAsync(8700);
+          m.start(attributes(7, 8));
+          await vi.advanceTimersByTimeAsync(1);
+          firstResponse.resolve();
+          const renewals = m.payloadSource.renewOffer.mock.calls.length;
+          await vi.advanceTimersByTimeAsync(250);
+          expect(m.payloadSource.renewOffer.mock.calls.length).toBeGreaterThan(renewals);
+          expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
+          expect(m.alternateCalls()).toHaveLength(0);
+          result.resolve();
+          await vi.advanceTimersByTimeAsync(1);
+          expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledTimes(2);
+          expect(
+            toRootHex(
+              m.api.beacon.publishExecutionPayloadBid.mock.calls[1][0].signedExecutionPayloadBid.message.parentBlockHash
+            )
+          ).toBe(replacementParent);
+          expect(m.alternateCalls()).toHaveLength(0);
+          replacementResponse.resolve();
+          await vi.advanceTimersByTimeAsync(0);
+          expect(m.alternateCalls()).toHaveLength(1);
+        } finally {
+          result.resolve();
+          firstResponse.resolve();
+          replacementResponse.resolve();
+        }
+      }
+    );
 
     it("does not gossip in dry-run mode", async () => {
       const m = setup({alternateGossip: true, dryRun: true}, [], true);

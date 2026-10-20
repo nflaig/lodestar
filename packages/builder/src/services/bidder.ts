@@ -75,6 +75,7 @@ type PrimaryBuild = {
   data: gloas.SSEPayloadAttributes;
   controller: AbortController;
   ready: boolean;
+  gossipSettled?: boolean;
   dependentRoot?: RootHex;
   feeRecipient?: ExecutionAddress;
   demotedBy?: PrimaryBuild;
@@ -1086,6 +1087,7 @@ export class Bidder {
       this.retainedAlternates.get(retained.id) === retained &&
       retained.signed === signed &&
       this.primary?.id !== retained.id &&
+      this.primary?.gossipSettled === true &&
       this.msToAlternateGossip(slot) <= 0 &&
       this.retainedContext(retained) === "valid" &&
       signed.message.executionPayment === 0n &&
@@ -1129,6 +1131,15 @@ export class Bidder {
       .catch(() => {
         // Detached transport diagnostics cannot stop renewal or escape shutdown.
       });
+  }
+
+  private releaseAlternateGossip(primary: PrimaryBuild): void {
+    if (primary.gossipSettled) return;
+    primary.gossipSettled = true;
+    if (!this.opts.alternateGossip || this.primary !== primary) return;
+    for (const retained of this.retainedOfferOwners) {
+      if (retained.event.data.proposalSlot === primary.slot) retained.wake?.();
+    }
   }
 
   private shareRetainedPayloadBody(payload: BuiltPayload): void {
@@ -1488,21 +1499,24 @@ export class Bidder {
       slotStart - config.SLOT_DURATION_MS + config.getSlotComponentDurationMs(deadlineBps);
     const primaryUntil = stages.length ? stageTime(stages[0].deadlineBps) : until;
     const gossipBest = (): void => {
+      if (Date.now() < job.getPayloadAt) return;
       if (
         !best ||
         !this.modules.bidStore.canOffer(best) ||
         publication ||
-        Date.now() < job.getPayloadAt ||
         Date.now() >= primaryUntil ||
         signal.aborted ||
         this.opts.dryRun ||
         ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)
-      )
+      ) {
+        if (best && (!publication || !publicationPending)) this.releaseAlternateGossip(primary);
         return;
+      }
       // Reserve synchronously in gossip(), before the transport can become uncertain.
       const signed = best;
       highestAttemptedValue = Math.max(highestAttemptedValue, signed.message.value);
       publicationPending = true;
+      primary.gossipSettled = false;
       publication = this.modules.bidPublisher
         .gossip(signed, signal, this.modules.bidStore.getOfferEligibility(signed))
         .then(() => {
@@ -1526,6 +1540,7 @@ export class Bidder {
         })
         .finally(() => {
           publicationPending = false;
+          this.releaseAlternateGossip(primary);
         });
     };
     const timerController = new AbortController();
