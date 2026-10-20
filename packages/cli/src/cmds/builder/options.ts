@@ -44,6 +44,7 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.updateIntervalMs": number;
   "bidding.updateCutoffBps": number;
   "bidding.maxRevisionsPerSlot": number;
+  "bidding.deferUnusedGossipStages": boolean;
   "bidding.minOperatingBalanceGwei": number;
   "reveal.cutoffBps"?: number;
 
@@ -222,6 +223,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     description: "Maximum new signed revisions per slot across all parents; existing commitments remain recoverable",
     type: "number",
     default: defaultOptions.bidding.maxRevisionsPerSlot,
+    group: "bidding",
+  },
+
+  "bidding.deferUnusedGossipStages": {
+    description: "Let an unsigned gossip stage wait for a higher bid within its existing window",
+    type: "boolean",
+    default: defaultOptions.bidding.deferUnusedGossipStages,
     group: "bidding",
   },
 

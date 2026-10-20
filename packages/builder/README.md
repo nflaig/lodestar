@@ -110,6 +110,22 @@ using the best ready bid at `bidding.deadlineBps` in the preceding slot. API pol
 continues until `updateCutoffBps` of the proposal slot; 1000 is 1.2 seconds into a
 12-second slot. Parent changes cancel construction without deleting old commitments.
 
+`--bidding.deferUnusedGossipStages` is disabled by default. With updates and staged
+identities enabled, a stage skipped solely because its value is below the gossip
+floor can wait for a higher durable API revision within its original window.
+The identity must have no signed revision for those parents and no pending or
+uncertain revision admission for that slot, including other parents. The deferral
+reason describes the identity's computed bid value after pricing and collateral
+checks; it does not prove that the payload is missing value. It starts preparation
+at most once, with a 25 ms budget covering signing, retention and acknowledgement
+and 10 ms reserved before the next stage or update cutoff. The timer cannot interrupt
+synchronous signing; expiry is checked again before gossip. Timed-out retention still preserves any late durable
+commitment, but cannot trigger gossip or another attempt. Cancellation, generation
+eligibility and the exact integer gossip floor are checked again before sending.
+The `BUILDER_STAGED_GOSSIP_DEFERRED` log records the wait; subsequent gossip or skip
+logs include `deferredMs`. This option does not extend any deadline or retry an
+uncertain send.
+
 The default update interval is zero, retaining one retrieval at the usual deadline.
 Positive intervals require this constructor source and must be at least 25 ms. This
 source cannot be combined with the controlled transaction-file source or its capture
@@ -218,7 +234,7 @@ VM snapshot rollback and clock restoration are outside the lease assumptions.
 
 ## Experimental Gloas bid streaming
 
-Enable `--builderApi --builderApi.bidStream` to serve the WebSocket extension used by
+Enable `--builderApi --builderApi.bidStream` to serve the `WebSocket` extension used by
 [Commit-Boost v0.12.0-rc1](https://github.com/Commit-Boost/commit-boost-client/releases/tag/v0.12.0-rc1)
 and [Helix PR #670](https://github.com/gattaca-com/helix/pull/670). This is an experimental
 extension, not a replacement for the standard HTTP builder API. The normal POST bid,
@@ -256,7 +272,7 @@ fails. A repeated proposer request opens a new stream and can return a newer bid
 
 The stream sends an eligible retained bid immediately, then updates after durable
 retention. It reserves the same transit and 50 ms response margin as HTTP and closes
-before the caller's deadline. Ping/pong RTT is logged for diagnosis; it does not change
+before the caller's deadline. Ping/pong round-trip time is logged for diagnosis; it does not change
 that margin or assume symmetric network latency. There are at most 64 pending or open
 streams, four per authenticated proposer, one write in flight and one coalesced update indication per
 connection. A 25 ms local eligibility check observes lease renewal without fetching or

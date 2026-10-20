@@ -55,6 +55,11 @@ export class BidPublisher {
   private readonly pendingGossip = new Set<string>();
   constructor(private readonly modules: BidPublisherModules) {}
 
+  /** Includes uncertain writes whose revision admission remains reserved. */
+  hasPendingRevisions(slot: Slot): boolean {
+    return (this.pendingRevisions.get(slot) ?? 0) > 0;
+  }
+
   publish(
     bid: heze.ExecutionPayloadBid,
     signal: AbortSignal,
