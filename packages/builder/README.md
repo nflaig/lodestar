@@ -234,7 +234,7 @@ VM snapshot rollback and clock restoration are outside the lease assumptions.
 
 ## Experimental Gloas bid streaming
 
-Enable `--builderApi --builderApi.bidStream` to serve the WebSocket extension used by
+Enable `--builderApi --builderApi.bidStream` to serve the `WebSocket` extension used by
 [Commit-Boost v0.12.0-rc1](https://github.com/Commit-Boost/commit-boost-client/releases/tag/v0.12.0-rc1)
 and [Helix PR #670](https://github.com/gattaca-com/helix/pull/670). This is an experimental
 extension, not a replacement for the standard HTTP builder API. The normal POST bid,
@@ -272,7 +272,7 @@ fails. A repeated proposer request opens a new stream and can return a newer bid
 
 The stream sends an eligible retained bid immediately, then updates after durable
 retention. It reserves the same transit and 50 ms response margin as HTTP and closes
-before the caller's deadline. Ping/pong RTT is logged for diagnosis; it does not change
+before the caller's deadline. Ping/pong round-trip time is logged for diagnosis; it does not change
 that margin or assume symmetric network latency. There are at most 64 pending or open
 streams, four per authenticated proposer, one write in flight and one coalesced update indication per
 connection. A 25 ms local eligibility check observes lease renewal without fetching or
