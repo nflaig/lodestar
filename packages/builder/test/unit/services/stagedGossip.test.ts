@@ -462,6 +462,94 @@ describe("staged P2P gossip", () => {
       await building;
     });
 
+    it.each(["unresolved", "uncertain"])("does not rearm after A to B to A with an %s admission", async (outcome) => {
+      const persistence = defer<void>();
+      const retain = vi.fn().mockReturnValueOnce(persistence.promise).mockResolvedValue(undefined);
+      let branchB = false;
+      source.getPayload.mockImplementation(async () => payload(branchB ? 4 : Date.now() >= 12100 ? 2 : 1));
+      const {second, primary} = setup({retain});
+      const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+      const first = primary.bidder.onPayloadAttributes(event());
+      await vi.advanceTimersByTimeAsync(10200);
+      const pending = second.bidPublisher.prepare({...published()[0].message, builderIndex: 2}).then(
+        () => "retained",
+        () => "uncertain"
+      );
+      expect(second.bidPublisher.hasPendingRevisions(slot)).toBe(true);
+      branchB = true;
+      const next = event();
+      next.data.parentBlockRoot = Buffer.alloc(32, 33);
+      const other = primary.bidder.onPayloadAttributes(next);
+      await vi.advanceTimersByTimeAsync(25);
+      await first;
+      branchB = false;
+      const returned = primary.bidder.onPayloadAttributes(event());
+      await vi.advanceTimersByTimeAsync(25);
+      await other;
+      if (outcome === "uncertain") {
+        persistence.reject(new CommitmentJournalError("COMMITMENT_WORKER_TIMEOUT", true));
+        expect(await pending).toBe("uncertain");
+      }
+      await vi.advanceTimersByTimeAsync(3050);
+      await returned;
+      expect(sign).toHaveBeenCalledOnce();
+      expect(retain).toHaveBeenCalledOnce();
+      expect(second.bidPublisher.hasPendingRevisions(slot)).toBe(true);
+      expect(published().filter((bid) => bid.message.builderIndex === 2)).toHaveLength(0);
+      expect(logger.info).toHaveBeenCalledWith(
+        "Skipped staged execution payload bid",
+        expect.objectContaining({builderIndex: 2, reason: "pending_revision", deferredMs: 0})
+      );
+      if (outcome === "unresolved") {
+        persistence.resolve();
+        expect(await pending).toBe("retained");
+      }
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("rechecks pending admission when a deferred stage wakes", async () => {
+      const persistence = defer<void>();
+      source.getPayload.mockImplementation(async () => payload(Date.now() >= 12100 ? 2 : 1));
+      const {second, primary} = setup({retain: () => persistence.promise});
+      const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+      const building = primary.bidder.onPayloadAttributes(event());
+      await vi.advanceTimersByTimeAsync(12050);
+      const pending = second.bidPublisher.prepare({...published()[0].message, builderIndex: 2});
+      await vi.advanceTimersByTimeAsync(1250);
+      await building;
+      expect(sign).toHaveBeenCalledOnce();
+      expect(published().filter((bid) => bid.message.builderIndex === 2)).toHaveLength(0);
+      expect(logger.info).toHaveBeenCalledWith(
+        "Skipped staged execution payload bid",
+        expect.objectContaining({builderIndex: 2, reason: "pending_revision", deferredMs: 100})
+      );
+      persistence.resolve();
+      await pending;
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("rechecks collateral and does not retry a higher bid the identity cannot cover", async () => {
+      source.getPayload.mockImplementation(async () => payload(Date.now() >= 12100 ? 2 : 1));
+      const options = {balance: 2_000_000_000};
+      const {second, primary} = setup(options);
+      const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+      const building = primary.bidder.onPayloadAttributes(event());
+      await vi.advanceTimersByTimeAsync(12125);
+      expect(logger.info).toHaveBeenCalledWith(
+        "Deferred staged execution payload bid",
+        expect.objectContaining({builderIndex: 2, computedValueGwei: 900_000_000})
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        "Bid policy declined to bid",
+        expect.objectContaining({payloadValueGwei: 2_000_000_000, coverableGwei: 1_000_000_000})
+      );
+      options.balance = 10_000_000_000;
+      await vi.advanceTimersByTimeAsync(1175);
+      await building;
+      expect(sign).not.toHaveBeenCalled();
+      expect(published().map((bid) => bid.message.builderIndex)).toEqual([1, 3]);
+    });
+
     it.each(["acknowledged", "lost"])("bounds busy retention and never retries its late %s reply", async (reply) => {
       const persistence = defer<void>();
       const retain = vi.fn(async (bid: gloas.SignedExecutionPayloadBid) => {
@@ -522,6 +610,66 @@ describe("staged P2P gossip", () => {
       expect(published().map((bid) => bid.message.builderIndex)).toEqual([1]);
       expect(second.ledger.getRevisionCount(slot)).toBe(1);
       expect(payloadStore.has(toRootHex(payload(2).executionPayload.blockHash))).toBe(true);
+    });
+
+    it("preserves the deferred commitment when cancellation races retention", async () => {
+      const persistence = defer<void>();
+      const retain = vi.fn(async (bid: gloas.SignedExecutionPayloadBid) => {
+        const stored = payloadStore.get(toRootHex(bid.message.blockHash));
+        if (!stored) throw Error("missing test payload");
+        second.journal?.retain(bid, stored);
+        await persistence.promise;
+      });
+      source.getPayload.mockImplementation(async () => payload(Date.now() >= 12100 ? 2 : 1));
+      const {second, primary} = setup({durable: true, retain});
+      const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+      const building = primary.bidder.onPayloadAttributes(event());
+      await vi.advanceTimersByTimeAsync(12105);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+      await building;
+      persistence.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sign).toHaveBeenCalledOnce();
+      expect(published().map((bid) => bid.message.builderIndex)).toEqual([1]);
+      expect(second.ledger.getRevisionCount(slot)).toBe(1);
+      const recovered = new BidLedger();
+      const retainedPayloads = new PayloadStore();
+      new CommitmentJournal(path.join(directory, "2"), second.journalIdentity, 1).recover(
+        1,
+        retainedPayloads,
+        new BidStore(),
+        recovered
+      );
+      expect(recovered.getRevisionCount(slot)).toBe(1);
+      expect(retainedPayloads.has(toRootHex(payload(2).executionPayload.blockHash))).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("keeps the next stage skipped while a deferred transport is still pending", async () => {
+      const transport = defer<Awaited<ReturnType<typeof api.beacon.publishExecutionPayloadBid>>>();
+      api.beacon.publishExecutionPayloadBid
+        .mockResolvedValueOnce(mockApiResponse({}))
+        .mockReturnValueOnce(transport.promise);
+      source.getPayload.mockImplementation(async () => payload(Date.now() >= 12150 ? 3 : Date.now() >= 12100 ? 2 : 1));
+      const {second, third, primary} = setup();
+      const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
+      const thirdSign = vi.spyOn(third.signer, "signExecutionPayloadBid");
+      const building = primary.bidder.onPayloadAttributes(event());
+      await vi.advanceTimersByTimeAsync(12250);
+      expect(logger.info).toHaveBeenCalledWith(
+        "Skipped staged execution payload bid",
+        expect.objectContaining({builderIndex: 3, reason: "publication_pending"})
+      );
+      transport.reject(Error("ambiguous deferred send"));
+      await vi.advanceTimersByTimeAsync(1050);
+      await building;
+      expect(published().map((bid) => bid.message.builderIndex)).toEqual([1, 2]);
+      expect(sign).toHaveBeenCalledOnce();
+      expect(thirdSign).not.toHaveBeenCalled();
+      expect(second.ledger.hasSubmitted(slot, toRootHex(parentHash), toRootHex(parentRoot))).toBe(true);
+      expect(second.bidStore.has(published()[1])).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
     });
 
     it("does not repeat an uncertain deferred send after more eligible revisions arrive", async () => {

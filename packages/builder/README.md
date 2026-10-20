@@ -113,9 +113,13 @@ continues until `updateCutoffBps` of the proposal slot; 1000 is 1.2 seconds into
 `--bidding.deferUnusedGossipStages` is disabled by default. With updates and staged
 identities enabled, a stage skipped solely because its value is below the gossip
 floor can wait for a higher durable API revision within its original window.
-The identity must have no signed revision for those parents. It starts preparation
-at most once, with a 25 ms acknowledgement budget and 10 ms reserved before the
-next stage or update cutoff. Timed-out retention still preserves any late durable
+The identity must have no signed revision for those parents and no pending or
+uncertain revision admission for that slot, including other parents. The deferral
+reason describes the identity's computed bid value after pricing and collateral
+checks; it does not prove that the payload is missing value. It starts preparation
+at most once, with a 25 ms budget covering signing, retention and acknowledgement
+and 10 ms reserved before the next stage or update cutoff. The timer cannot interrupt
+synchronous signing; expiry is checked again before gossip. Timed-out retention still preserves any late durable
 commitment, but cannot trigger gossip or another attempt. Cancellation, generation
 eligibility and the exact integer gossip floor are checked again before sending.
 The `BUILDER_STAGED_GOSSIP_DEFERRED` log records the wait; subsequent gossip or skip

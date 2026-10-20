@@ -332,12 +332,15 @@ export class Bidder {
           if (stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)) return;
           let initialBest = best;
           let stored = this.modules.payloadStore.get(toRootHex(initialBest.message.blockHash));
-          if (!stored) return;
+          if (!stored) {
+            logSkipped("payload_unavailable");
+            return;
+          }
           publicationPending = true;
           let ownsPublication = true;
           try {
             let minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
-            let belowFloor = false;
+            let belowFloorValue: number | undefined;
             let signed = await this.bidOnPayload(
               {
                 ...stored.payload,
@@ -353,19 +356,24 @@ export class Bidder {
               stage,
               minimum - 1,
               valueWaiters
-                ? () => {
-                    belowFloor = true;
+                ? (value) => {
+                    belowFloorValue = value;
                   }
                 : undefined
             );
-            if (
-              !signed &&
-              belowFloor &&
-              valueWaiters &&
-              !stage.ledger
-                .getBidsForSlot(slot)
-                .some((bid) => bid.parentBlockHash === parentBlockHash && bid.parentBlockRoot === parentBlockRoot)
-            ) {
+            if (!signed && belowFloorValue !== undefined && valueWaiters) {
+              if (stage.bidPublisher.hasPendingRevisions(slot)) {
+                logSkipped("pending_revision");
+                return;
+              }
+              if (
+                stage.ledger
+                  .getBidsForSlot(slot)
+                  .some((bid) => bid.parentBlockHash === parentBlockHash && bid.parentBlockRoot === parentBlockRoot)
+              ) {
+                logSkipped("previous_signed_revision");
+                return;
+              }
               publicationPending = false;
               ownsPublication = false;
               const deferredAt = performance.now();
@@ -375,6 +383,7 @@ export class Bidder {
                 parentBlockHash,
                 parentBlockRoot,
                 builderIndex: stage.builderIndex,
+                computedValueGwei: belowFloorValue,
                 minimumValueGwei: minimum,
               });
               const ready = await waitForValue(expires);
@@ -383,6 +392,7 @@ export class Bidder {
                 !ready ||
                 signal.aborted ||
                 publicationPending ||
+                stage.bidPublisher.hasPendingRevisions(slot) ||
                 stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot) ||
                 !best ||
                 !this.modules.bidStore.canOffer(best)
@@ -394,20 +404,28 @@ export class Bidder {
                       ? "deferred_window_closed"
                       : publicationPending
                         ? "publication_pending"
-                        : stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)
-                          ? "already_submitted"
-                          : "offer_ineligible"
+                        : stage.bidPublisher.hasPendingRevisions(slot)
+                          ? "pending_revision"
+                          : stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)
+                            ? "already_submitted"
+                            : "offer_ineligible"
                 );
                 return;
               }
               initialBest = best;
               stored = this.modules.payloadStore.get(toRootHex(initialBest.message.blockHash));
-              if (!stored) return;
+              if (!stored) {
+                logSkipped("deferred_payload_unavailable");
+                return;
+              }
               const budget = Math.min(
                 STAGED_GOSSIP_DEFERRED_PREPARE_MS,
                 expires - Date.now() - STAGED_GOSSIP_REFRESH_MARGIN_MS
               );
-              if (budget <= 0) return;
+              if (budget <= 0) {
+                logSkipped("deferred_budget_exhausted");
+                return;
+              }
               minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
               publicationPending = true;
               ownsPublication = true;
@@ -621,7 +639,7 @@ export class Bidder {
     identity: Pick<BidderModules, "ledger" | "bidPublisher" | "bidStore" | "getBuilderStatus" | "builderIndex"> = this
       .modules,
     minimumValue = -1,
-    onBelowMinimumValue?: () => void
+    onBelowMinimumValue?: (value: number) => void
   ): Promise<gloas.SignedExecutionPayloadBid | null> {
     const {clock, logger, metrics} = this.modules;
     const {ledger, bidPublisher, bidStore, builderIndex} = identity;
@@ -669,7 +687,7 @@ export class Bidder {
     }
 
     if (value <= minimumValue) {
-      onBelowMinimumValue?.();
+      onBelowMinimumValue?.(value);
       return null;
     }
     const previous = bidStore.get(slot, parentBlockHash, parentBlockRoot);
