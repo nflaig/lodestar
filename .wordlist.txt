@@ -277,6 +277,7 @@ verifier
 vite
 vitest
 webpack
+websocket
 wip
 wordlist
 xRelayPubKey
