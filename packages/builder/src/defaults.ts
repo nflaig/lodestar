@@ -23,6 +23,7 @@ export const defaultOptions = {
     updateCutoffBps: 1000,
     maxRevisionsPerSlot: MAX_BID_REVISIONS_PER_SLOT,
     alternateBranches: false,
+    alternateGossip: false,
     primaryHandoff: false,
     alternateBuildDurationMs: 500,
     alternateRefreshBeforeSlotMs: 0,

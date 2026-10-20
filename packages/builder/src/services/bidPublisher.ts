@@ -174,12 +174,14 @@ export class BidPublisher {
   async gossip(
     signedExecutionPayloadBid: gloas.SignedExecutionPayloadBid,
     signal: AbortSignal,
-    eligibility?: OfferEligibility
+    eligibility?: OfferEligibility,
+    beforeRequest?: () => void
   ): Promise<void> {
     signal.throwIfAborted();
     const assertEligible = (): void => {
       signal.throwIfAborted();
       if (!isOfferEligible(eligibility)) throw Error("BID_OFFER_INELIGIBLE");
+      beforeRequest?.();
     };
     assertEligible();
     const {api, ledger, config, hasPayload, builderIndex} = this.modules;
@@ -212,7 +214,7 @@ export class BidPublisher {
 
     const response = await api.beacon.publishExecutionPayloadBid(
       {signedExecutionPayloadBid},
-      eligibility ? {signal, beforeRequest: assertEligible} : {signal}
+      eligibility || beforeRequest ? {signal, beforeRequest: assertEligible} : {signal}
     );
     response.assertOk();
   }

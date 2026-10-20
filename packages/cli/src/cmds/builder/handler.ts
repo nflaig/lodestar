@@ -67,9 +67,15 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   const updateCutoffBps = args["bidding.updateCutoffBps"];
   const maxRevisionsPerSlot = args["bidding.maxRevisionsPerSlot"];
   const alternateBranches = args["bidding.alternateBranches"] ?? false;
+  const alternateGossip = args["bidding.alternateGossip"] ?? false;
   const beginReservations = args["payload.beginReservations"] ?? false;
   const retainedAlternateOffers = args["payload.alternateOrderGenerations"] ?? false;
   const primaryHandoff = args["bidding.primaryHandoff"] ?? false;
+  if (alternateGossip && (!alternateBranches || !retainedAlternateOffers)) {
+    throw new YargsError(
+      "--bidding.alternateGossip requires --bidding.alternateBranches and --payload.alternateOrderGenerations"
+    );
+  }
   if (primaryHandoff && (!alternateBranches || !retainedAlternateOffers)) {
     throw new YargsError(
       "--bidding.primaryHandoff requires --bidding.alternateBranches and --payload.alternateOrderGenerations"
@@ -226,6 +232,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       updateCutoffBps,
       maxRevisionsPerSlot,
       alternateBranches,
+      alternateGossip,
       primaryHandoff,
       alternateBuildDurationMs,
       alternateRefreshBeforeSlotMs,
@@ -321,6 +328,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       updateCutoffBps,
       maxRevisionsPerSlot,
       alternateBranches,
+      alternateGossip,
       primaryHandoff,
       alternateBuildDurationMs,
       alternateRefreshBeforeSlotMs,
