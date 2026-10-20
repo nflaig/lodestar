@@ -33,6 +33,7 @@ import {
 } from "../../util/index.js";
 import {getVersionData} from "../../util/version.js";
 import {BuilderRestApiServer, getBuilderApiBeforeInit} from "./apiServer.js";
+import {ForkTransitionPayloadSource} from "./forkTransitionPayloadSource.js";
 import {loadGossipIdentities} from "./gossipIdentities.js";
 import {loadBuilderKeypair} from "./loadKeypair.js";
 import {IBuilderCliArgs, builderMetricsDefaultOptions} from "./options.js";
@@ -40,6 +41,7 @@ import {SessionPayloadSource} from "./sessionPayloadSource.js";
 import {TestingPayloadSource} from "./testingPayloadSource.js";
 
 const ZERO_ADDRESS = "0x" + "0".repeat(40);
+const FORK_TRANSITION_SNAPSHOT_MARGIN_MS = 300;
 
 export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promise<void> {
   const {config, network} = getBeaconConfigFromArgs(args);
@@ -48,9 +50,25 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     throw Error(`Gloas must be scheduled via GLOAS_FORK_EPOCH for network=${network}`);
   }
 
+  const assumedIdentity = parseAssumedIdentity(args.assumeBuilderIndex, args.assumeBuilderBalanceGwei);
   const transactionsFile = args["payload.transactionsFile"];
   const testingUrl = args["payload.testingUrl"];
   const constructorUrl = args["payload.constructorUrl"];
+  const engineUntilSlot = args["payload.engineUntilSlot"];
+  if (
+    engineUntilSlot !== undefined &&
+    (!constructorUrl || !Number.isSafeInteger(engineUntilSlot) || engineUntilSlot < 0)
+  ) {
+    throw new YargsError("--payload.engineUntilSlot requires --payload.constructorUrl and a non-negative safe slot");
+  }
+  if (
+    engineUntilSlot !== undefined &&
+    (!Number.isSafeInteger(args["bidding.deadlineBps"]) ||
+      args["bidding.deadlineBps"] <= 0 ||
+      args["bidding.deadlineBps"] > 10000)
+  ) {
+    throw new YargsError("--payload.engineUntilSlot requires --bidding.deadlineBps between 1 and 10000");
+  }
   if (constructorUrl && (transactionsFile || testingUrl || args["payload.outputDir"])) {
     throw new YargsError("--payload.constructorUrl cannot be combined with controlled transaction file options");
   }
@@ -215,6 +233,33 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     });
   }
 
+  const createEngineSource = (): EnginePayloadSource => {
+    // Payload ids are local to the execution client that issued them, fallback urls can't be used
+    if (args["execution.urls"].length !== 1) {
+      throw Error("Exactly one execution client url is required");
+    }
+    const executionUrl = args["execution.urls"][0];
+    const engine = initializeExecutionEngine(
+      {
+        mode: "http",
+        urls: [executionUrl],
+        timeout: args["execution.timeout"],
+        retries: args["execution.retries"],
+        retryDelay: args["execution.retryDelay"],
+        jwtSecretHex: args.jwtSecret ? extractJwtHexSecret(fs.readFileSync(args.jwtSecret, "utf-8").trim()) : undefined,
+        jwtId: args.jwtId,
+        version,
+        commit,
+      },
+      {signal: abortController.signal, logger}
+    );
+    return new EnginePayloadSource(toPrintableUrl(executionUrl), {
+      notifyForkchoiceUpdate: (fork, headBlockHash, safeBlockHash, finalizedBlockHash, payloadAttributes) =>
+        engine.notifyForkchoiceUpdate(fork, headBlockHash, safeBlockHash, finalizedBlockHash, payloadAttributes),
+      getPayload: async (fork, payloadId) => (await engine.getPayload(fork, payloadId)) as EnginePayloadResult,
+    });
+  };
+
   let payloadSource: PayloadSource;
   if (constructorUrl) {
     payloadSource = new SessionPayloadSource(
@@ -226,6 +271,17 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
         }),
       {boundedAlternates: alternateBranches, beginReservations, retainedAlternateOffers, primaryHandoff, logger}
     );
+    if (engineUntilSlot !== undefined) {
+      payloadSource = new ForkTransitionPayloadSource(
+        payloadSource,
+        createEngineSource(),
+        engineUntilSlot,
+        config.SLOT_DURATION_MS -
+          config.getSlotComponentDurationMs(args["bidding.deadlineBps"]) +
+          FORK_TRANSITION_SNAPSHOT_MARGIN_MS
+      );
+      logger.info("Execution client builds through the configured fork transition slot", {engineUntilSlot});
+    }
     logger.info("Session payload source", {
       url: toPrintableUrl(constructorUrl),
       updateIntervalMs,
@@ -253,30 +309,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       dryRun: args["payload.dryRun"],
     });
   } else {
-    // Payload ids are local to the execution client that issued them, fallback urls can't be used
-    if (args["execution.urls"].length !== 1) {
-      throw Error("Exactly one execution client url is required");
-    }
-    const executionUrl = args["execution.urls"][0];
-    const engine = initializeExecutionEngine(
-      {
-        mode: "http",
-        urls: [executionUrl],
-        timeout: args["execution.timeout"],
-        retries: args["execution.retries"],
-        retryDelay: args["execution.retryDelay"],
-        jwtSecretHex: args.jwtSecret ? extractJwtHexSecret(fs.readFileSync(args.jwtSecret, "utf-8").trim()) : undefined,
-        jwtId: args.jwtId,
-        version,
-        commit,
-      },
-      {signal: abortController.signal, logger}
-    );
-    payloadSource = new EnginePayloadSource(toPrintableUrl(executionUrl), {
-      notifyForkchoiceUpdate: (fork, headBlockHash, safeBlockHash, finalizedBlockHash, payloadAttributes) =>
-        engine.notifyForkchoiceUpdate(fork, headBlockHash, safeBlockHash, finalizedBlockHash, payloadAttributes),
-      getPayload: async (fork, payloadId) => (await engine.getPayload(fork, payloadId)) as EnginePayloadResult,
-    });
+    payloadSource = createEngineSource();
   }
 
   const builderApiOpts = args.builderApi ? {authData: getBuilderApiAuthData(args), ...httpTiming} : undefined;
@@ -320,6 +353,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       shareBps: args["bidding.shareBps"],
       fixedCostGwei: args["bidding.fixedCostGwei"],
       subsidyGwei: args["bidding.subsidyGwei"],
+      subsidyUntilSlot: args["bidding.subsidyUntilSlot"],
       minValueGwei: args["bidding.minValueGwei"],
       maxValueGwei: args["bidding.maxValueGwei"],
       deadlineBps: args["bidding.deadlineBps"],
@@ -337,6 +371,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
     },
     builderApi: builderApiOpts,
     proposerPreferences: {sources: proposerPreferencesSources, timeoutMs: proposerPreferencesTimeout},
+    assumedIdentity,
     reveal: {
       cutoffBps: args["reveal.cutoffBps"],
       adversarialWithholdExecutionPayload: args["adversarial.withhold.executionPayload"],
@@ -382,4 +417,23 @@ function getBuilderApiAuthData(args: IBuilderCliArgs): Uint8Array {
     return new TextEncoder().encode(new URL(args["builderApi.publicUrl"]).hostname);
   }
   throw new YargsError("--builderApi requires either --builderApi.publicUrl or --builderApi.authData");
+}
+
+function parseAssumedIdentity(
+  index: number | undefined,
+  balanceGwei: number | undefined
+): {index: number; balanceGwei: number} | undefined {
+  if (index === undefined && balanceGwei === undefined) {
+    return undefined;
+  }
+  if (index === undefined || balanceGwei === undefined) {
+    throw new YargsError("assumeBuilderIndex and assumeBuilderBalanceGwei must be set together");
+  }
+  if (!Number.isSafeInteger(index) || index < 0) {
+    throw new YargsError(`assumeBuilderIndex must be a non-negative safe integer, got ${index}`);
+  }
+  if (!Number.isSafeInteger(balanceGwei) || balanceGwei <= 0) {
+    throw new YargsError(`assumeBuilderBalanceGwei must be a positive safe integer, got ${balanceGwei}`);
+  }
+  return {index, balanceGwei};
 }

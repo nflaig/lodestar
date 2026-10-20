@@ -130,6 +130,13 @@ describe("Bidder", () => {
     sign.mockRestore();
   });
 
+  it("ignores pre-Gloas attributes even with an active assumed identity", async () => {
+    const {bidder} = createBidder(() => ({status: "active", balance: 10_000_000_000}));
+    await bidder.onPayloadAttributes({version: ForkName.fulu, data: ssz.fulu.SSEPayloadAttributes.defaultValue()});
+    expect(payloadSource.prepare).not.toHaveBeenCalled();
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+  });
+
   it("builds on the emitted parent and publishes a bid at the deadline", async () => {
     addProposerPreferences();
     const {bidder, ledger, bidStore} = createBidder();
