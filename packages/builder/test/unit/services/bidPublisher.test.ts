@@ -46,6 +46,8 @@ describe("BidPublisher", () => {
     });
     const bid = createBid();
     const result = publisher.publish(bid, new AbortController().signal);
+    expect(publisher.hasPendingRevisions(bid.slot)).toBe(true);
+    expect(publisher.hasPendingRevisions(bid.slot + 1)).toBe(false);
     expect(ledger.getBidsForSlot(bid.slot)).toHaveLength(0);
     await expect(
       publisher.gossip(signer.signExecutionPayloadBid(bid), new AbortController().signal)
@@ -58,6 +60,7 @@ describe("BidPublisher", () => {
     expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
     disk.resolve();
     await result;
+    expect(publisher.hasPendingRevisions(bid.slot)).toBe(false);
     expect(api.beacon.publishExecutionPayloadBid).toHaveBeenCalledOnce();
     expect(ledger.getBidsForSlot(bid.slot)).toHaveLength(1);
   });
@@ -130,6 +133,7 @@ describe("BidPublisher", () => {
       ledger.recordRevision({...bidIdentity(bid), signedBidRoot: toRootHex(root), valueGwei: i});
     }
     await expect(publisher.prepare(bid)).rejects.toThrow("worker exited after write");
+    expect(publisher.hasPendingRevisions(bid.slot)).toBe(true);
     await expect(publisher.prepare({...bid, value: 6})).rejects.toMatchObject({
       type: {code: BidLedgerErrorCode.REVISION_LIMIT},
     });
@@ -150,6 +154,7 @@ describe("BidPublisher", () => {
       ledger.recordRevision({...bidIdentity(bid), signedBidRoot: toRootHex(root), valueGwei: i});
     }
     await expect(publisher.prepare(bid)).rejects.toThrow("COMMITMENT_WORKER_CAPACITY");
+    expect(publisher.hasPendingRevisions(bid.slot)).toBe(false);
     await publisher.prepare(bid);
     expect(retainCommitment).toHaveBeenCalledTimes(2);
     expect(ledger.getRevisionCount(bid.slot)).toBe(256);

@@ -1,4 +1,4 @@
-import {describe, expect, it, vi} from "vitest";
+import {afterEach, describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {Builder} from "@lodestar/builder";
 import {chainConfig} from "@lodestar/config/default";
@@ -14,6 +14,7 @@ import {testFilesDir} from "../../../utils.js";
 describe("cmds / builder / args handler", () => {
   const ZERO_ADDRESS = "0x" + "0".repeat(40);
   const VALID_FEE_RECIPIENT = "0x" + "1".repeat(40);
+  afterEach(() => vi.restoreAllMocks());
 
   async function runBuilderHandler(
     args: Partial<IBuilderCliArgs & GlobalArgs> & Record<string, unknown>
@@ -26,11 +27,34 @@ describe("cmds / builder / args handler", () => {
       "bidding.updateIntervalMs": 0,
       "bidding.updateCutoffBps": 1000,
       "bidding.maxRevisionsPerSlot": 256,
+      "bidding.deferUnusedGossipStages": builderOptions["bidding.deferUnusedGossipStages"].default,
       beaconNodeUrl: "http://127.0.0.1:9596",
       "proposerPreferences.timeout": 1000,
       ...args,
     } as unknown as IBuilderCliArgs & GlobalArgs);
   }
+
+  it.each([undefined, false, true])("wires the unused-stage flag through builder initialization: %s", async (flag) => {
+    expect(builderOptions["bidding.deferUnusedGossipStages"].default).toBe(false);
+    const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1));
+    vi.spyOn(keyLoader, "loadBuilderKeypair").mockResolvedValue({
+      secretKey,
+      publicKey: secretKey.toPublicKey(),
+    });
+    vi.spyOn(cliUtils, "onGracefulShutdown").mockImplementation(() => {});
+    const marker = Error("stop before builder startup");
+    const init = vi.spyOn(Builder, "init").mockRejectedValue(marker);
+    await expect(
+      runBuilderHandler({
+        "params.GLOAS_FORK_EPOCH": "0",
+        "payload.constructorUrl": "http://127.0.0.1:8547",
+        ...(flag === undefined ? {} : {"bidding.deferUnusedGossipStages": flag}),
+      })
+    ).rejects.toBe(marker);
+    expect(init).toHaveBeenCalledWith(
+      expect.objectContaining({bidding: expect.objectContaining({deferUnusedGossipStages: flag ?? false})})
+    );
+  });
 
   it("Should reject unscheduled Gloas", async () => {
     await expect(runBuilderHandler({})).rejects.toThrow("Gloas must be scheduled via GLOAS_FORK_EPOCH");

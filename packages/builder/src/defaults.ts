@@ -27,6 +27,7 @@ export const defaultOptions = {
     primaryHandoff: false,
     alternateBuildDurationMs: 500,
     alternateRefreshBeforeSlotMs: 0,
+    deferUnusedGossipStages: false,
     /** Do not bid when the builder balance falls below this, 1.1 ETH leaves headroom above MIN_DEPOSIT_AMOUNT */
     minOperatingBalanceGwei: 1_100_000_000,
   },

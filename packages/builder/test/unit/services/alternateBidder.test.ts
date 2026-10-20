@@ -279,6 +279,46 @@ describe("alternate parent bidder", () => {
   }
 
   describe("alternate gossip", () => {
+    it("keeps deferred primary stages independent of retained alternate gossip", async () => {
+      const m = setup({alternateGossip: true, deferUnusedGossipStages: true, primaryHandoff: true}, [9000], true);
+      const primary = attributes(4, 5);
+      const alternate = attributes(4, 6);
+      m.start(primary);
+      m.bidder.onAlternatePayloadAttributes(alternate);
+      await vi.advanceTimersByTimeAsync(10_800);
+      const earlierPrimary = m.offer(primary);
+      const earlierAlternate = m.offer(alternate);
+      expect(earlierPrimary).not.toBeNull();
+      expect(earlierAlternate).not.toBeNull();
+      expect(
+        m.api.beacon.publishExecutionPayloadBid.mock.calls.map(([args]) => args.signedExecutionPayloadBid)
+      ).toEqual([earlierPrimary, earlierAlternate]);
+      expect(
+        m.logger.info.mock.calls.filter(([message]) => message === "Deferred staged execution payload bid")
+      ).toHaveLength(1);
+      const session = m.sessions.get("1");
+      if (!session) throw Error("Missing primary session");
+      session.payload = {
+        ...session.payload,
+        executionPayload: {...session.payload.executionPayload, blockHash: Buffer.alloc(32, 42)},
+        executionPayloadValue: 2_000_000_000_000_000_000n,
+      };
+      await vi.advanceTimersByTimeAsync(100);
+      const sent = m.api.beacon.publishExecutionPayloadBid.mock.calls.map(([args]) => args.signedExecutionPayloadBid);
+      expect(sent).toHaveLength(3);
+      expect(sent[2].message.builderIndex).toBe(2);
+      expect(toRootHex(sent[2].message.parentBlockHash)).toBe(toRootHex(primary.data.parentBlockHash));
+      expect(toRootHex(sent[2].message.parentBlockRoot)).toBe(toRootHex(primary.data.parentBlockRoot));
+      expect(toRootHex(sent[2].message.blockHash)).toBe(toRootHex(Buffer.alloc(32, 42)));
+      expect(sent[2].message.value).toBeGreaterThan(sent[0].message.value);
+      for (const signed of [earlierPrimary, earlierAlternate]) {
+        if (!signed) throw Error("Missing earlier bid");
+        expect(m.payloadStore.has(toRootHex(signed.message.blockHash))).toBe(true);
+      }
+      await vi.advanceTimersByTimeAsync(100);
+      expect(m.api.beacon.publishExecutionPayloadBid).toHaveBeenCalledTimes(3);
+    });
+
     async function ready(options: Partial<BidderOptions> = {}) {
       const m = setup({alternateGossip: true, ...options}, [], true);
       const alternate = attributes(4, 6);
