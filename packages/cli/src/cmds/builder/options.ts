@@ -51,6 +51,7 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.primaryHandoff": boolean;
   "bidding.alternateBuildDurationMs": number;
   "bidding.alternateRefreshBeforeSlotMs": number;
+  "bidding.deferUnusedGossipStages": boolean;
   "bidding.minOperatingBalanceGwei": number;
   "reveal.cutoffBps"?: number;
 
@@ -278,6 +279,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     description:
       "Target one alternate refresh this many ms before the slot, after primary gossip plus 100 ms; zero disables",
     default: defaultOptions.bidding.alternateRefreshBeforeSlotMs,
+    group: "bidding",
+  },
+
+  "bidding.deferUnusedGossipStages": {
+    description: "Let an unsigned gossip stage wait for a higher bid within its existing window",
+    type: "boolean",
+    default: defaultOptions.bidding.deferUnusedGossipStages,
     group: "bidding",
   },
 

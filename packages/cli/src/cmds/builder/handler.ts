@@ -332,6 +332,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       primaryHandoff,
       alternateBuildDurationMs,
       alternateRefreshBeforeSlotMs,
+      deferUnusedGossipStages: args["bidding.deferUnusedGossipStages"],
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
     builderApi: builderApiOpts,
