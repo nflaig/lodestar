@@ -30,6 +30,7 @@ import {ProposerPreferencesTracker} from "./proposerPreferencesTracker.js";
 const GWEI_TO_WEI = 1_000_000_000n;
 const STAGED_GOSSIP_REFRESH_MARGIN_MS = 10;
 const STAGED_GOSSIP_REFRESH_MAX_MS = 25;
+const STAGED_GOSSIP_DEFERRED_PREPARE_MS = 25;
 
 export type PayloadAttributesEvent = routes.events.EventData[routes.events.EventType.payloadAttributes];
 
@@ -41,6 +42,8 @@ export type BidderOptions = {
   updateCutoffBps?: number;
   /** Limit new offers across all parents without reducing recovery capacity for existing commitments. */
   maxRevisionsPerSlot?: number;
+  /** Let an unused stage wait for a higher durable API bid within its original window. */
+  deferUnusedGossipStages?: boolean;
   /** Point within the slot before the proposal slot at which the payload is retrieved and bid on, in basis points */
   deadlineBps: number;
   /** Do not bid while the builder balance is below this value */
@@ -257,12 +260,39 @@ export class Bidder {
       .catch((error: unknown) => {
         if (!isErrorAborted(error)) throw error;
       });
-    // A stage gets one attempt at its deadline. Missed windows never catch up in a burst.
+    const stagedSignal = AbortSignal.any([signal, timerController.signal]);
+    const valueWaiters = this.opts.deferUnusedGossipStages ? new Set<() => void>() : undefined;
+    const waitForValue = (expires: number): Promise<boolean> =>
+      new Promise((resolve) => {
+        const latestStart = expires - STAGED_GOSSIP_DEFERRED_PREPARE_MS - STAGED_GOSSIP_REFRESH_MARGIN_MS;
+        const finish = (ready: boolean): void => {
+          clearTimeout(timeout);
+          stagedSignal.removeEventListener("abort", cancel);
+          valueWaiters?.delete(check);
+          resolve(ready);
+        };
+        const cancel = (): void => finish(false);
+        const check = (): void => {
+          if (stagedSignal.aborted || Date.now() >= latestStart) {
+            finish(false);
+            return;
+          }
+          const minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
+          if (!publicationPending && best && this.modules.bidStore.canOffer(best) && best.message.value >= minimum)
+            finish(true);
+        };
+        const timeout = setTimeout(cancel, Math.max(0, latestStart - Date.now()));
+        stagedSignal.addEventListener("abort", cancel, {once: true});
+        valueWaiters?.add(check);
+        check();
+      });
+    // Only an unsigned, below-floor stage may wait inside its existing window.
     const stagesStartedAt = Date.now();
     const stagedPublications = stages.map((stage, index) =>
-      sleep(stageTime(stage.deadlineBps) - Date.now(), AbortSignal.any([signal, timerController.signal]))
+      sleep(stageTime(stage.deadlineBps) - Date.now(), stagedSignal)
         .then(async () => {
-          const stageStarted = performance.now();
+          let stageStarted = performance.now();
+          let deferredMs = 0;
           const timerLatenessMs = Date.now() - stageTime(stage.deadlineBps);
           const expires = index + 1 < stages.length ? stageTime(stages[index + 1].deadlineBps) : until;
           const logSkipped = (
@@ -281,6 +311,7 @@ export class Bidder {
               parentBlockRoot,
               builderIndex: stage.builderIndex,
               reason,
+              deferredMs,
               phase: preparation ? "after_preparation" : "before_preparation",
               refreshAttempted: false,
               ...preparation,
@@ -299,12 +330,14 @@ export class Bidder {
             return;
           }
           if (stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)) return;
-          const initialBest = best;
-          const stored = this.modules.payloadStore.get(toRootHex(initialBest.message.blockHash));
+          let initialBest = best;
+          let stored = this.modules.payloadStore.get(toRootHex(initialBest.message.blockHash));
           if (!stored) return;
           publicationPending = true;
+          let ownsPublication = true;
           try {
-            const minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
+            let minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
+            let belowFloor = false;
             let signed = await this.bidOnPayload(
               {
                 ...stored.payload,
@@ -318,8 +351,100 @@ export class Bidder {
               signal,
               true,
               stage,
-              minimum - 1
+              minimum - 1,
+              valueWaiters
+                ? () => {
+                    belowFloor = true;
+                  }
+                : undefined
             );
+            if (
+              !signed &&
+              belowFloor &&
+              valueWaiters &&
+              !stage.ledger
+                .getBidsForSlot(slot)
+                .some((bid) => bid.parentBlockHash === parentBlockHash && bid.parentBlockRoot === parentBlockRoot)
+            ) {
+              publicationPending = false;
+              ownsPublication = false;
+              const deferredAt = performance.now();
+              logger.info("Deferred staged execution payload bid", {
+                code: "BUILDER_STAGED_GOSSIP_DEFERRED",
+                slot,
+                parentBlockHash,
+                parentBlockRoot,
+                builderIndex: stage.builderIndex,
+                minimumValueGwei: minimum,
+              });
+              const ready = await waitForValue(expires);
+              deferredMs = performance.now() - deferredAt;
+              if (
+                !ready ||
+                signal.aborted ||
+                publicationPending ||
+                stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot) ||
+                !best ||
+                !this.modules.bidStore.canOffer(best)
+              ) {
+                logSkipped(
+                  signal.aborted
+                    ? "aborted"
+                    : !ready
+                      ? "deferred_window_closed"
+                      : publicationPending
+                        ? "publication_pending"
+                        : stage.ledger.hasSubmitted(slot, parentBlockHash, parentBlockRoot)
+                          ? "already_submitted"
+                          : "offer_ineligible"
+                );
+                return;
+              }
+              initialBest = best;
+              stored = this.modules.payloadStore.get(toRootHex(initialBest.message.blockHash));
+              if (!stored) return;
+              const budget = Math.min(
+                STAGED_GOSSIP_DEFERRED_PREPARE_MS,
+                expires - Date.now() - STAGED_GOSSIP_REFRESH_MARGIN_MS
+              );
+              if (budget <= 0) return;
+              minimum = highestAttemptedValue < 0 ? 0 : getMinGossipBidValue(highestAttemptedValue);
+              publicationPending = true;
+              ownsPublication = true;
+              stageStarted = performance.now();
+              const deferredPayload = stored.payload;
+              try {
+                signed = await withTimeout(
+                  (prepareSignal = signal) =>
+                    this.bidOnPayload(
+                      {
+                        ...deferredPayload,
+                        fork: ForkName.gloas,
+                        offerEligibility: this.modules.bidStore.getOfferEligibility(initialBest),
+                      },
+                      data,
+                      feeRecipient,
+                      prepareSignal,
+                      true,
+                      stage,
+                      minimum - 1
+                    ),
+                  budget,
+                  signal
+                );
+              } catch (error) {
+                if (error instanceof TimeoutError) {
+                  logSkipped("deferred_prepare_timeout", {
+                    initialPrepareMs: performance.now() - stageStarted,
+                    refreshAttempted: false,
+                    refreshTimedOut: false,
+                    refreshMs: 0,
+                  });
+                  return;
+                }
+                throw error;
+              }
+            }
             const initialPrepareMs = performance.now() - stageStarted;
             // Persistence may finish after a parent switch, shutdown, or this stage's window.
             if (!signed || signal.aborted || Date.now() >= expires || signed.message.value <= highestAttemptedValue) {
@@ -422,6 +547,7 @@ export class Bidder {
               builderIndex: stage.builderIndex,
               value: prettyGweiToEth(signed.message.value),
               timerLatenessMs,
+              deferredMs,
               initialPrepareMs,
               refreshAttempted,
               refreshTimedOut,
@@ -430,7 +556,7 @@ export class Bidder {
               publishMs: publishedAt - preparedAt,
             });
           } finally {
-            publicationPending = false;
+            if (ownsPublication) publicationPending = false;
           }
         })
         .catch((error: unknown) => {
@@ -450,6 +576,7 @@ export class Bidder {
           const signed = await this.bidOnPayload(payload, data, feeRecipient, signal, true);
           if (signed) best = signed;
           gossipBest();
+          if (valueWaiters) for (const check of valueWaiters) check();
         },
         signal
       );
@@ -493,7 +620,8 @@ export class Bidder {
     apiRevision: boolean,
     identity: Pick<BidderModules, "ledger" | "bidPublisher" | "bidStore" | "getBuilderStatus" | "builderIndex"> = this
       .modules,
-    minimumValue = -1
+    minimumValue = -1,
+    onBelowMinimumValue?: () => void
   ): Promise<gloas.SignedExecutionPayloadBid | null> {
     const {clock, logger, metrics} = this.modules;
     const {ledger, bidPublisher, bidStore, builderIndex} = identity;
@@ -540,7 +668,10 @@ export class Bidder {
       return null;
     }
 
-    if (value <= minimumValue) return null;
+    if (value <= minimumValue) {
+      onBelowMinimumValue?.();
+      return null;
+    }
     const previous = bidStore.get(slot, parentBlockHash, parentBlockRoot);
     if (apiRevision && previous && value <= previous.message.value) return previous;
     signal.throwIfAborted();

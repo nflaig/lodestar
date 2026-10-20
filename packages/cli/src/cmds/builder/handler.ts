@@ -257,6 +257,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       updateIntervalMs,
       updateCutoffBps,
       maxRevisionsPerSlot,
+      deferUnusedGossipStages: args["bidding.deferUnusedGossipStages"],
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],
     },
     builderApi: builderApiOpts,

@@ -71,7 +71,10 @@ export function createBiddingModules({
   dryRun?: boolean;
   gossipStages?: GossipStage[];
   retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => Promise<void>;
-  updateOptions?: Pick<BidderOptions, "updateIntervalMs" | "updateCutoffBps" | "maxRevisionsPerSlot">;
+  updateOptions?: Pick<
+    BidderOptions,
+    "updateIntervalMs" | "updateCutoffBps" | "maxRevisionsPerSlot" | "deferUnusedGossipStages"
+  >;
 }): {ledger: BidLedger; bidStore: BidStore; bidder: Bidder; revealer: Revealer; bidPublisher: BidPublisher} {
   const ledger = new BidLedger();
   const bidStore = new BidStore();
