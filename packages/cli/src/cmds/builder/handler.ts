@@ -69,6 +69,12 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
   const alternateBranches = args["bidding.alternateBranches"] ?? false;
   const beginReservations = args["payload.beginReservations"] ?? false;
   const retainedAlternateOffers = args["payload.alternateOrderGenerations"] ?? false;
+  const primaryHandoff = args["bidding.primaryHandoff"] ?? false;
+  if (primaryHandoff && (!alternateBranches || !retainedAlternateOffers)) {
+    throw new YargsError(
+      "--bidding.primaryHandoff requires --bidding.alternateBranches and --payload.alternateOrderGenerations"
+    );
+  }
   if (retainedAlternateOffers && (!constructorUrl || !alternateBranches || updateIntervalMs === 0)) {
     throw new YargsError(
       "--payload.alternateOrderGenerations requires --payload.constructorUrl, --bidding.alternateBranches and payload updates"
@@ -212,7 +218,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
           signal,
           timeout: args["execution.timeout"],
         }),
-      {boundedAlternates: alternateBranches, beginReservations, retainedAlternateOffers, logger}
+      {boundedAlternates: alternateBranches, beginReservations, retainedAlternateOffers, primaryHandoff, logger}
     );
     logger.info("Session payload source", {
       url: toPrintableUrl(constructorUrl),
@@ -220,6 +226,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       updateCutoffBps,
       maxRevisionsPerSlot,
       alternateBranches,
+      primaryHandoff,
       alternateBuildDurationMs,
       alternateRefreshBeforeSlotMs,
       dryRun: args["payload.dryRun"],
@@ -314,6 +321,7 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
       updateCutoffBps,
       maxRevisionsPerSlot,
       alternateBranches,
+      primaryHandoff,
       alternateBuildDurationMs,
       alternateRefreshBeforeSlotMs,
       minOperatingBalanceGwei: args["bidding.minOperatingBalanceGwei"],

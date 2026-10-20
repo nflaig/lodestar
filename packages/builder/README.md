@@ -152,6 +152,25 @@ alternate branches and continuous primary updates. The publisher first requires
 An older constructor cannot be treated as supporting the new permission protocol.
 With generations disabled, the existing unleased alternate path remains in use.
 
+`--bidding.primaryHandoff true` additionally allows an already durable primary bid
+to survive a same-slot, same-proposer change of primary parent. It defaults to
+false and requires retained alternate permissions plus the constructor's explicit
+`primaryHandoffVersion: 1` capability. With the second worker free at demotion,
+one conditional `zbuilder_retainPrimaryPayloadV1` request has at most 25 ms before
+normal worker release. The new primary starts independently. Native must confirm
+the exact current hash, parents, slot, namespace and generation. No execution,
+signature or journal write is repeated. The grant is unavailable to callers until
+fresh alternate attributes, dependent root, preferences, builder identity and
+collateral authorize the unchanged signed value. Missing metadata releases the
+grant after at most the configured alternate duration, within the ordinary offer
+cutoff. The request counts toward the existing four-attempt slot cap; a lost
+response is not retried and remains subject to native token expiry.
+An absent or malformed optional namespace leaves ordinary primary bidding intact
+but cannot authorize a handoff. Adoption conservatively requires the full payload
+attributes to match, including safe and finalized hashes. A refused or expired
+handoff preserves captured alternate metadata for normal bounded reconstruction
+under the current eligible primary, including a further same-slot parent switch.
+
 In this opt-in mode, `zbuilder_beginAlternateV2` (or the separate
 `zbuilder_reserveAlternateBeginV1` reservation) allocates the spare worker.
 `zbuilder_getRetainedPayloadV1` atomically copies a candidate and grants permission

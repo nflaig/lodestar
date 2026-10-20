@@ -47,6 +47,7 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.updateCutoffBps": number;
   "bidding.maxRevisionsPerSlot": number;
   "bidding.alternateBranches": boolean;
+  "bidding.primaryHandoff": boolean;
   "bidding.alternateBuildDurationMs": number;
   "bidding.alternateRefreshBeforeSlotMs": number;
   "bidding.minOperatingBalanceGwei": number;
@@ -244,6 +245,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     description: "Maximum new signed revisions per slot across all parents; existing commitments remain recoverable",
     type: "number",
     default: defaultOptions.bidding.maxRevisionsPerSlot,
+    group: "bidding",
+  },
+  "bidding.primaryHandoff": {
+    description:
+      "Retain an exact durable primary bid on a validated same-slot alternate branch (requires constructor capability)",
+    type: "boolean",
+    default: defaultOptions.bidding.primaryHandoff,
     group: "bidding",
   },
   "bidding.alternateBranches": {

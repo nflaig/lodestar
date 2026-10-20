@@ -89,11 +89,14 @@ export interface PayloadSource {
   readonly supportsUpdates?: boolean;
   readonly supportsBoundedAlternates?: boolean;
   readonly supportsRetainedOffers?: boolean;
+  readonly supportsPrimaryHandoff?: boolean;
   getResources?(): PayloadSourceResources | undefined;
   /** Retry only recorded end operations; an anonymous timed-out begin cannot be reclaimed by inference. */
   reconcileResources?(signal: AbortSignal): Promise<void>;
   prepare(request: BuildRequest, signal: AbortSignal): Promise<BuildHandle>;
   getPayload(handle: BuildHandle, signal: AbortSignal): Promise<BuiltPayload>;
+  /** Acquire independent permission for the exact current primary snapshot, without rebuilding it. */
+  retainPrimaryPayload?(handle: BuildHandle, payload: BuiltPayload, signal: AbortSignal): Promise<BuiltPayload>;
   /** Renew only the exact immutable payload's permission. Never re-stamp an older generation. */
   renewOffer?(payload: BuiltPayload, signal: AbortSignal): Promise<boolean>;
   releaseOffer?(payload: BuiltPayload, signal: AbortSignal): Promise<void>;

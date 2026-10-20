@@ -2,7 +2,7 @@ import {ApiClient, routes} from "@lodestar/api";
 import {ChainForkConfig} from "@lodestar/config";
 import {ForkName, MIN_DEPOSIT_AMOUNT, isForkPostGloas} from "@lodestar/params";
 import {IClock, computeEpochAtSlot} from "@lodestar/state-transition";
-import {BLSPubkey, BuilderIndex, BuilderStatus, ExecutionAddress, RootHex, gloas} from "@lodestar/types";
+import {BLSPubkey, BuilderIndex, BuilderStatus, ExecutionAddress, RootHex, gloas, ssz} from "@lodestar/types";
 import {
   Logger,
   TimeoutError,
@@ -24,7 +24,7 @@ import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import {GossipStage, getMinGossipBidValue, validateGossipStages} from "./gossipStages.js";
 import {PayloadSourceNotReady, isOfferEligible} from "./offerEligibility.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
-import type {BuiltPayload, PayloadSourceResources} from "./payloadSource.js";
+import type {BuildHandle, BuiltPayload, PayloadSourceResources} from "./payloadSource.js";
 import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
 import type {ProposerDutiesTracker} from "./proposerDutiesTracker.js";
 import {ProposerPreferencesTracker} from "./proposerPreferencesTracker.js";
@@ -61,7 +61,7 @@ type AlternateDiagnosticReason =
   | "builder_ineligible"
   | "refresh_capacity";
 
-type AlternateKind = "initial" | "retry" | "refresh" | "reauthorize";
+type AlternateKind = "initial" | "retry" | "refresh" | "reauthorize" | "handoff";
 type QueuedAlternate = {
   event: AlternatePayloadAttributesEvent;
   kind: AlternateKind;
@@ -77,6 +77,17 @@ type PrimaryBuild = {
   ready: boolean;
   dependentRoot?: RootHex;
   feeRecipient?: ExecutionAddress;
+  demotedBy?: PrimaryBuild;
+  durable?: {payload: BuiltPayload; signed: gloas.SignedExecutionPayloadBid; targetGasLimit: bigint};
+};
+
+type PendingPrimaryHandoff = {
+  primary: PrimaryBuild;
+  replacement: PrimaryBuild;
+  event?: AlternatePayloadAttributesEvent;
+  payload?: BuiltPayload;
+  timer: ReturnType<typeof setTimeout>;
+  abort: () => void;
 };
 
 type AlternateBuild = {
@@ -119,6 +130,8 @@ export type BidderOptions = {
   maxRevisionsPerSlot?: number;
   /** Build one bounded API/stream snapshot for each supported alternate parent tuple. */
   alternateBranches?: boolean;
+  /** Reuse an exact durable primary bid after a validated same-slot demotion. */
+  primaryHandoff?: boolean;
   alternateBuildDurationMs?: number;
   /** Target one refresh this many ms before the slot, after primary gossip plus 100 ms. Zero disables it. */
   alternateRefreshBeforeSlotMs?: number;
@@ -166,6 +179,7 @@ export class Bidder {
   /** Committed owner per tuple; pending replacement/cleanup owners are separate. */
   private readonly retainedAlternates = new Map<string, RetainedAlternate>();
   private readonly retainedOfferOwners = new Set<RetainedAlternate>();
+  private readonly primaryHandoffs = new Map<string, PendingPrimaryHandoff>();
   private alternateTask: Promise<void> | undefined;
   private alternateWake: ReturnType<typeof setTimeout> | undefined;
   private alternateDiagnosticSlot = -Infinity;
@@ -198,6 +212,7 @@ export class Bidder {
     if (!Number.isSafeInteger(refresh) || (refresh !== 0 && (refresh < 500 || refresh > 5000)))
       throw new RangeError("alternateRefreshBeforeSlotMs must be zero or between 500 and 5000");
     if (refresh > 0 && !opts.alternateBranches) throw Error("ALTERNATE_REFRESH_REQUIRES_ALTERNATE_BRANCHES");
+    if (opts.primaryHandoff && !opts.alternateBranches) throw Error("PRIMARY_HANDOFF_REQUIRES_ALTERNATE_BRANCHES");
     if (
       opts.alternateBranches &&
       (!(opts.updateIntervalMs && opts.updateIntervalMs > 0) ||
@@ -237,8 +252,15 @@ export class Bidder {
     }
     // A delayed event must not displace a newer primary or its reserved native worker.
     if (this.primary && this.primary.slot > slot) return;
+    const previousPrimary = this.primary;
     const controller = new AbortController();
     const primary: PrimaryBuild = {id: buildId, slot, data, controller, ready: false};
+    if (
+      this.opts.primaryHandoff &&
+      this.primary?.slot === slot &&
+      this.primary.data.proposerIndex === data.proposerIndex
+    )
+      this.primary.demotedBy = primary;
     const alternate = this.alternateBuild;
     if (
       alternate &&
@@ -270,6 +292,8 @@ export class Bidder {
     const active = {slot, controller};
     this.activeBuilds.set(buildId, active);
     this.primary = primary;
+    this.recheckPrimaryHandoffs();
+    if (previousPrimary) this.queuePrimaryHandoff(previousPrimary, primary);
     this.recheckRetainedContexts();
     const signal = AbortSignal.any([controller.signal, this.modules.signal]);
 
@@ -292,6 +316,7 @@ export class Bidder {
       const {feeRecipient, targetGasLimit} = proposerPreferences.message;
       primary.dependentRoot = dependentRoot;
       primary.feeRecipient = feeRecipient;
+      this.recheckPrimaryHandoffs();
       this.recheckRetainedContexts();
       signal.throwIfAborted();
 
@@ -332,6 +357,7 @@ export class Bidder {
       if (this.activeBuilds.get(buildId) === active) this.activeBuilds.delete(buildId);
       if (this.primary === primary) {
         this.primary = undefined;
+        this.recheckPrimaryHandoffs();
         this.recheckRetainedContexts();
         this.alternateBuild?.controller.abort();
         this.alternateQueue.clear();
@@ -366,6 +392,12 @@ export class Bidder {
       return;
     }
     const id = `${data.proposalSlot}:${toRootHex(data.parentBlockRoot)}:${toRootHex(data.parentBlockHash)}`;
+    const handoff = this.primaryHandoffs.get(id);
+    if (handoff) {
+      handoff.event = event;
+      this.adoptPrimaryHandoff(handoff);
+      return;
+    }
     if (this.alternateReauthorizations.has(id)) this.alternateReauthorizations.set(id, event);
     const refresh = (this.opts.alternateRefreshBeforeSlotMs ?? 0) > 0;
     const generations = this.modules.orchestrator.supportsRetainedOffers;
@@ -402,7 +434,10 @@ export class Bidder {
     const kind: AlternateKind = refresh && retained ? "refresh" : "initial";
     if (
       id === primary.id ||
-      attempts.some((attempt) => attempt.id === id && (kind !== "refresh" || attempt.kind === "refresh")) ||
+      attempts.some(
+        (attempt) =>
+          attempt.id === id && attempt.kind !== "handoff" && (kind !== "refresh" || attempt.kind === "refresh")
+      ) ||
       this.alternateQueue.has(id) ||
       (!refresh &&
         this.modules.bidStore.get(data.proposalSlot, toRootHex(data.parentBlockHash), toRootHex(data.parentBlockRoot)))
@@ -1038,11 +1073,200 @@ export class Bidder {
     payload.blobsBundle = stored.blobsBundle;
   }
 
+  private queuePrimaryHandoff(primary: PrimaryBuild, replacement: PrimaryBuild): void {
+    if (!this.opts.primaryHandoff || !this.modules.orchestrator.supportsPrimaryHandoff) return;
+    const resources = this.modules.orchestrator.getResources();
+    const attempts = this.alternateAttempts.get(primary.slot) ?? [];
+    if (
+      this.modules.signal.aborted ||
+      primary.demotedBy !== replacement ||
+      !primary.durable ||
+      primary.dependentRoot === undefined ||
+      primary.feeRecipient === undefined ||
+      !primary.durable.payload.offerEligibility ||
+      primary.durable.payload.offerEligibility.retained ||
+      this.retainedAlternates.has(primary.id) ||
+      this.primaryHandoffs.has(primary.id) ||
+      this.primaryHandoffs.size + this.retainedOfferOwners.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT * 2 ||
+      this.alternateTask ||
+      !resources ||
+      resources.alternatesDisabled ||
+      resources.active !== 1 ||
+      resources.preparing !== 0 ||
+      resources.uncertain + resources.releasing !== 0 ||
+      attempts.length >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT ||
+      attempts.some((attempt) => attempt.id === primary.id && attempt.kind === "handoff")
+    )
+      return;
+    const cutoff =
+      this.modules.clock.msToSlot(primary.slot) +
+      this.modules.config.getSlotComponentDurationMs(this.opts.updateCutoffBps ?? 1000);
+    if (cutoff <= 0) return;
+    const abort = (): void => this.finishPrimaryHandoff(handoff);
+    const handoff: PendingPrimaryHandoff = {
+      primary,
+      replacement,
+      event: this.alternateQueue.get(primary.id)?.event,
+      abort,
+      timer: setTimeout(abort, Math.min(cutoff, this.opts.alternateBuildDurationMs ?? 500)),
+    };
+    this.primaryHandoffs.set(primary.id, handoff);
+    // The old session must not remain an offer while its demoted branch is
+    // awaiting validation. Native grants are independent of this shared lease.
+    primary.durable.payload.offerEligibility.lease.ready = false;
+    this.alternateQueue.delete(primary.id);
+    this.modules.signal.addEventListener("abort", abort, {once: true});
+  }
+
+  private finishPrimaryHandoff(handoff: PendingPrimaryHandoff, adopted = false): void {
+    if (this.primaryHandoffs.get(handoff.primary.id) !== handoff) return;
+    this.primaryHandoffs.delete(handoff.primary.id);
+    clearTimeout(handoff.timer);
+    this.modules.signal.removeEventListener("abort", handoff.abort);
+    if (!adopted && handoff.payload) {
+      const eligibility = handoff.payload.offerEligibility;
+      if (eligibility) {
+        eligibility.lease.ready = false;
+        if (eligibility.retained) eligibility.retained.closed = true;
+      }
+      void this.modules.orchestrator.releaseOffer(handoff.payload).catch(() => {});
+    }
+    const {event} = handoff;
+    const current = this.primary;
+    const attempts = this.alternateAttempts.get(handoff.primary.slot) ?? [];
+    if (
+      !adopted &&
+      event &&
+      !this.modules.signal.aborted &&
+      current &&
+      !current.controller.signal.aborted &&
+      current.id !== handoff.primary.id &&
+      current.slot === event.data.proposalSlot &&
+      current.data.proposerIndex === event.data.proposerIndex &&
+      this.modules.clock.getCurrentSlot() < current.slot &&
+      attempts.length < MAX_ALTERNATE_ATTEMPTS_PER_SLOT &&
+      !attempts.some((attempt) => attempt.id === handoff.primary.id && attempt.kind !== "handoff") &&
+      !this.hasRetainedAlternate(event) &&
+      !this.alternateQueue.has(handoff.primary.id) &&
+      this.alternateQueue.size < MAX_ALTERNATE_ATTEMPTS_PER_SLOT
+    ) {
+      // Preserve captured metadata even if duties outlive the grant wait.
+      // Normal admission still owns every execution, policy and capacity check.
+      this.alternateQueue.set(handoff.primary.id, {event, kind: "initial", notBefore: 0});
+      this.logPrimaryHandoff("fallback", handoff.primary.id, handoff.primary.slot);
+      this.tryAlternate();
+    }
+  }
+
+  private recheckPrimaryHandoffs(): void {
+    for (const handoff of this.primaryHandoffs.values()) this.adoptPrimaryHandoff(handoff);
+  }
+
+  private adoptPrimaryHandoff(handoff: PendingPrimaryHandoff): void {
+    const {primary, replacement, payload, event} = handoff;
+    if (
+      this.modules.signal.aborted ||
+      this.primary !== replacement ||
+      replacement.controller.signal.aborted ||
+      (replacement.dependentRoot !== undefined && replacement.dependentRoot !== primary.dependentRoot)
+    ) {
+      this.finishPrimaryHandoff(handoff);
+      return;
+    }
+    if (!payload || !event || replacement.dependentRoot === undefined || replacement.feeRecipient === undefined) return;
+    const durable = primary.durable;
+    if (
+      !durable ||
+      !primary.feeRecipient ||
+      !ssz.gloas.SSEPayloadAttributes.equals(primary.data, event.data) ||
+      toRootHex(event.context.dependentRoot) !== primary.dependentRoot ||
+      this.retainedAlternates.has(primary.id) ||
+      durable.signed.message.builderIndex !== this.modules.builderIndex ||
+      toRootHex(durable.signed.message.blockHash) !== toRootHex(payload.executionPayload.blockHash) ||
+      !this.modules.bidStore.has(durable.signed)
+    ) {
+      this.finishPrimaryHandoff(handoff);
+      return;
+    }
+    const retained = this.startRetainedAlternate(
+      event,
+      payload,
+      primary.feeRecipient,
+      durable.targetGasLimit,
+      durable.signed
+    );
+    if (!retained) {
+      this.finishPrimaryHandoff(handoff);
+      return;
+    }
+    this.retainedAlternates.set(primary.id, retained);
+    this.alternateQueue.delete(primary.id);
+    this.finishPrimaryHandoff(handoff, true);
+    this.logPrimaryHandoff("adopted", primary.id, primary.slot, payload);
+  }
+
+  private async retainDemotedPrimary(primary: PrimaryBuild, handle: BuildHandle, signal: AbortSignal): Promise<void> {
+    const handoff = this.primaryHandoffs.get(primary.id);
+    const resources = this.modules.orchestrator.getResources();
+    const attempts = this.alternateAttempts.get(primary.slot) ?? [];
+    if (
+      !handoff ||
+      !primary.durable ||
+      this.primary !== handoff.replacement ||
+      this.modules.signal.aborted ||
+      signal.aborted ||
+      this.alternateTask ||
+      !resources ||
+      resources.alternatesDisabled ||
+      resources.uncertain + resources.releasing !== 0 ||
+      resources.active + resources.preparing > resources.capacity ||
+      attempts.length >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT
+    ) {
+      if (handoff) this.finishPrimaryHandoff(handoff);
+      return;
+    }
+    attempts.push({id: primary.id, kind: "handoff"});
+    this.alternateAttempts.set(primary.slot, attempts);
+    try {
+      const payload = await this.modules.orchestrator.retainPrimaryPayload(handle, primary.durable.payload, signal);
+      if (signal.aborted || this.primaryHandoffs.get(primary.id) !== handoff) {
+        await this.modules.orchestrator.releaseOffer(payload).catch(() => {});
+        return;
+      }
+      handoff.payload = payload;
+      this.logPrimaryHandoff("granted", primary.id, primary.slot, payload);
+      this.adoptPrimaryHandoff(handoff);
+    } catch (error) {
+      this.finishPrimaryHandoff(handoff);
+      if (!this.modules.signal.aborted) {
+        this.modules.logger.debug(
+          "Primary bid handoff unavailable",
+          {slot: primary.slot, id: primary.id},
+          error as Error
+        );
+      }
+    }
+  }
+
+  private logPrimaryHandoff(state: string, id: string, slot: number, payload?: BuiltPayload): void {
+    try {
+      this.modules.logger.debug("Primary bid handoff", {
+        code: "BUILDER_PRIMARY_HANDOFF",
+        state,
+        id,
+        slot,
+        blockHash: payload && toRootHex(payload.executionPayload.blockHash),
+        generation: payload?.offerEligibility?.generation,
+      });
+    } catch {}
+  }
+
   private startRetainedAlternate(
     event: AlternatePayloadAttributesEvent,
     payload: BuiltPayload,
     feeRecipient: ExecutionAddress,
-    targetGasLimit: bigint
+    targetGasLimit: bigint,
+    signed?: gloas.SignedExecutionPayloadBid
   ): RetainedAlternate | undefined {
     const offer = payload.offerEligibility?.retained;
     if (!offer || this.retainedOfferOwners.size >= MAX_ALTERNATE_ATTEMPTS_PER_SLOT * 2) return undefined;
@@ -1055,6 +1279,7 @@ export class Bidder {
       dependentRoot: toRootHex(event.context.dependentRoot),
       controller: new AbortController(),
       renewRequested: false,
+      signed,
     };
     if (this.retainedContext(retained) !== "valid") return undefined;
     this.shareRetainedPayloadBody(payload);
@@ -1062,6 +1287,7 @@ export class Bidder {
     const signal = AbortSignal.any([retained.controller.signal, this.modules.signal]);
     void (async () => {
       let reauthorize = false;
+      let handoffOffered = false;
       try {
         while (!signal.aborted) {
           const context = this.retainedContext(retained);
@@ -1083,6 +1309,17 @@ export class Bidder {
                 !isOfferEligible(this.modules.bidStore.getOfferEligibility(retained.signed))
               )
                 this.modules.bidStore.add(retained.signed, payload.offerEligibility);
+              if (
+                signed &&
+                !handoffOffered &&
+                this.retainedAlternates.get(retained.id) === retained &&
+                this.retainedContext(retained) === "valid" &&
+                this.modules.bidStore.getOfferEligibility(signed) === payload.offerEligibility &&
+                this.modules.bidStore.canOffer(signed)
+              ) {
+                handoffOffered = true;
+                this.logPrimaryHandoff("offered", retained.id, event.data.proposalSlot, payload);
+              }
             } catch (error) {
               if (!signal.aborted && !payload.offerEligibility?.retained?.closed)
                 this.modules.logger.debug(
@@ -1414,10 +1651,42 @@ export class Bidder {
     try {
       await orchestrator.runUpdates(
         job,
-        {intervalMs: this.opts.updateIntervalMs ?? 100, until},
+        {
+          intervalMs: this.opts.updateIntervalMs ?? 100,
+          until,
+          ...(this.opts.primaryHandoff
+            ? {
+                beforeRelease: (handle: BuildHandle, releaseSignal: AbortSignal) =>
+                  this.retainDemotedPrimary(primary, handle, releaseSignal),
+              }
+            : {}),
+        },
         async (payload) => {
-          const signed = await this.bidOnPayload(payload, data, feeRecipient, signal, true);
-          if (signed) best = signed;
+          const onDurable =
+            this.opts.primaryHandoff && orchestrator.supportsPrimaryHandoff
+              ? (signed: gloas.SignedExecutionPayloadBid): void => {
+                  if (
+                    signed.message.builderIndex === this.modules.builderIndex &&
+                    toRootHex(signed.message.blockHash) === toRootHex(payload.executionPayload.blockHash)
+                  )
+                    primary.durable = {payload, signed, targetGasLimit: job.request.payloadAttributes.targetGasLimit};
+                }
+              : undefined;
+          const signed = await this.bidOnPayload(
+            payload,
+            data,
+            feeRecipient,
+            signal,
+            true,
+            this.modules,
+            -1,
+            undefined,
+            onDurable
+          );
+          if (signed) {
+            best = signed;
+            onDurable?.(signed);
+          }
           gossipBest();
           primary.ready =
             signed !== null &&
@@ -1468,7 +1737,8 @@ export class Bidder {
     identity: Pick<BidderModules, "ledger" | "bidPublisher" | "bidStore" | "getBuilderStatus" | "builderIndex"> = this
       .modules,
     minimumValue = -1,
-    alternateAdmission?: {coverableGwei: number; deadline: number; onRetentionAttempted: () => void}
+    alternateAdmission?: {coverableGwei: number; deadline: number; onRetentionAttempted: () => void},
+    onDurable?: (signed: gloas.SignedExecutionPayloadBid) => void
   ): Promise<gloas.SignedExecutionPayloadBid | null> {
     const {clock, logger, metrics} = this.modules;
     const {ledger, bidPublisher, bidStore, builderIndex} = identity;
@@ -1563,7 +1833,8 @@ export class Bidder {
     // or arrives after cancellation. Reveal ownership does not expire with offers.
     const deadlineExpired = alternateAdmission !== undefined && Date.now() >= alternateAdmission.deadline;
     const alternateExpired = alternateAdmission && (signal.aborted || deadlineExpired);
-    bidStore.add(signedBid, alternateExpired ? "recovery" : payload.offerEligibility);
+    bidStore.add(signedBid, alternateExpired || (onDurable && signal.aborted) ? "recovery" : payload.offerEligibility);
+    onDurable?.(signedBid);
     if (alternateExpired) {
       logger.debug("Skipping alternate parent bid", {
         ...logCtx,

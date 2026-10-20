@@ -38,7 +38,14 @@ type RetainedResponse = {
   slot: string;
   payload: PayloadResponse;
 };
-type LeasedResponse = {generation: string; leaseMs: number; ready: boolean; payload: PayloadResponse | null};
+type RetainedLeaseResponse = Omit<RetainedResponse, "payload">;
+type LeasedResponse = {
+  generation: string;
+  namespace?: string | null;
+  leaseMs: number;
+  ready: boolean;
+  payload: PayloadResponse | null;
+};
 // Native operations allow up to 15s; retain the reply through bounded failure
 // cleanup too. The orchestrator's build deadline still detaches independently.
 const BEGIN_RPC_TIMEOUT_MS = 20_000;
@@ -87,6 +94,8 @@ type SessionEntry = {
   reconcileAfter?: number;
   reconcileFailures?: number;
   beginRejected?: boolean;
+  primaryHandoff?: boolean;
+  handoffRequested?: boolean;
 };
 
 type Reconciliation = {
@@ -109,6 +118,7 @@ export class SessionPayloadSource implements PayloadSource {
   private readonly requests = new Map<string, SessionEntry>();
   private preparing = 0;
   private retainedProtocol = false;
+  private primaryHandoffProtocol = false;
   private orphaned = 0;
   private alternatesDisabled = false;
   private reconciliation: Reconciliation | undefined;
@@ -122,6 +132,7 @@ export class SessionPayloadSource implements PayloadSource {
       boundedAlternates?: boolean;
       beginReservations?: boolean;
       retainedAlternateOffers?: boolean;
+      primaryHandoff?: boolean;
       logger?: {warn: Logger["warn"]};
     } = {}
   ) {}
@@ -132,6 +143,10 @@ export class SessionPayloadSource implements PayloadSource {
 
   get supportsRetainedOffers(): boolean {
     return this.options.retainedAlternateOffers === true && this.retainedProtocol;
+  }
+
+  get supportsPrimaryHandoff(): boolean {
+    return this.options.primaryHandoff === true && this.supportsRetainedOffers && this.primaryHandoffProtocol;
   }
 
   private get tracksSessions(): boolean {
@@ -368,6 +383,7 @@ export class SessionPayloadSource implements PayloadSource {
       orderGenerationVersion?: number;
       alternateSessionVersion?: number;
       retainedOfferVersion?: number;
+      primaryHandoffVersion?: number;
     };
     let disabledReason: AlternateDisabledReason | undefined;
     try {
@@ -424,6 +440,7 @@ export class SessionPayloadSource implements PayloadSource {
     const entry: SessionEntry = {
       request,
       state: "active",
+      primaryHandoff: !alternate && result.orderGenerationVersion === 1 && result.primaryHandoffVersion === 1,
       lease:
         result.orderGenerationVersion === 1
           ? {generation: "", validUntil: 0, validUntilUnixMs: 0, ready: false}
@@ -461,7 +478,10 @@ export class SessionPayloadSource implements PayloadSource {
         reason: "Unsupported order generation protocol",
       });
     }
-    if (!alternate) this.retainedProtocol = result.orderGenerationVersion === 1 && result.retainedOfferVersion === 1;
+    if (!alternate) {
+      this.retainedProtocol = result.orderGenerationVersion === 1 && result.retainedOfferVersion === 1;
+      this.primaryHandoffProtocol = entry.primaryHandoff === true;
+    }
     this.resetBeginRetry(request);
     return handle;
   }
@@ -501,6 +521,7 @@ export class SessionPayloadSource implements PayloadSource {
         orderGenerationVersion: number;
         alternateSessionVersion: number;
         retainedOfferVersion?: number;
+        primaryHandoffVersion?: number;
       }>(
         {
           method: "zbuilder_beginReservedV1",
@@ -533,13 +554,17 @@ export class SessionPayloadSource implements PayloadSource {
         request,
         state: "active",
         reserved: true,
+        primaryHandoff:
+          !isAlternateBuild(request) && result.orderGenerationVersion === 1 && result.primaryHandoffVersion === 1,
         lease:
           result.orderGenerationVersion === 1
             ? {generation: "", validUntil: 0, validUntilUnixMs: 0, ready: false}
             : undefined,
       });
-      if (!isAlternateBuild(request))
+      if (!isAlternateBuild(request)) {
         this.retainedProtocol = result.orderGenerationVersion === 1 && result.retainedOfferVersion === 1;
+        this.primaryHandoffProtocol = result.orderGenerationVersion === 1 && result.primaryHandoffVersion === 1;
+      }
       this.resetBeginRetry(request);
       if (signal.aborted) throw new ErrorAborted();
       return {sourceId: this.id, fork: request.fork, payloadId: ticket};
@@ -628,6 +653,7 @@ export class SessionPayloadSource implements PayloadSource {
     if (this.requests.get(handle.payloadId) !== entry || entry.state !== "active")
       throw new SessionPayloadError({code: SessionPayloadErrorCode.UNKNOWN_HANDLE, reason: handle.payloadId});
     let response: PayloadResponse | null;
+    let namespace: string | undefined;
     if (entry.lease) {
       entry.lease.ready = false;
       const result = received as LeasedResponse | null;
@@ -640,6 +666,20 @@ export class SessionPayloadSource implements PayloadSource {
         !("payload" in result)
       )
         throw new SessionPayloadError({code: SessionPayloadErrorCode.RESPONSE_MISMATCH, reason: "Invalid offer lease"});
+      if (entry.primaryHandoff && this.options.primaryHandoff) {
+        namespace =
+          typeof result.namespace === "string" && /^0x[0-9a-f]{32}$/.test(result.namespace)
+            ? result.namespace
+            : undefined;
+        if (entry.latest?.offerEligibility && entry.latest.offerEligibility.namespace !== namespace) {
+          // A conditional reply may renew ordinary permission, but cannot
+          // rebind an older immutable snapshot to another handoff namespace.
+          entry.latest = {
+            ...entry.latest,
+            offerEligibility: {...entry.latest.offerEligibility, namespace: undefined},
+          };
+        }
+      }
       const previous = entry.lease.generation;
       if (previous && BigInt(result.generation) < BigInt(previous))
         throw new SessionPayloadError({
@@ -663,7 +703,8 @@ export class SessionPayloadSource implements PayloadSource {
     try {
       if (response !== null) {
         entry.latest = validateSessionPayload(this.id, entry.request, response);
-        if (entry.lease) entry.latest.offerEligibility = {generation: entry.lease.generation, lease: entry.lease};
+        if (entry.lease)
+          entry.latest.offerEligibility = {generation: entry.lease.generation, namespace, lease: entry.lease};
       }
       if (!entry.latest)
         throw new SessionPayloadError({code: SessionPayloadErrorCode.RESPONSE_MISMATCH, reason: "No initial payload"});
@@ -676,6 +717,76 @@ export class SessionPayloadSource implements PayloadSource {
       return entry.latest;
     } catch (error) {
       if (entry.lease) entry.lease.ready = false;
+      throw error;
+    }
+  }
+
+  async retainPrimaryPayload(handle: BuildHandle, payload: BuiltPayload, signal: AbortSignal): Promise<BuiltPayload> {
+    const entry = this.requests.get(handle.payloadId);
+    const eligibility = payload.offerEligibility;
+    if (
+      !this.supportsPrimaryHandoff ||
+      !entry?.primaryHandoff ||
+      entry.state !== "active" ||
+      entry.handoffRequested ||
+      isAlternateBuild(entry.request) ||
+      handle.sourceId !== this.id ||
+      payload.sourceId !== this.id ||
+      handle.fork !== entry.request.fork ||
+      payload.fork !== handle.fork ||
+      !eligibility?.namespace ||
+      !/^0x[0-9a-f]{32}$/.test(eligibility.namespace) ||
+      eligibility.namespace !== entry.latest?.offerEligibility?.namespace ||
+      !/^0x(?:0|[1-9a-f][0-9a-f]{0,15})$/.test(eligibility.generation) ||
+      eligibility.retained ||
+      eligibility.lease !== entry.lease ||
+      toHex(payload.executionPayload.parentHash) !== entry.request.forkchoiceState.headBlockHash
+    )
+      throw new SessionPayloadError({
+        code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED,
+        reason: "Primary handoff unavailable",
+      });
+    signal.throwIfAborted();
+    const context = {
+      namespace: eligibility.namespace,
+      generation: eligibility.generation,
+      slot: `0x${entry.request.payloadAttributes.slotNumber.toString(16)}`,
+      parentHash: entry.request.forkchoiceState.headBlockHash,
+      parentBeaconBlockRoot: toHex(entry.request.payloadAttributes.parentBeaconBlockRoot),
+      blockHash: toHex(payload.executionPayload.blockHash),
+    };
+    entry.handoffRequested = true;
+    const started = performance.now();
+    const startedUnix = Date.now();
+    const result = await this.rpc(signal).fetch<RetainedLeaseResponse>(
+      {method: "zbuilder_retainPrimaryPayloadV1", params: [handle.payloadId, context]},
+      {timeout: 25}
+    );
+    const instance = /^(?:native|begin)-([0-9a-f]{32})-/.exec(handle.payloadId)?.[1];
+    const token = /^offer-([0-9a-f]{32})-([1-9][0-9]{0,19})$/.exec(result?.offerId ?? "");
+    if (!instance || token?.[1] !== instance || BigInt(token[2]) > 0xffffffffffffffffn)
+      throw new SessionPayloadError({
+        code: SessionPayloadErrorCode.RESPONSE_MISMATCH,
+        reason: "Invalid primary handoff identity",
+      });
+    const retained: BuiltPayload = {
+      ...payload,
+      offerEligibility: {
+        generation: context.generation,
+        namespace: context.namespace,
+        retained: {id: result.offerId, ...context, closed: false},
+        lease: {generation: context.generation, validUntil: 0, validUntilUnixMs: 0, ready: false},
+      },
+    };
+    try {
+      this.applyRetainedLease(retained, result, started, startedUnix);
+      signal.throwIfAborted();
+      if (this.requests.get(handle.payloadId) !== entry || entry.state !== "active")
+        throw new SessionPayloadError({code: SessionPayloadErrorCode.UNKNOWN_HANDLE, reason: handle.payloadId});
+      if (!retained.offerEligibility?.lease.ready) throw new PayloadSourceNotReady();
+      return retained;
+    } catch (error) {
+      await this.releaseOffer(retained, AbortSignal.timeout(1000)).catch(() => {});
       throw error;
     }
   }
@@ -750,7 +861,7 @@ export class SessionPayloadSource implements PayloadSource {
 
   private applyRetainedLease(
     payload: BuiltPayload,
-    result: RetainedResponse,
+    result: RetainedLeaseResponse,
     started: number,
     startedUnix: number,
     pauseEpoch = 0
