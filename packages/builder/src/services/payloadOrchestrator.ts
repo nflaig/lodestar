@@ -10,6 +10,13 @@ import {
 } from "./payloadSource.js";
 
 const PREPARE_RETRY_DELAY = 100;
+const PRIMARY_HANDOFF_TIMEOUT_MS = 25;
+
+type UpdateOptions = {
+  intervalMs: number;
+  until: number;
+  beforeRelease?: (handle: BuildHandle, signal: AbortSignal) => Promise<void>;
+};
 
 export type PayloadBuildJob = {
   /** Jobs with the same ID share one build and its result. */
@@ -82,6 +89,23 @@ export class PayloadOrchestrator {
       this.source.renewOffer !== undefined &&
       this.source.releaseOffer !== undefined
     );
+  }
+
+  get supportsPrimaryHandoff(): boolean {
+    return (
+      this.supportsRetainedOffers &&
+      this.source.supportsPrimaryHandoff === true &&
+      this.source.retainPrimaryPayload !== undefined
+    );
+  }
+
+  async retainPrimaryPayload(handle: BuildHandle, payload: BuiltPayload, signal: AbortSignal): Promise<BuiltPayload> {
+    if (!this.supportsPrimaryHandoff || !this.source.retainPrimaryPayload)
+      throw new PayloadOrchestratorError({
+        code: PayloadOrchestratorErrorCode.ALTERNATE_SOURCE_UNSUPPORTED,
+        jobId: handle.payloadId,
+      });
+    return this.source.retainPrimaryPayload(handle, payload, signal);
   }
 
   async renewOffer(payload: BuiltPayload, signal: AbortSignal): Promise<boolean> {
@@ -176,7 +200,7 @@ export class PayloadOrchestrator {
   /** Poll ready snapshots until the cutoff. A callback completes before the next poll. */
   runUpdates(
     job: PayloadBuildJob,
-    options: {intervalMs: number; until: number},
+    options: UpdateOptions,
     onPayload: (payload: BuiltPayload) => Promise<void>,
     signal: AbortSignal = this.signal
   ): Promise<void> {
@@ -192,7 +216,7 @@ export class PayloadOrchestrator {
 
   private async runUpdateJob(
     job: PayloadBuildJob,
-    {intervalMs, until}: {intervalMs: number; until: number},
+    {intervalMs, until, beforeRelease}: UpdateOptions,
     onPayload: (payload: BuiltPayload) => Promise<void>,
     signal: AbortSignal
   ): Promise<void> {
@@ -243,6 +267,15 @@ export class PayloadOrchestrator {
         await sleep(Math.min(Math.max(1, intervalMs - Math.max(0, now - started)), until - now), signal);
       }
     } finally {
+      // A demotion may retain an exact permission before ending its worker.
+      // It never waits on the cancelled build signal or a fresh primary job.
+      if (beforeRelease && this.supportsPrimaryHandoff && !this.signal.aborted) {
+        await withTimeout(
+          (handoffSignal = AbortSignal.timeout(PRIMARY_HANDOFF_TIMEOUT_MS)) =>
+            beforeRelease(handle, AbortSignal.any([this.signal, handoffSignal])),
+          PRIMARY_HANDOFF_TIMEOUT_MS
+        ).catch(() => {});
+      }
       await this.release(handle);
     }
   }

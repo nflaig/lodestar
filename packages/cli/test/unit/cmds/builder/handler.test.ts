@@ -158,6 +158,13 @@ describe("cmds / builder / args handler", () => {
     ).rejects.toThrow("--payload.alternateOrderGenerations requires");
   });
 
+  it("keeps primary handoff opt-in and requires retained alternate permissions", async () => {
+    expect(builderOptions["bidding.primaryHandoff"].default).toBe(false);
+    await expect(runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "bidding.primaryHandoff": true})).rejects.toThrow(
+      "--bidding.primaryHandoff requires --bidding.alternateBranches and --payload.alternateOrderGenerations"
+    );
+  });
+
   it("requires a constructor for recoverable begins", async () => {
     await expect(
       runBuilderHandler({"params.GLOAS_FORK_EPOCH": "0", "payload.beginReservations": true})

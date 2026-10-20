@@ -17,7 +17,13 @@ export type RetainedOffer = {
   pauseEpoch?: number;
   paused?: boolean;
 };
-export type OfferEligibility = {generation: string; lease: OfferLease; retained?: RetainedOffer};
+export type OfferEligibility = {
+  generation: string;
+  /** Constructor namespace captured with this immutable primary snapshot. */
+  namespace?: string;
+  lease: OfferLease;
+  retained?: RetainedOffer;
+};
 
 export function isOfferEligible(eligibility?: OfferEligibility): boolean {
   return (

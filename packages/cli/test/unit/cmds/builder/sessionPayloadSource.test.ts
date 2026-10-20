@@ -75,7 +75,12 @@ function payloadResponse(request: BuildRequest, transactions = ["0x01aa", "0x02b
 
 describe("SessionPayloadSource", () => {
   const signal = new AbortController().signal;
-  function setup(boundedAlternates = false, beginReservations = false, retainedAlternateOffers = false) {
+  function setup(
+    boundedAlternates = false,
+    beginReservations = false,
+    retainedAlternateOffers = false,
+    primaryHandoff = false
+  ) {
     const rpc = new JsonRpcHttpClient(["http://127.0.0.1:1"]);
     const fetch = vi.spyOn(rpc, "fetch");
     const warn = vi.fn<Logger["warn"]>();
@@ -86,7 +91,7 @@ describe("SessionPayloadSource", () => {
         signals.push(callSignal);
         return rpc;
       },
-      {boundedAlternates, beginReservations, retainedAlternateOffers, logger: {warn}}
+      {boundedAlternates, beginReservations, retainedAlternateOffers, primaryHandoff, logger: {warn}}
     );
     return {source, fetch, signals, warn, request: buildRequest()};
   }
@@ -114,6 +119,222 @@ describe("SessionPayloadSource", () => {
         payload,
       };
     }
+    describe("primary handoff", () => {
+      async function primary(
+        enabled = true,
+        capable = true,
+        reserved = false,
+        readOverrides: Record<string, unknown> = {}
+      ) {
+        const m = setup(true, reserved, true, enabled);
+        const id = reserved ? `begin-${instance}-1` : session;
+        const caps = {...capabilities, ...(capable ? {primaryHandoffVersion: 1} : {})};
+        if (reserved) m.fetch.mockResolvedValueOnce({reservationId: id, beginReservationVersion: 1});
+        m.fetch.mockResolvedValueOnce({
+          sessionId: id,
+          ...caps,
+          ...(reserved ? {beginReservationVersion: 1, alternateSessionVersion: 0} : {}),
+        });
+        const handle = await m.source.prepare(m.request, signal);
+        m.fetch.mockResolvedValueOnce({
+          generation: "0x0",
+          namespace: grant(m.request).namespace,
+          leaseMs: 250,
+          ready: true,
+          payload: payloadResponse(m.request),
+          ...readOverrides,
+        });
+        const payload = await m.source.getPayload(handle, signal);
+        return {...m, handle, payload};
+      }
+
+      it.each([undefined, null, "0x01", 1, true, `0x${"CD".repeat(16)}`])(
+        "keeps a primary payload available with optional namespace %j",
+        async (namespace) => {
+          const m = await primary(true, true, false, {namespace});
+          expect(m.payload.offerEligibility?.lease.ready).toBe(true);
+          expect(m.payload.offerEligibility?.namespace).toBeUndefined();
+          expect(m.source.getResources()?.active).toBe(1);
+          const calls = m.fetch.mock.calls.length;
+          await expect(m.source.retainPrimaryPayload(m.handle, m.payload, signal)).rejects.toMatchObject({
+            type: {code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED},
+          });
+          expect(m.fetch).toHaveBeenCalledTimes(calls);
+        }
+      );
+
+      it.each([undefined, null, "malformed", `0x${"ef".repeat(16)}`])(
+        "keeps conditional primary bytes without rebinding an old snapshot to namespace %j",
+        async (namespace) => {
+          const m = await primary();
+          const oldNamespace = m.payload.offerEligibility?.namespace;
+          m.fetch.mockResolvedValueOnce({generation: "0x0", namespace, leaseMs: 250, ready: true, payload: null});
+          const current = await m.source.getPayload(m.handle, signal);
+          expect(current.executionPayload).toBe(m.payload.executionPayload);
+          expect(current.offerEligibility?.lease.ready).toBe(true);
+          expect(current.offerEligibility?.namespace).toBeUndefined();
+          expect(m.payload.offerEligibility?.namespace).toBe(oldNamespace);
+          const calls = m.fetch.mock.calls.length;
+          for (const snapshot of [m.payload, current])
+            await expect(m.source.retainPrimaryPayload(m.handle, snapshot, signal)).rejects.toMatchObject({
+              type: {code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED},
+            });
+          expect(m.fetch).toHaveBeenCalledTimes(calls);
+          m.fetch.mockResolvedValueOnce({
+            generation: "0x0",
+            namespace: grant(m.request).namespace,
+            leaseMs: 250,
+            ready: true,
+            payload: null,
+          });
+          const conditional = await m.source.getPayload(m.handle, signal);
+          expect(conditional.executionPayload).toBe(m.payload.executionPayload);
+          expect(conditional.offerEligibility?.namespace).toBeUndefined();
+          m.fetch.mockResolvedValueOnce({
+            generation: "0x0",
+            namespace: grant(m.request).namespace,
+            leaseMs: 250,
+            ready: true,
+            payload: payloadResponse(m.request),
+          });
+          const refreshed = await m.source.getPayload(m.handle, signal);
+          const {payload: _payload, ...permission} = grant(m.request);
+          m.fetch.mockResolvedValueOnce(permission);
+          await expect(m.source.retainPrimaryPayload(m.handle, refreshed, signal)).resolves.toMatchObject({
+            offerEligibility: {retained: {id: offerId}},
+          });
+        }
+      );
+
+      it("still rejects a wrong parent when the optional namespace is absent", async () => {
+        const payload = payloadResponse(buildRequest());
+        payload.executionPayload.parentHash = `0x${"99".repeat(32)}`;
+        await expect(primary(true, true, false, {namespace: null, payload})).rejects.toMatchObject({
+          type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH},
+        });
+      });
+
+      it.each([{generation: "0x00"}, {leaseMs: 251}, {ready: "true"}])(
+        "still rejects malformed required lease fields with an absent namespace: %j",
+        async (fields) => {
+          await expect(primary(true, true, false, {namespace: null, ...fields})).rejects.toMatchObject({
+            type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH},
+          });
+        }
+      );
+
+      it.each([false, true])(
+        "retains exact bytes independently of the primary worker (reserved %s)",
+        async (reserved) => {
+          const m = await primary(true, true, reserved);
+          expect(m.source.supportsPrimaryHandoff).toBe(true);
+          const {payload: _payload, ...permission} = grant(m.request);
+          m.fetch.mockResolvedValueOnce(permission);
+          const retained = await m.source.retainPrimaryPayload(m.handle, m.payload, signal);
+          expect(retained.executionPayload).toBe(m.payload.executionPayload);
+          expect(retained.executionRequests).toBe(m.payload.executionRequests);
+          expect(retained.blobsBundle).toBe(m.payload.blobsBundle);
+          expect(retained.offerEligibility?.lease).not.toBe(m.payload.offerEligibility?.lease);
+          expect(m.fetch).toHaveBeenLastCalledWith(
+            {
+              method: "zbuilder_retainPrimaryPayloadV1",
+              params: [
+                m.handle.payloadId,
+                {
+                  namespace: permission.namespace,
+                  generation: "0x0",
+                  slot: permission.slot,
+                  parentHash: permission.parentHash,
+                  parentBeaconBlockRoot: permission.parentBeaconBlockRoot,
+                  blockHash: permission.blockHash,
+                },
+              ],
+            },
+            {timeout: 25}
+          );
+          m.fetch.mockResolvedValueOnce(reserved ? {released: true, beginReservationVersion: 1} : true);
+          await m.source.release(m.handle, signal);
+          expect(m.payload.offerEligibility?.lease.ready).toBe(false);
+          expect(retained.offerEligibility?.lease.ready).toBe(true);
+          m.fetch.mockResolvedValueOnce(permission);
+          expect(await m.source.renewOffer(retained, signal)).toBe(true);
+          m.fetch.mockResolvedValueOnce({...permission, currentGeneration: "0x1", ready: false, leaseMs: 0});
+          expect(await m.source.renewOffer(retained, signal)).toBe(false);
+          expect(retained.offerEligibility?.retained?.closed).toBe(true);
+        }
+      );
+
+      it.each([
+        [false, true],
+        [true, false],
+      ])("requires explicit opt-in %s and native capability %s", async (enabled, capable) => {
+        const m = await primary(enabled, capable);
+        expect(m.source.supportsPrimaryHandoff).toBe(false);
+        const count = m.fetch.mock.calls.length;
+        await expect(m.source.retainPrimaryPayload(m.handle, m.payload, signal)).rejects.toMatchObject({
+          type: {code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED},
+        });
+        expect(m.fetch).toHaveBeenCalledTimes(count);
+      });
+
+      it.each(["namespace", "parentHash", "parentBeaconBlockRoot", "blockHash", "generation", "slot"] as const)(
+        "releases a known token if returned %s differs",
+        async (field) => {
+          const m = await primary();
+          const {payload: _payload, ...permission} = grant(m.request);
+          m.fetch.mockResolvedValueOnce({...permission, [field]: "0x99"}).mockResolvedValueOnce(true);
+          await expect(m.source.retainPrimaryPayload(m.handle, m.payload, signal)).rejects.toMatchObject({
+            type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH},
+          });
+          expect(m.fetch).toHaveBeenLastCalledWith(
+            {method: "zbuilder_releasePayloadOfferV1", params: [offerId]},
+            {timeout: 1000}
+          );
+        }
+      );
+
+      it("never retries a lost grant response and still releases the worker", async () => {
+        const m = await primary();
+        m.fetch.mockRejectedValueOnce(new Error("lost response"));
+        await expect(m.source.retainPrimaryPayload(m.handle, m.payload, signal)).rejects.toThrow("lost response");
+        const count = m.fetch.mock.calls.length;
+        await expect(m.source.retainPrimaryPayload(m.handle, m.payload, signal)).rejects.toMatchObject({
+          type: {code: SessionPayloadErrorCode.ALTERNATE_UNSUPPORTED},
+        });
+        expect(m.fetch).toHaveBeenCalledTimes(count);
+        m.fetch.mockResolvedValueOnce(true);
+        await m.source.release(m.handle, signal);
+        expect(m.source.getResources()?.active).toBe(0);
+      });
+
+      it("releases a late known grant after caller cancellation", async () => {
+        const m = await primary();
+        const controller = new AbortController();
+        const {payload: _payload, ...permission} = grant(m.request);
+        m.fetch
+          .mockImplementationOnce(async () => {
+            controller.abort();
+            return permission;
+          })
+          .mockResolvedValueOnce(true);
+        await expect(m.source.retainPrimaryPayload(m.handle, m.payload, controller.signal)).rejects.toBeDefined();
+        expect(m.fetch).toHaveBeenLastCalledWith(
+          {method: "zbuilder_releasePayloadOfferV1", params: [offerId]},
+          {timeout: 1000}
+        );
+        expect(m.payload.offerEligibility?.lease.ready).toBe(true);
+      });
+
+      it("does not release an untrusted foreign-instance token", async () => {
+        const m = await primary();
+        m.fetch.mockResolvedValueOnce({...grant(m.request), offerId: `offer-${"ef".repeat(16)}-1`});
+        await expect(m.source.retainPrimaryPayload(m.handle, m.payload, signal)).rejects.toMatchObject({
+          type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH},
+        });
+        expect(m.fetch.mock.calls.some(([call]) => call.method === "zbuilder_releasePayloadOfferV1")).toBe(false);
+      });
+    });
+
     async function prepared() {
       const m = setup(true, false, true);
       m.fetch.mockResolvedValueOnce({sessionId: session, ...capabilities});

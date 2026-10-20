@@ -34,6 +34,8 @@ export function getPayloadSourceStub() {
     supportsUpdates: false,
     supportsBoundedAlternates: false,
     supportsRetainedOffers: false,
+    supportsPrimaryHandoff: false,
+    retainPrimaryPayload: vi.fn<NonNullable<PayloadSource["retainPrimaryPayload"]>>(),
     renewOffer: vi.fn<NonNullable<PayloadSource["renewOffer"]>>().mockResolvedValue(false),
     releaseOffer: vi.fn<NonNullable<PayloadSource["releaseOffer"]>>().mockResolvedValue(undefined),
     getResources: vi.fn<NonNullable<PayloadSource["getResources"]>>(),
