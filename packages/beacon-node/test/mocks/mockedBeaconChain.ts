@@ -208,6 +208,7 @@ vi.mock("../../src/chain/chain.js", async (importActual) => {
       getHeadStateAtCurrentEpoch: vi.fn(),
       getHeadState: vi.fn(),
       getStateBySlot: vi.fn(),
+      getParentExecutionRequests: vi.fn(),
       updateBuilderStatus: vi.fn(),
       updateAttachedValidators: vi.fn(),
       processBlock: vi.fn(),
