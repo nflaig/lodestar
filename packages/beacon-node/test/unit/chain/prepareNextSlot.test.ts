@@ -365,6 +365,7 @@ describe("PrepareNextSlot scheduler", () => {
         gloasConfig,
         true
       );
+      state.blockRoots.set(slot - 1, fromHex(headRoot));
       const stateView = new BeaconStateView(createCachedBeaconState(state, {config: gloasConfig, pubkeyCache}));
       if (!isStatePostGloas(stateView)) {
         throw new Error("Expected Gloas state");
@@ -394,6 +395,14 @@ describe("PrepareNextSlot scheduler", () => {
     /** The early path only awaits mocked promises, one real macrotask turn drains all of them */
     async function flushEarlyWork(): Promise<void> {
       await vi.advanceTimersByTimeAsync(0);
+    }
+
+    function subscribeAlternates(alternate: Mock): void {
+      chainStub.emitter.off(routes.events.EventType.payloadAttributes, payloadAttributesSpy);
+      chainStub.emitter.on(routes.events.EventType.payloadAttributes, (event) => {
+        if (event.context?.role === "alternate") alternate(event);
+        else payloadAttributesSpy(event);
+      });
     }
 
     function makeHeadFullOnRecompute(): void {
@@ -510,6 +519,99 @@ describe("PrepareNextSlot scheduler", () => {
         },
       });
       expect(executionEngineStub.notifyForkchoiceUpdate).not.toHaveBeenCalled();
+      expect(loggerStub.error).not.toHaveBeenCalled();
+    });
+
+    it.each(["early", "regular", "missed-slot fallback"] as const)(
+      "emits the authoritative %s event before queued alternate work",
+      async (mode) => {
+        earlyController.abort();
+        earlyController = new AbortController();
+        earlyScheduler = createEarlyScheduler({
+          ...earlyOpts,
+          emitPayloadAttributesAlternates: true,
+          payloadAttributesAlternateBuilderIndices: [0],
+        });
+        const alternate = vi.fn();
+        subscribeAlternates(alternate);
+        const headSlot = mode === "missed-slot fallback" ? clockSlot - 1 : clockSlot;
+        forkChoiceStub.getHead.mockReturnValue({...makeHead(PayloadStatus.EMPTY), slot: headSlot});
+        forkChoiceStub.getBlockHex.mockImplementation((root, status) =>
+          root === headRoot ? {...makeHead(status), slot: headSlot} : null
+        );
+        forkChoiceStub.getDependentRoot.mockReturnValue(headRoot);
+        chainStub.getHeadState.mockReturnValue(prepareState);
+        chainStub.recomputeForkChoiceHead.mockImplementation(() => forkChoiceStub.getHead());
+        let finish: ((requests: ReturnType<typeof ssz.gloas.ExecutionRequests.defaultValue>) => void) | undefined;
+        chainStub.getParentExecutionRequests.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finish = resolve;
+            })
+        );
+
+        if (mode === "early") {
+          emitBlockImported();
+          await vi.advanceTimersByTimeAsync(20);
+        } else if (mode === "missed-slot fallback") {
+          chainStub.clock.emit(ClockEvent.slot, clockSlot);
+          await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(1667) + 20);
+        } else {
+          const regular = earlyScheduler.prepareForNextSlot(clockSlot);
+          await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(6667) + 20);
+          await regular;
+        }
+
+        expect(payloadAttributesSpy).toHaveBeenCalledOnce();
+        expect(alternate).not.toHaveBeenCalled();
+        expect(finish).toBeDefined();
+        expect(chainStub.getParentExecutionRequests).toHaveBeenCalledExactlyOnceWith(headSlot, headRoot);
+        finish?.(ssz.gloas.ExecutionRequests.defaultValue());
+        await vi.advanceTimersByTimeAsync(20);
+        expect(alternate).toHaveBeenCalledOnce();
+        expect(alternate.mock.calls[0][0].data.parentBlockHash).toEqual(fromHex(payloadHash));
+        expect(payloadAttributesSpy.mock.invocationCallOrder[0]).toBeLessThan(alternate.mock.invocationCallOrder[0]);
+        expect(regenStub.getBlockSlotState).toHaveBeenCalledOnce();
+        expect(executionEngineStub.notifyForkchoiceUpdate).not.toHaveBeenCalled();
+      }
+    );
+
+    it("starts alternate work after the primary event without waiting for the regular FCU", async () => {
+      earlyController.abort();
+      earlyController = new AbortController();
+      earlyScheduler = createEarlyScheduler({
+        ...earlyOpts,
+        emitPayloadAttributesAlternates: true,
+        payloadAttributesAlternateBuilderIndices: [0],
+      });
+      const alternate = vi.fn();
+      subscribeAlternates(alternate);
+      forkChoiceStub.getBlockHex.mockImplementation((root, status) => (root === headRoot ? makeHead(status) : null));
+      forkChoiceStub.getDependentRoot.mockReturnValue(headRoot);
+      chainStub.getHeadState.mockReturnValue(prepareState);
+      chainStub.recomputeForkChoiceHead.mockImplementation(() => forkChoiceStub.getHead());
+      chainStub.predictProposerHead.mockImplementation(() => forkChoiceStub.getHead());
+      beaconProposerCacheStub.get.mockReturnValue(`0x${"11".repeat(20)}`);
+      (executionEngineStub as unknown as {payloadIdCache: PayloadIdCache}).payloadIdCache = new PayloadIdCache();
+      let finish: ((payloadId: string) => void) | undefined;
+      executionEngineStub.notifyForkchoiceUpdate.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          })
+      );
+      let completed = false;
+      const regular = earlyScheduler.prepareForNextSlot(clockSlot).then(() => {
+        completed = true;
+      });
+      await vi.advanceTimersByTimeAsync(config.getSlotComponentDurationMs(6667) + 20);
+      expect(finish).toBeDefined();
+      expect(completed).toBe(false);
+      expect(payloadAttributesSpy).toHaveBeenCalledOnce();
+      expect(alternate).toHaveBeenCalledOnce();
+      expect(payloadAttributesSpy.mock.invocationCallOrder[0]).toBeLessThan(alternate.mock.invocationCallOrder[0]);
+      finish?.("0x1234");
+      await regular;
       expect(loggerStub.error).not.toHaveBeenCalled();
     });
 
