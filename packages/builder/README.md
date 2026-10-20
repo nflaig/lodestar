@@ -126,6 +126,26 @@ The `BUILDER_STAGED_GOSSIP_DEFERRED` log records the wait; subsequent gossip or 
 logs include `deferredMs`. This option does not extend any deadline or retry an
 uncertain send.
 
+### Temporary Hoodi fork transition
+
+The temporary Hoodi branch keeps `--assumeBuilderIndex` and
+`--assumeBuilderBalanceGwei` together. Before Gloas it uses that identity, then
+checks its public key against the registry. A different registered index stops
+bidding rather than signing with the wrong identity.
+
+`--payload.engineUntilSlot` selects the Engine through that proposal slot,
+inclusive; the native constructor starts at the next slot. Each build keeps its
+original owner across the boundary, including late replies and cleanup. Engine
+retrieval occurs 300 ms before the configured gossip deadline and its complete
+snapshot is reused. Native failures after the cutoff do not fall back to Engine.
+Both alternate request modes are rejected before Engine allocation. Only native
+snapshots support retained permissions and primary transfer; permission renewal
+and cleanup remain attached to the exact original payload after worker release.
+
+`--bidding.subsidyUntilSlot` also includes its cutoff slot. It does not change the
+configured gossip deadline, share, or update cutoff. These temporary options are
+independent of deferred staged gossip and alternate gossip.
+
 ### Recoverable constructor allocation
 
 With a compatible native constructor, enable `--payload.beginReservations true` to

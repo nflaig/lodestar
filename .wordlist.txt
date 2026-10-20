@@ -129,6 +129,7 @@ Zig
 addons
 api
 args
+assumeBuilderIndex
 async
 auth
 backfill
@@ -230,6 +231,7 @@ namespaces
 navbar
 nodemodule
 nonces
+onboards
 orchestrator
 osx
 params

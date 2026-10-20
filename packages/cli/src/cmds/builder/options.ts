@@ -15,6 +15,8 @@ export type IBuilderCliArgs = LogArgs & {
   keystore: string;
   keystorePassword: string;
   builderPubkey?: string;
+  assumeBuilderIndex?: number;
+  assumeBuilderBalanceGwei?: number;
   executionFeeRecipient: string;
   requestTimeout: number;
   "proposerPreferences.urls"?: string[];
@@ -30,6 +32,7 @@ export type IBuilderCliArgs = LogArgs & {
   "payload.transactionsFile"?: string;
   "payload.testingUrl"?: string;
   "payload.constructorUrl"?: string;
+  "payload.engineUntilSlot"?: number;
   "payload.beginReservations"?: boolean;
   "payload.alternateOrderGenerations"?: boolean;
   "payload.outputDir"?: string;
@@ -38,6 +41,7 @@ export type IBuilderCliArgs = LogArgs & {
   "bidding.shareBps": number;
   "bidding.fixedCostGwei": number;
   "bidding.subsidyGwei": number;
+  "bidding.subsidyUntilSlot"?: number;
   "bidding.minValueGwei": number;
   "bidding.maxValueGwei"?: number;
   "bidding.deadlineBps": number;
@@ -98,6 +102,21 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
   builderPubkey: {
     description: "Builder's expected public key based on the keystore from 'keystore' option",
     type: "string",
+  },
+
+  assumeBuilderIndex: {
+    description:
+      "Before the Gloas fork, assume this builder index for the deposit the fork onboards, to bid for the first Gloas slot. " +
+      "Verified against the beacon node after the first Gloas block, bidding stops if the registry disagrees",
+    type: "number",
+    implies: ["assumeBuilderBalanceGwei"],
+  },
+
+  assumeBuilderBalanceGwei: {
+    description:
+      "Balance in gwei assumed with 'assumeBuilderIndex' until the beacon node reports the builder, the deposit amount",
+    type: "number",
+    implies: ["assumeBuilderIndex"],
   },
 
   executionFeeRecipient: {
@@ -185,6 +204,14 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
   "payload.constructorUrl": {
     description: "Private zbuilder session RPC URL for incrementally constructed, validated payloads",
     type: "string",
+    group: "payload",
+  },
+
+  "payload.engineUntilSlot": {
+    description:
+      "Use the execution client instead of the session constructor through this proposal slot (inclusive), for the fork transition. Later slots use the constructor exclusively",
+    type: "number",
+    implies: ["payload.constructorUrl"],
     group: "payload",
   },
 
@@ -307,6 +334,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     description: "Fixed amount in gwei added on top of the proposer share of every bid, paid from the builder balance",
     type: "number",
     default: defaultOptions.bidding.subsidyGwei,
+    group: "bidding",
+  },
+
+  "bidding.subsidyUntilSlot": {
+    description:
+      "Only add the subsidy to bids for proposal slots up to and including this slot, e.g. the first slot of a fork, the subsidy applies to every bid if unset",
+    type: "number",
     group: "bidding",
   },
 

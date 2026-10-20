@@ -9,7 +9,7 @@ import {BuilderBidStreamApi, getBuilderBidStreamApi} from "./api/bidStream.js";
 import {BuilderApi, BuilderApiOptions, getBuilderApi} from "./api/impl.js";
 import {defaultOptions} from "./defaults.js";
 import {waitForGenesis} from "./genesis.js";
-import {resolveBuilderIdentity, resolveGossipBuilderIdentity} from "./identity.js";
+import {AssumedBuilderIdentity, resolveBuilderIdentity, resolveGossipBuilderIdentity} from "./identity.js";
 import {Metrics} from "./metrics.js";
 import {logNodeVersion, waitForNodeReady} from "./readiness.js";
 import {AsyncCommitmentJournal} from "./services/asyncCommitmentJournal.js";
@@ -106,6 +106,8 @@ export type BuilderOptions = {
     /** Deadline per poll in milliseconds, defaults to 1000 */
     timeoutMs?: number;
   };
+  /** Identity to use before the Gloas fork, see {@link AssumedBuilderIdentity} */
+  assumedIdentity?: AssumedBuilderIdentity;
 };
 
 /**
@@ -256,20 +258,26 @@ export class Builder {
 
     const clock = new Clock(config, logger, {genesisTime: Number(genesis.genesisTime), ...opts.clock});
 
+    const assumed = clock.getCurrentEpoch() < config.GLOAS_FORK_EPOCH ? opts.assumedIdentity : undefined;
     const identity = await resolveBuilderIdentity(
       api,
       logger,
       builderSigner.getPubkeyHex(),
       opts.abortController.signal,
       clock,
-      config
+      config,
+      assumed
     );
     const index = identity.index;
 
-    const builderStatusTracker = new BuilderStatusTracker(api, logger, index, opts.metrics, {
-      status: identity.status,
-      balance: identity.builder.balance,
-    });
+    const builderStatusTracker = new BuilderStatusTracker(
+      api,
+      logger,
+      index,
+      opts.metrics,
+      {status: identity.status, balance: identity.builder.balance},
+      assumed !== undefined ? builderSigner.getPubkeyHex() : undefined
+    );
     // A builder resolved ahead of the fork is not known to the beacon node yet
     if (clock.getCurrentEpoch() >= config.GLOAS_FORK_EPOCH) {
       await builderStatusTracker.poll(clock.getCurrentEpoch());
