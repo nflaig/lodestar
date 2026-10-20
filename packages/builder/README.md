@@ -166,9 +166,9 @@ grant after at most the configured alternate duration, within the ordinary offer
 cutoff. The request counts toward the existing four-attempt slot cap; a lost
 response is not retried and remains subject to native token expiry.
 An absent or malformed optional namespace leaves ordinary primary bidding intact
-but cannot authorize a handoff. Adoption conservatively requires the full payload
+but cannot authorize a transfer. Adoption conservatively requires the full payload
 attributes to match, including safe and finalized hashes. A refused or expired
-handoff preserves captured alternate metadata for normal bounded reconstruction
+transfer preserves captured alternate metadata for normal bounded reconstruction
 under the current eligible primary, including a further same-slot parent switch.
 
 In this opt-in mode, `zbuilder_beginAlternateV2` (or the separate
