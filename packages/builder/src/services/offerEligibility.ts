@@ -19,6 +19,7 @@ export type RetainedOffer = {
 };
 export type OfferEligibility = {
   generation: string;
+  doNotOfferBefore?: number;
   /** Constructor namespace captured with this immutable primary snapshot. */
   namespace?: string;
   lease: OfferLease;
@@ -28,7 +29,8 @@ export type OfferEligibility = {
 export function isOfferEligible(eligibility?: OfferEligibility): boolean {
   return (
     eligibility === undefined ||
-    (eligibility.retained?.closed !== true &&
+    (Date.now() >= (eligibility.doNotOfferBefore ?? 0) &&
+      eligibility.retained?.closed !== true &&
       eligibility.retained?.paused !== true &&
       eligibility.lease.ready &&
       eligibility.generation === eligibility.lease.generation &&

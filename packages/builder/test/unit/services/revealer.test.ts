@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {SecretKey} from "@chainsafe/lodestar-z/blst";
 import {createBeaconConfig} from "@lodestar/config";
@@ -8,6 +11,9 @@ import {toRootHex} from "@lodestar/utils";
 import {BidLedger} from "../../../src/services/bidLedger.js";
 import {ObservedBlock} from "../../../src/services/blockObserver.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
+import {CommitmentJournal} from "../../../src/services/commitmentJournal.js";
+import {type OfferEligibility, isOfferEligible} from "../../../src/services/offerEligibility.js";
+import {type OrderMetadata, parseOrderMetadata} from "../../../src/services/orderMetadata.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
 import {ProposerPreferencesTracker} from "../../../src/services/proposerPreferencesTracker.js";
 import {Revealer, RevealerOptions} from "../../../src/services/revealer.js";
@@ -63,8 +69,18 @@ describe("Revealer", () => {
   }
 
   /** Block that selected a bid for a payload, optionally recorded as our bid and retained */
-  function selectedBlock({recordBid = true, retainPayload = true} = {}): ObservedBlock {
-    const payload = mockBuiltPayload({slot});
+  function selectedBlock({
+    recordBid = true,
+    retainPayload = true,
+    orderMetadata,
+    offerEligibility,
+  }: {
+    recordBid?: boolean;
+    retainPayload?: boolean;
+    orderMetadata?: OrderMetadata;
+    offerEligibility?: OfferEligibility;
+  } = {}): ObservedBlock {
+    const payload = {...mockBuiltPayload({slot}), orderMetadata, offerEligibility};
     const block = ssz.gloas.SignedBeaconBlock.defaultValue();
     block.message.slot = slot;
     const signedBid = block.message.body.signedExecutionPayloadBid;
@@ -99,6 +115,47 @@ describe("Revealer", () => {
       signedBid,
     };
   }
+
+  it("reveals the exact old payload selected after a cancellation fence acknowledgement", async () => {
+    const orderId = `0x${"12".repeat(32)}`;
+    const lease = {
+      generation: "0x0",
+      ready: true,
+      validUntil: performance.now() + 10000,
+      validUntilUnixMs: Date.now() + 10000,
+    };
+    const eligibility = {generation: "0x0", lease};
+    const observed = selectedBlock({
+      orderMetadata: parseOrderMetadata({version: 1, orderIds: [orderId], doNotOfferBefore: 0}),
+      offerEligibility: eligibility,
+    });
+    const stored = payloadStore.get(toRootHex(observed.signedBid.message.blockHash));
+    if (!stored) throw Error("Missing exact old payload");
+    const expected = ssz.gloas.ExecutionPayload.serialize(stored.payload.executionPayload);
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cancelled-reveal-"));
+    try {
+      const journal = new CommitmentJournal(directory, {
+        genesisValidatorsRoot: toRootHex(Buffer.alloc(32)),
+        pubkey: "test",
+      });
+      journal.retain(observed.signedBid, stored);
+      lease.generation = "0x1";
+      const fenceAcknowledgedAt = Date.now();
+      expect(isOfferEligible(eligibility)).toBe(false);
+      expect(journal.queryExposure(orderId, fenceAcknowledgedAt)).toMatchObject({commitmentCount: 1});
+      await revealer.onBlock(observed);
+      const submitted = api.beacon.publishExecutionPayloadEnvelope.mock.calls[0][0].signedEnvelopeOrContents;
+      expect("signedExecutionPayloadEnvelope" in submitted).toBe(true);
+      if (!("signedExecutionPayloadEnvelope" in submitted)) throw Error("Missing revealed contents");
+      expect(ssz.gloas.ExecutionPayload.serialize(submitted.signedExecutionPayloadEnvelope.message.payload)).toEqual(
+        expected
+      );
+      expect(ledger.hasPublishedReveal(observed.blockRoot)).toBe(true);
+      expect(journal.queryExposure(orderId, fenceAcknowledgedAt).commitmentCount).toBe(1);
+    } finally {
+      fs.rmSync(directory, {recursive: true, force: true});
+    }
+  });
 
   it("reveals the retained payload of a selected bid", async () => {
     const observed = selectedBlock();

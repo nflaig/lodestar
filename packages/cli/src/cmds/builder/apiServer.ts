@@ -2,9 +2,10 @@ import {Endpoint} from "@lodestar/api";
 import {BuilderApiMethods, getRoutes} from "@lodestar/api/builder/server";
 import {ApiError, FastifyRoute, canSendResponse} from "@lodestar/api/server";
 import {RestApiServer, RestApiServerModules, RestApiServerOpts} from "@lodestar/beacon-node";
-import {BuilderApi, BuilderBidStreamApi} from "@lodestar/builder";
+import {BuilderApi, BuilderBidStreamApi, type OrderExposure} from "@lodestar/builder";
 import {ChainForkConfig} from "@lodestar/config";
 import {registerBidStream} from "./bidStream.js";
+import {registerOrderExposure} from "./orderExposure.js";
 
 export const builderRestApiServerOptsDefault: RestApiServerOpts = {
   address: "127.0.0.1",
@@ -24,6 +25,7 @@ export type BuilderRestApiServerModules = RestApiServerModules & {
   config: ChainForkConfig;
   api: BuilderApi;
   getBidStreamApi?: () => BuilderBidStreamApi | null;
+  getOrderExposure?: () => OrderExposure | null;
 };
 
 /**
@@ -64,7 +66,11 @@ export function getBuilderApiBeforeInit(config: ChainForkConfig, getBuilderApi: 
   };
 }
 
-export type BuilderRestApiServerOpts = RestApiServerOpts & {bidStream?: boolean; bidStreamAdaptiveTiming?: boolean};
+export type BuilderRestApiServerOpts = RestApiServerOpts & {
+  bidStream?: boolean;
+  bidStreamAdaptiveTiming?: boolean;
+  orderExposureTokenFile?: string;
+};
 
 export class BuilderRestApiServer extends RestApiServer {
   constructor(optsArg: Partial<BuilderRestApiServerOpts>, modules: BuilderRestApiServerModules) {
@@ -112,6 +118,9 @@ export class BuilderRestApiServer extends RestApiServer {
         );
       });
     }
+
+    if (opts.orderExposureTokenFile)
+      registerOrderExposure(this.server, opts.orderExposureTokenFile, modules.getOrderExposure ?? (() => null));
 
     // Only the routes implemented by the builder are registered, routes of earlier forks are not served
     const routes = getRoutes(modules.config, modules.api as BuilderApiMethods);

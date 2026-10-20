@@ -13,6 +13,18 @@ export {
   type RetainedOffer,
 } from "./services/offerEligibility.js";
 export {
+  OrderExposure,
+  type OrderExposureCapabilities,
+  type OrderExposureQuery,
+  type OrderExposureResponse,
+} from "./services/orderExposure.js";
+export {
+  type OrderMetadata,
+  isOrderOfferAllowed,
+  parseOrderMetadata,
+  sameOrderMetadata,
+} from "./services/orderMetadata.js";
+export {
   type BuildHandle,
   type BuildRequest,
   type BuiltPayload,

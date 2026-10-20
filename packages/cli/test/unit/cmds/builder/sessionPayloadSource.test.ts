@@ -148,6 +148,55 @@ describe("SessionPayloadSource", () => {
         return {...m, handle, payload};
       }
 
+      it("preserves exact order metadata through conditional reads, primary handoff and renewals", async () => {
+        const orderMetadata = {version: 1, orderIds: [`0x${"12".repeat(32)}`], doNotOfferBefore: 0};
+        const m = await primary(true, true, false, {orderMetadata});
+        m.fetch.mockResolvedValueOnce({
+          generation: "0x0",
+          namespace: grant(m.request).namespace,
+          leaseMs: 250,
+          ready: true,
+          payload: null,
+          orderMetadata,
+        });
+        const unchanged = await m.source.getPayload(m.handle, signal);
+        expect(unchanged.orderMetadata).toEqual(orderMetadata);
+        const {payload: _payload, ...permission} = grant(m.request);
+        m.fetch.mockResolvedValueOnce({...permission, orderMetadata});
+        const retained = await m.source.retainPrimaryPayload(m.handle, unchanged, signal);
+        expect(retained.orderMetadata).toEqual(orderMetadata);
+        m.fetch.mockResolvedValueOnce({...permission, orderMetadata});
+        expect(await m.source.renewOffer(retained, signal)).toBe(true);
+        m.fetch.mockResolvedValueOnce({...permission, orderMetadata: {...orderMetadata, orderIds: []}});
+        await expect(m.source.renewOffer(retained, signal)).rejects.toMatchObject({
+          type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH, reason: "Retained order metadata changed"},
+        });
+        expect(retained.offerEligibility?.lease.ready).toBe(false);
+      });
+
+      it("rejects changed conditional membership and too-early reads without signing permission", async () => {
+        const orderMetadata = {version: 1, orderIds: [`0x${"12".repeat(32)}`], doNotOfferBefore: 0};
+        const m = await primary(true, true, false, {orderMetadata});
+        m.fetch.mockResolvedValueOnce({
+          generation: "0x0",
+          namespace: grant(m.request).namespace,
+          leaseMs: 250,
+          ready: true,
+          payload: null,
+          orderMetadata: {...orderMetadata, orderIds: []},
+        });
+        await expect(m.source.getPayload(m.handle, signal)).rejects.toMatchObject({
+          type: {
+            code: SessionPayloadErrorCode.RESPONSE_MISMATCH,
+            reason: "Order metadata changed for unchanged payload",
+          },
+        });
+        expect(m.payload.offerEligibility?.lease.ready).toBe(false);
+        await expect(
+          primary(true, true, false, {orderMetadata: {...orderMetadata, doNotOfferBefore: Date.now() + 60_000}})
+        ).rejects.toBeInstanceOf(PayloadSourceNotReady);
+      });
+
       it.each([undefined, null, "0x01", 1, true, `0x${"CD".repeat(16)}`])(
         "keeps a primary payload available with optional namespace %j",
         async (namespace) => {

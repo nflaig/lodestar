@@ -68,6 +68,7 @@ export type IBuilderCliArgs = LogArgs & {
   "builderApi.address"?: string;
   "builderApi.publicUrl"?: string;
   "builderApi.authData"?: string;
+  "builderApi.orderExposureTokenFile"?: string;
   "builderApi.bidStream"?: boolean;
   "builderApi.bidStreamAdaptiveTiming"?: boolean;
   "builderApi.httpReturnReserveCapMs"?: number;
@@ -455,6 +456,13 @@ export const builderOptions: CliCommandOptions<IBuilderCliArgs> = {
     description: "Enable the experimental authenticated Gloas WebSocket bid stream alongside the HTTP builder API",
     type: "boolean",
     default: false,
+    group: "builderApi",
+  },
+
+  "builderApi.orderExposureTokenFile": {
+    description: "File containing a shared 32-byte lowercase hex token for the private order exposure endpoint",
+    type: "string",
+    implies: ["builderApi"],
     group: "builderApi",
   },
 

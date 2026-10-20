@@ -654,6 +654,81 @@ commitment. Keep those keys available and drain bidding before removing an ident
 memory until the normal reveal retention expires, and each journal independently holds
 the payloads needed to recover that identity's commitments.
 
+## Order cancellation evidence
+
+The optional `--builderApi.orderExposureTokenFile /run/zbuilder/order-exposure.token`
+setting enables `POST /internal/v1/order-exposure` on the builder API listener.
+The file contains 64 lowercase hexadecimal characters, optionally followed by a
+newline. It is read once at startup. Requests use that value as a Bearer token;
+the route is absent without this setting. Keep the route private and give access
+only to the gateway that owns the native generation fence. Public owner
+authorization belongs to the gateway.
+
+Native snapshots carry `orderMetadata` with a version, at most 256 immutable
+order IDs, and a `doNotOfferBefore` timestamp in Unix milliseconds. Missing
+metadata or `orderIds: null` means unknown membership. New signing, persistence,
+HTTP responses, stream frames, gossip, and retained offer permissions check the
+timestamp. Historical signed payloads remain available for reveal after a
+cancellation or a clock change. Reusing a payload hash or signed bid root with
+different membership is refused.
+
+Every primary and staged journal persists membership with the existing durable
+signature write. A durable signed commitment means **possible exposure**,
+including when its transport result or persistence acknowledgement is unknown.
+This is not evidence of selection, a canonical block, or finality.
+
+The capability response provides a publisher instance, coverage start, and
+`observedAtUnixMs` from the publisher clock. The gateway records that observation
+as a conservative admission lower bound before durable admission and live feed;
+it must not substitute its own clock. After the native generation drain
+acknowledgement, an authenticated query waits up to one second for all identity
+journal barriers. The response echoes the exact order ID, namespace and
+generation. It searches all retained matching commitments, including those older
+than the admission bound.
+
+Absence requires a matching continuously covered publisher instance and complete
+history covering admission. Legacy records, unknown membership, lost journal coverage,
+detected clock discontinuities, missing identities, or incomplete barriers
+prevent an absence claim. A retained positive is still reported when another
+journal is unavailable. Each journal bounds its evidence index to 8,192 records
+and 16 MiB; exceeding either limit makes absence unavailable for that instance.
+Queries return at most 64 commitments, with a total count and truncation marker.
+There is one active query per publisher and a 1 KiB request limit. A response
+timeout keeps that query occupied until its outstanding journal work settles.
+The journal barrier also waits for a shared reference's snapshot fallback, and
+its queue slot does not consume the existing capacity for reveal writes.
+
+Publisher and journal clocks are checked against their initial monotonic clock
+observations. A difference above 10 ms permanently disables absence claims for
+that instance. Every prune checks the clock and advances the coverage boundary
+to at least its current time plus a conservative 22 ms margin; an admission
+before that boundary cannot regain an absence claim merely by waiting.
+
+New bid records use the version 2 journal envelope. The new reader preserves old
+records and their exact reveal payloads, but treats their exposure metadata as
+unknown. **Do not roll back to an older binary after writing new records.**
+Preserve every identity journal and use a reader compatible with this format.
+Existing legacy records can keep absence unavailable until they leave the
+retention window. With 32 slots per epoch, a bid for slot `s` is removed at
+`s + 97`, about 19 minutes 24 seconds later on a 12-second network. All identity
+journals must finish that pruning, and a new order must then be admitted after
+the coverage boundary. This is not a timer guarantee: further unknown records
+or lost coverage can keep absence unavailable. Retained positive evidence is
+available immediately.
+
+The reusable `test/perf/commitmentMetadata.mjs` benchmark compares the real BLS
+signer and primary/shared journal worker acknowledgement path on one filesystem:
+
+```sh
+node packages/builder/test/perf/commitmentMetadata.mjs /path/to/compiled/repository 64 4 48
+```
+
+The arguments select the repository, order count (0, 64 or 256), blob count
+(0 or 4), and revision count. Zero orders omits metadata to measure the legacy
+input path. Use alternating baseline and candidate processes without concurrent
+builds. Synthetic payloads measure durable preparation overhead, not execution
+validity, remote delivery, payload value, or win rate.
+
 ## License
 
 Apache-2.0 [ChainSafe Systems](https://chainsafe.io)

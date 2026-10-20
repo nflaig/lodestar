@@ -16,6 +16,26 @@ import {getApiClientStub, mockApiErrorResponse, mockApiResponse} from "../utils/
 const builderIndex = 7;
 
 describe("BidPublisher", () => {
+  it("does not sign before the floor and rechecks it immediately before P2P handoff", async () => {
+    let allowed = false;
+    const retention = vi.fn();
+    const {publisher, signer, api} = createPublisher({
+      hasPayload: () => true,
+      retainCommitment: retention,
+      canSign: () => allowed,
+    });
+    const sign = vi.spyOn(signer, "signExecutionPayloadBid");
+    await expect(publisher.prepare(createBid())).rejects.toThrow("ORDER_OFFER_TOO_EARLY");
+    expect(sign).not.toHaveBeenCalled();
+    expect(retention).not.toHaveBeenCalled();
+    allowed = true;
+    const signed = await publisher.prepare(createBid());
+    allowed = false;
+    await expect(publisher.gossip(signed, new AbortController().signal)).rejects.toThrow("ORDER_OFFER_TOO_EARLY");
+    expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
+    expect(retention).toHaveBeenCalledOnce();
+  });
+
   it("reserves primary revision headroom across pending and uncertain alternate writes", async () => {
     const disk = defer<void>();
     const retainCommitment = vi.fn(() => disk.promise);
@@ -350,8 +370,10 @@ function createPublisher({
   hasPayload,
   fork = ForkName.gloas,
   retainCommitment,
+  canSign,
 }: {
   hasPayload: (identity: BidIdentity) => boolean;
+  canSign?: (identity: BidIdentity) => boolean;
   fork?: ForkName;
   retainCommitment?: ConstructorParameters<typeof BidPublisher>[0]["retainCommitment"];
 }) {
@@ -362,7 +384,16 @@ function createPublisher({
   Object.assign(api.beacon, {publishExecutionPayloadBid: vi.fn()});
   api.beacon.publishExecutionPayloadBid.mockResolvedValue(mockApiResponse({}));
   const ledger = new BidLedger();
-  const publisher = new BidPublisher({api, config, signer, ledger, builderIndex, hasPayload, retainCommitment});
+  const publisher = new BidPublisher({
+    api,
+    config,
+    signer,
+    ledger,
+    builderIndex,
+    hasPayload,
+    retainCommitment,
+    canSign,
+  });
   return {api, config, keys, ledger, publisher, signer};
 }
 

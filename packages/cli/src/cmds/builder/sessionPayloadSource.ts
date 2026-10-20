@@ -12,11 +12,15 @@ import {
   type BuildRequest,
   type BuiltPayload,
   type OfferLease,
+  type OrderMetadata,
   type PayloadSource,
   PayloadSourceNotReady,
   type PayloadSourceResources,
   type RetainedOffer,
   isAlternateBuild,
+  isOrderOfferAllowed,
+  parseOrderMetadata,
+  sameOrderMetadata,
 } from "@lodestar/builder";
 import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB, ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
@@ -25,6 +29,7 @@ import {ErrorAborted, LodestarError, type Logger, isFetchError, sleep, toHex, wi
 type Rpc = Pick<JsonRpcHttpClient, "fetch">;
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
 type RetainedResponse = {
+  orderMetadata?: unknown;
   retainedOfferVersion: number;
   offerId: string;
   namespace: string;
@@ -40,6 +45,7 @@ type RetainedResponse = {
 };
 type RetainedLeaseResponse = Omit<RetainedResponse, "payload">;
 type LeasedResponse = {
+  orderMetadata?: unknown;
   generation: string;
   namespace?: string | null;
   leaseMs: number;
@@ -654,6 +660,7 @@ export class SessionPayloadSource implements PayloadSource {
       throw new SessionPayloadError({code: SessionPayloadErrorCode.UNKNOWN_HANDLE, reason: handle.payloadId});
     let response: PayloadResponse | null;
     let namespace: string | undefined;
+    let orderMetadata: OrderMetadata | undefined;
     if (entry.lease) {
       entry.lease.ready = false;
       const result = received as LeasedResponse | null;
@@ -693,7 +700,13 @@ export class SessionPayloadSource implements PayloadSource {
       entry.lease.validUntilUnixMs = startedUnix + result.leaseMs;
       if (previous !== result.generation) entry.latest = undefined;
       if (!result.ready) throw new PayloadSourceNotReady();
+      orderMetadata = parseOrderMetadata(result.orderMetadata);
       response = result.payload;
+      if (response === null && entry.latest && !sameOrderMetadata(entry.latest.orderMetadata, orderMetadata))
+        throw new SessionPayloadError({
+          code: SessionPayloadErrorCode.RESPONSE_MISMATCH,
+          reason: "Order metadata changed for unchanged payload",
+        });
       if (response === null && !entry.latest)
         throw new SessionPayloadError({
           code: SessionPayloadErrorCode.RESPONSE_MISMATCH,
@@ -703,15 +716,24 @@ export class SessionPayloadSource implements PayloadSource {
     try {
       if (response !== null) {
         entry.latest = validateSessionPayload(this.id, entry.request, response);
+        entry.latest.orderMetadata = orderMetadata;
         if (entry.lease)
-          entry.latest.offerEligibility = {generation: entry.lease.generation, namespace, lease: entry.lease};
+          entry.latest.offerEligibility = {
+            generation: entry.lease.generation,
+            namespace,
+            lease: entry.lease,
+            doNotOfferBefore: orderMetadata?.doNotOfferBefore,
+          };
       }
       if (!entry.latest)
         throw new SessionPayloadError({code: SessionPayloadErrorCode.RESPONSE_MISMATCH, reason: "No initial payload"});
       if (entry.lease) {
         // A large reply may consume its whole lease. Cache its verified bytes,
         // but require a fresh, small conditional read before making an offer.
-        entry.lease.ready = performance.now() < entry.lease.validUntil && Date.now() < entry.lease.validUntilUnixMs;
+        entry.lease.ready =
+          isOrderOfferAllowed(entry.latest.orderMetadata) &&
+          performance.now() < entry.lease.validUntil &&
+          Date.now() < entry.lease.validUntilUnixMs;
         if (!entry.lease.ready) throw new PayloadSourceNotReady();
       }
       return entry.latest;
@@ -725,6 +747,7 @@ export class SessionPayloadSource implements PayloadSource {
     const entry = this.requests.get(handle.payloadId);
     const eligibility = payload.offerEligibility;
     if (
+      !isOrderOfferAllowed(payload.orderMetadata) ||
       !this.supportsPrimaryHandoff ||
       !entry?.primaryHandoff ||
       entry.state !== "active" ||
@@ -773,6 +796,7 @@ export class SessionPayloadSource implements PayloadSource {
       ...payload,
       offerEligibility: {
         generation: context.generation,
+        doNotOfferBefore: payload.orderMetadata?.doNotOfferBefore,
         namespace: context.namespace,
         retained: {id: result.offerId, ...context, closed: false},
         lease: {generation: context.generation, validUntil: 0, validUntilUnixMs: 0, ready: false},
@@ -823,6 +847,7 @@ export class SessionPayloadSource implements PayloadSource {
     let payload: BuiltPayload | undefined;
     try {
       payload = validateSessionPayload(this.id, entry.request, result.payload);
+      payload.orderMetadata = parseOrderMetadata(result.orderMetadata);
       const retained: RetainedOffer = {
         id: result.offerId,
         namespace: result.namespace,
@@ -834,6 +859,7 @@ export class SessionPayloadSource implements PayloadSource {
       };
       payload.offerEligibility = {
         generation: result.generation,
+        doNotOfferBefore: payload.orderMetadata?.doNotOfferBefore,
         retained,
         lease: {generation: result.generation, validUntil: 0, validUntilUnixMs: 0, ready: false},
       };
@@ -900,6 +926,11 @@ export class SessionPayloadSource implements PayloadSource {
         code: SessionPayloadErrorCode.RESPONSE_MISMATCH,
         reason: "Retained offer context mismatch",
       });
+    if (!sameOrderMetadata(payload.orderMetadata, parseOrderMetadata(result.orderMetadata)))
+      throw new SessionPayloadError({
+        code: SessionPayloadErrorCode.RESPONSE_MISMATCH,
+        reason: "Retained order metadata changed",
+      });
     if (retained.closed) return;
     eligibility.lease.validUntil = started + result.leaseMs;
     eligibility.lease.validUntilUnixMs = startedUnix + result.leaseMs;
@@ -908,6 +939,7 @@ export class SessionPayloadSource implements PayloadSource {
     if (result.currentGeneration !== eligibility.generation || !result.ready) retained.closed = true;
     eligibility.lease.ready =
       !retained.closed &&
+      isOrderOfferAllowed(payload.orderMetadata) &&
       performance.now() < eligibility.lease.validUntil &&
       Date.now() < eligibility.lease.validUntilUnixMs;
   }

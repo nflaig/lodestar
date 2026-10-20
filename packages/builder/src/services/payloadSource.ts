@@ -9,6 +9,7 @@ import type {
 } from "@lodestar/types";
 import {LodestarError} from "@lodestar/utils";
 import type {OfferEligibility} from "./offerEligibility.js";
+import type {OrderMetadata} from "./orderMetadata.js";
 
 export type PayloadId = string;
 
@@ -51,6 +52,7 @@ export type BuildHandle = {
 };
 
 export type BuiltPayload = {
+  orderMetadata?: OrderMetadata;
   sourceId: string;
   fork: ForkPostGloas;
   executionPayload: ExecutionPayload<ForkPostGloas>;
