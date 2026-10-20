@@ -700,9 +700,21 @@ its queue slot does not consume the existing capacity for reveal writes.
 
 Publisher and journal clocks are checked against their initial monotonic clock
 observations. A difference above 10 ms permanently disables absence claims for
-that instance. Every prune checks the clock and advances the coverage boundary
-to at least its current time plus a conservative 22 ms margin; an admission
-before that boundary cannot regain an absence claim merely by waiting.
+that instance. Every prune checks the clock. When a complete bid record is
+removed, its exact order IDs remain remembered; a query for one of those IDs
+returns unknown unless a retained positive commitment is still available.
+Pruning known empty or unrelated records does not invalidate absence for other
+orders. Missing or incomplete records still advance the global coverage
+boundary to at least the prune time plus a conservative 22 ms margin; an
+admission before that boundary cannot regain absence merely by waiting.
+
+Each journal remembers at most 8,192 distinct pruned order IDs. Repeated IDs do
+not consume additional entries. Exceeding that limit permanently disables
+absence for the publisher instance before any remembered IDs are discarded,
+including for queries with later admission bounds. Retained positive evidence
+remains available. Restarting creates a new instance that cannot certify
+absence for orders admitted under the old instance. This bounded history is
+not an archival guarantee for sustained private order flow.
 
 New bid records use the version 2 journal envelope. The new reader preserves old
 records and their exact reveal payloads, but treats their exposure metadata as

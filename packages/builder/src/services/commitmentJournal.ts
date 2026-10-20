@@ -29,6 +29,7 @@ const KEEP_SLOTS = BID_HISTORY_SLOTS;
 const MAX_BYTES = MAX_COMMITMENT_JOURNAL_BYTES;
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
 const MAX_FILES = MAX_COMMITMENT_JOURNAL_FILES;
+const MAX_FORGOTTEN_ORDER_IDS = 8192;
 const recordName = /^(payload|bid|reveal|blob)-(\d+)-(0x[0-9a-f]{64})\.(json|bin)$/;
 const BLOB_BYTES = FIELD_ELEMENTS_PER_BLOB * 32;
 const COMMITMENT_BYTES = 48;
@@ -82,6 +83,7 @@ export class CommitmentJournal {
   private exposureBytes = 0;
   private exposureIncomplete = false;
   private prunedThroughUnixMs = 0;
+  private readonly forgottenOrderIds = new Set<string>();
   private readonly exposureClock = {unix: Date.now(), monotonic: performance.now()};
   private lastExposureUnixMs = this.exposureClock.unix;
 
@@ -521,11 +523,25 @@ export class CommitmentJournal {
         continue;
       if (match[1] === "bid") {
         const record = this.exposure.get(name);
-        this.prunedThroughUnixMs = Math.max(
-          this.prunedThroughUnixMs,
-          record?.commitment?.possibleExposureAtUnixMs ?? 0,
-          pruneBoundary
-        );
+        const ids = record?.metadata?.orderIds;
+        if (ids && record?.commitment && !this.exposureIncomplete) {
+          for (const id of ids) {
+            if (!this.forgottenOrderIds.has(id) && this.forgottenOrderIds.size === MAX_FORGOTTEN_ORDER_IDS) {
+              this.exposureIncomplete = true;
+              break;
+            }
+            this.forgottenOrderIds.add(id);
+          }
+        }
+        if (!ids || !record?.commitment || this.exposureIncomplete) {
+          this.prunedThroughUnixMs = Math.max(
+            this.prunedThroughUnixMs,
+            record?.commitment?.possibleExposureAtUnixMs ?? 0,
+            pruneBoundary
+          );
+        }
+        // Lost exact IDs cannot regain absence through a later admission bound.
+        if (this.exposureIncomplete) this.forgottenOrderIds.clear();
         this.exposureBytes -= record?.bytes ?? 0;
         this.exposure.delete(name);
       }
@@ -549,7 +565,11 @@ export class CommitmentJournal {
 
   queryExposure(orderId: string, admittedAtUnixMs: number): JournalExposure {
     this.checkExposureClock();
-    let coverageComplete = !this.failed && !this.exposureIncomplete && admittedAtUnixMs > this.prunedThroughUnixMs;
+    let coverageComplete =
+      !this.failed &&
+      !this.exposureIncomplete &&
+      admittedAtUnixMs > this.prunedThroughUnixMs &&
+      !this.forgottenOrderIds.has(orderId);
     const commitments: OrderCommitment[] = [];
     let commitmentCount = 0;
     for (const {metadata, commitment} of this.exposure.values()) {

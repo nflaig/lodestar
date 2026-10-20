@@ -50,6 +50,7 @@ class Thread extends EventEmitter {
     } catch (error) {
       reply.error = error instanceof Error ? error.message : String(error);
     }
+    reply.coverageLost = !this.journal.hasExposureCoverage();
     this.emit("message", reply);
   }
   async terminate(): Promise<number> {
@@ -89,6 +90,18 @@ function fixture(index = 0, ids: string[] | null = [orderId]) {
       payload,
     },
   };
+}
+
+function distinctFixture(index: number, ids: string[] | null, slot = 100) {
+  const f = fixture(index, ids);
+  const hash = createHash("sha256").update(`exposure-${index}`).digest();
+  f.bid.message.slot = slot;
+  f.bid.message.blockHash = hash;
+  f.stored.slot = slot;
+  f.stored.blockHash = toRootHex(hash);
+  f.stored.payload.executionPayload.slotNumber = slot;
+  f.stored.payload.executionPayload.blockHash = hash;
+  return f;
 }
 
 function request(exposure: OrderExposure, id = orderId): OrderExposureQuery {
@@ -275,6 +288,174 @@ describe("order exposure receipts", () => {
     third.journal.retain(legacy.bid, legacy.stored);
     const recovered = new CommitmentJournal(third.directory, identity);
     expect(recovered.queryExposure(orderId, time).coverageComplete).toBe(false);
+  });
+
+  it.each([{ids: []}, {ids: [otherId]}])(
+    "preserves absence across sixty seconds of unrelated pruning: $ids",
+    async ({ids}) => {
+      vi.useFakeTimers();
+      const primary = setup();
+      const staged = setup();
+      const exposure = new OrderExposure([primary.worker, staged.worker]);
+      const q = request(exposure);
+      for (let i = 0; i < 5; i++) {
+        const f = distinctFixture(i, ids, 100 + i);
+        primary.journal.retain(f.bid, f.stored);
+        staged.journal.retain(f.bid, f.stored);
+        await vi.advanceTimersByTimeAsync(12_000);
+        primary.journal.prune(101 + i + BID_HISTORY_SLOTS);
+        staged.journal.prune(101 + i + BID_HISTORY_SLOTS);
+        const result = exposure.query(q);
+        primary.thread.finish();
+        staged.thread.finish();
+        expect(await result, `prune ${i}`).toMatchObject({
+          priorCommitmentExposure: "none",
+          coverageComplete: true,
+          commitmentCount: 0,
+          commitments: [],
+        });
+      }
+      await primary.worker.close();
+      await staged.worker.close();
+    }
+  );
+
+  it("keeps forgotten matching IDs unknown even with a later bound without inventing positives", async () => {
+    vi.useFakeTimers();
+    const primary = setup();
+    const exposure = new OrderExposure([primary.worker]);
+    const f = fixture();
+    primary.journal.retain(f.bid, f.stored);
+    await vi.advanceTimersByTimeAsync(1000);
+    primary.journal.prune(101 + BID_HISTORY_SLOTS);
+    await vi.advanceTimersByTimeAsync(1000);
+    const result = exposure.query(request(exposure));
+    primary.thread.finish();
+    expect(await result).toMatchObject({
+      priorCommitmentExposure: "unknown",
+      coverageComplete: false,
+      commitmentCount: 0,
+      commitments: [],
+      earliestPossibleOfferAtUnixMs: null,
+      truncated: false,
+    });
+    const later = distinctFixture(1, [orderId], 102);
+    primary.journal.retain(later.bid, later.stored);
+    const positive = exposure.query(request(exposure));
+    primary.thread.finish();
+    expect(await positive).toMatchObject({priorCommitmentExposure: "possible", commitmentCount: 1});
+    await primary.worker.close();
+  });
+
+  it("bounds forgotten IDs at 8192, does not charge duplicates and makes overflow sticky", async () => {
+    vi.useFakeTimers();
+    const primary = setup();
+    const {journal} = primary;
+    const exposure = new OrderExposure([primary.worker]);
+    const q = request(exposure);
+    const admitted = Date.now();
+    const id = (n: number) => `0x${n.toString(16).padStart(64, "0")}`;
+    for (let i = 0; i < 32; i++) {
+      const f = distinctFixture(
+        i,
+        Array.from({length: 256}, (_, n) => id(i * 256 + n)),
+        100 + i
+      );
+      journal.retain(f.bid, f.stored);
+      journal.prune(101 + i + BID_HISTORY_SLOTS);
+      expect(journal.queryExposure(otherId, admitted).coverageComplete, `batch ${i}`).toBe(true);
+    }
+    const duplicate = distinctFixture(32, [id(0), id(8191)], 132);
+    journal.retain(duplicate.bid, duplicate.stored);
+    journal.prune(133 + BID_HISTORY_SLOTS);
+    expect(journal.hasExposureCoverage()).toBe(true);
+    expect(journal.queryExposure(otherId, admitted).coverageComplete).toBe(true);
+
+    const overflow = distinctFixture(33, [id(8192)], 133);
+    journal.retain(overflow.bid, overflow.stored);
+    journal.prune(134 + BID_HISTORY_SLOTS);
+    expect(journal.hasExposureCoverage()).toBe(false);
+    vi.advanceTimersByTime(60_000);
+    journal.prune(200 + BID_HISTORY_SLOTS);
+    for (const queried of [id(0), id(8191), id(8192), otherId]) {
+      expect(journal.queryExposure(queried, Date.now()), queried).toMatchObject({
+        coverageComplete: false,
+        commitmentCount: 0,
+        commitments: [],
+      });
+    }
+    const unknown = exposure.query({...q, orderId: id(0), admittedAtUnixMs: Date.now()});
+    primary.thread.finish();
+    expect(await unknown).toMatchObject({priorCommitmentExposure: "unknown", coverageComplete: false});
+    expect(exposure.capabilities()).toMatchObject({ready: false});
+    expect(exposure.capabilities().publisherInstance).not.toBe(q.admittedPublisherInstance);
+    const retained = distinctFixture(34, [id(0)], 300);
+    journal.retain(retained.bid, retained.stored);
+    const positive = exposure.query({...q, orderId: id(0), admittedAtUnixMs: Date.now()});
+    primary.thread.finish();
+    expect(await positive).toMatchObject({
+      priorCommitmentExposure: "possible",
+      coverageComplete: false,
+      commitmentCount: 1,
+    });
+    await primary.worker.close();
+  });
+
+  it("does not clear unknown membership's global barrier when a known record is later pruned", () => {
+    vi.useFakeTimers();
+    const {journal} = setup();
+    const admitted = Date.now();
+    const unknown = distinctFixture(0, null);
+    journal.retain(unknown.bid, unknown.stored);
+    vi.advanceTimersByTime(1000);
+    journal.prune(101 + BID_HISTORY_SLOTS);
+    vi.advanceTimersByTime(1000);
+    const known = distinctFixture(1, [], 102);
+    journal.retain(known.bid, known.stored);
+    journal.prune(103 + BID_HISTORY_SLOTS);
+    expect(journal.queryExposure(otherId, admitted).coverageComplete).toBe(false);
+    expect(journal.queryExposure(otherId, Date.now()).coverageComplete).toBe(true);
+  });
+
+  it("does not turn a forgotten old-instance admission into absence after restart", async () => {
+    vi.useFakeTimers();
+    const primary = setup();
+    const before = new OrderExposure([primary.worker]);
+    const q = request(before);
+    const f = fixture();
+    primary.journal.retain(f.bid, f.stored);
+    primary.journal.prune(101 + BID_HISTORY_SLOTS);
+    await primary.worker.close();
+    await vi.advanceTimersByTimeAsync(1000);
+    const recovered = new CommitmentJournal(primary.directory, identity);
+    const thread = new Thread(recovered);
+    const worker = new AsyncCommitmentJournal(thread);
+    thread.emit("message", {id: 0});
+    const after = new OrderExposure([worker]);
+    expect(after.capabilities().publisherInstance).not.toBe(q.admittedPublisherInstance);
+    const result = after.query({...q, admittedAtUnixMs: Date.now()});
+    thread.finish();
+    expect(await result).toMatchObject({priorCommitmentExposure: "unknown", coverageComplete: false});
+    await worker.close();
+  });
+
+  it("keeps forgotten membership conservative when the bid file cannot be removed", () => {
+    vi.useFakeTimers();
+    const {journal} = setup();
+    const f = fixture();
+    const admitted = Date.now();
+    journal.retain(f.bid, f.stored);
+    const unlink = fs.unlinkSync;
+    const removal = vi.spyOn(fs, "unlinkSync").mockImplementation((name) => {
+      if (path.basename(String(name)).startsWith("bid-")) throw Error("injected prune failure");
+      unlink(name);
+    });
+    expect(() => journal.prune(101 + BID_HISTORY_SLOTS)).toThrow("injected prune failure");
+    removal.mockRestore();
+    vi.advanceTimersByTime(1000);
+    expect(journal.queryExposure(orderId, Date.now())).toMatchObject({coverageComplete: false, commitmentCount: 0});
+    journal.prune(101 + BID_HISTORY_SLOTS);
+    expect(journal.queryExposure(otherId, admitted).coverageComplete).toBe(false);
   });
 
   it("rejects metadata rebinding for a repeated payload or signed root, before and after recovery", () => {
@@ -485,20 +666,21 @@ describe("order exposure receipts", () => {
     expect(recovered.recover(100, new PayloadStore(), new BidStore(), new BidLedger())).toBe(1);
   });
 
-  it.each(["legacy", "unsupported metadata"] as const)(
+  it.each(["legacy", "unsupported metadata", "missing timestamp"] as const)(
     "retains historical reveals but refuses absence after %s recovery",
     (format) => {
+      vi.useFakeTimers();
       const {journal, directory} = setup();
+      const admitted = Date.now();
       const f = fixture();
       journal.retain(f.bid, f.stored);
       const bidName = fs.readdirSync(directory).find((name) => name.startsWith("bid-"));
       if (!bidName) throw Error("Missing committed bid");
       const filename = path.join(directory, bidName);
       const record = JSON.parse(fs.readFileSync(filename, "utf8"));
-      const data =
-        format === "legacy"
-          ? record.data.signedBid
-          : {...record.data, orderMetadata: {version: 99, orderIds: [], doNotOfferBefore: 0}};
+      const data = format === "legacy" ? record.data.signedBid : record.data;
+      if (format === "unsupported metadata") data.orderMetadata = {version: 99, orderIds: [], doNotOfferBefore: 0};
+      if (format === "missing timestamp") delete data.possibleExposureAtUnixMs;
       fs.writeFileSync(
         filename,
         JSON.stringify({data, checksum: createHash("sha256").update(JSON.stringify(data)).digest("hex")})
@@ -514,6 +696,10 @@ describe("order exposure receipts", () => {
       expect(ssz.gloas.ExecutionPayload.serialize(restored.payload.executionPayload)).toEqual(
         ssz.gloas.ExecutionPayload.serialize(f.stored.payload.executionPayload)
       );
+      vi.advanceTimersByTime(1000);
+      recovered.prune(101 + BID_HISTORY_SLOTS);
+      vi.advanceTimersByTime(1000);
+      expect(recovered.queryExposure(otherId, admitted)).toMatchObject({coverageComplete: false, commitmentCount: 0});
     }
   );
 
