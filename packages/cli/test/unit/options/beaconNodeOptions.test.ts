@@ -2,6 +2,7 @@ import os from "node:os";
 import {describe, expect, it} from "vitest";
 import {ArchiveMode, IBeaconNodeOptions} from "@lodestar/beacon-node";
 import {RecursivePartial} from "@lodestar/utils";
+import {options as chainOptions} from "../../../src/options/beaconNodeOptions/chain.js";
 import {BeaconNodeArgs, parseBeaconNodeArgs} from "../../../src/options/beaconNodeOptions/index.js";
 import {
   NetworkArgs,
@@ -11,6 +12,25 @@ import {
 } from "../../../src/options/beaconNodeOptions/network.js";
 
 describe("options / beaconNodeOptions", () => {
+  it("bounds explicit alternate builder identities", () => {
+    const coerce = chainOptions["chain.payloadAttributesAlternateBuilderIndices"].coerce;
+    if (!coerce) throw Error("Expected builder index parser");
+    expect(coerce(["0,7", "12"])).toEqual([0, 7, 12]);
+    expect(coerce([])).toEqual([]);
+    for (const values of [
+      ["0,0"],
+      ["-1"],
+      ["1.1"],
+      [""],
+      ["9007199254740992"],
+      Array.from({length: 17}, (_, i) => String(i)),
+    ]) {
+      expect(() => coerce(values), JSON.stringify(values)).toThrow(
+        "INVALID_PAYLOAD_ATTRIBUTES_ALTERNATE_BUILDER_INDICES"
+      );
+    }
+  });
+
   it("Should parse BeaconNodeArgs", () => {
     // Cast to match the expected fully defined type
     const beaconNodeArgsPartial = {
@@ -50,6 +70,8 @@ describe("options / beaconNodeOptions", () => {
       "chain.archiveMode": ArchiveMode.Frequency,
       emitPayloadAttributes: false,
       "chain.emitPayloadAttributesEarly": true,
+      "chain.emitPayloadAttributesAlternates": true,
+      "chain.payloadAttributesAlternateBuilderIndices": [0, 7],
       graffitiAppend: false,
 
       "execution.urls": ["http://localhost:8551"],
@@ -144,6 +166,8 @@ describe("options / beaconNodeOptions", () => {
         archiveStateEpochFrequency: 1024,
         emitPayloadAttributes: false,
         emitPayloadAttributesEarly: true,
+        emitPayloadAttributesAlternates: true,
+        payloadAttributesAlternateBuilderIndices: [0, 7],
         minSameMessageSignatureSetsToBatch: 32,
         maxShufflingCacheEpochs: 100,
         archiveDataEpochs: 10000,

@@ -27,7 +27,7 @@ import {
   isStatePostFulu,
   isStatePostGloas,
 } from "@lodestar/state-transition";
-import {Bytes32, RootHex, Slot, ValidatorIndex} from "@lodestar/types";
+import {Bytes32, RootHex, SSEPayloadAttributes, Slot, ValidatorIndex} from "@lodestar/types";
 import {Logger, fromHex, isErrorAborted, sleep, toRootHex} from "@lodestar/utils";
 import {GENESIS_SLOT} from "../constants/constants.js";
 import {BuilderStatus} from "../execution/builder/http.js";
@@ -37,6 +37,7 @@ import {ClockEvent} from "../util/clock.js";
 import {isQueueErrorAborted} from "../util/queue/index.js";
 import {ForkchoiceCaller} from "./forkChoice/index.js";
 import {IBeaconChain} from "./interface.js";
+import {PayloadAttributesAlternates} from "./payloadAttributesAlternates.js";
 import {getPayloadAttributesForSSE, prepareExecutionPayload} from "./produceBlock/produceBlockBody.js";
 import {RegenCaller} from "./regen/index.js";
 
@@ -89,6 +90,7 @@ export class PrepareNextSlotScheduler {
   private earlyTrigger: EarlyPayloadAttributesTrigger | null = null;
   private earlyRunning = false;
   private earlyFallbackTimeout: ReturnType<typeof setTimeout> | null = null;
+  private readonly alternates?: PayloadAttributesAlternates;
 
   constructor(
     private readonly chain: IBeaconChain,
@@ -97,6 +99,9 @@ export class PrepareNextSlotScheduler {
     private readonly logger: Logger,
     private readonly signal: AbortSignal
   ) {
+    if (this.chain.opts.emitPayloadAttributes === true && this.chain.opts.emitPayloadAttributesAlternates === true) {
+      this.alternates = new PayloadAttributesAlternates(chain, config, logger, signal);
+    }
     this.chain.clock.on(ClockEvent.slot, this.prepareForNextSlot);
     if (this.chain.opts.emitPayloadAttributes === true && this.chain.opts.emitPayloadAttributesEarly === true) {
       this.chain.clock.on(ClockEvent.slot, this.onEarlyFallbackSlot);
@@ -291,7 +296,7 @@ export class PrepareNextSlotScheduler {
           (feeRecipient || this.chain.opts.emitPayloadAttributes === true) &&
           this.chain.emitter.listenerCount(routes.events.EventType.payloadAttributes)
         ) {
-          payloadAttributes = this.emitPayloadAttributes(fork as ForkPostBellatrix, {
+          const primaryAttributes = this.emitPayloadAttributes(fork as ForkPostBellatrix, {
             prepareSlot,
             parentBlock: updatedHead,
             parentBlockHash,
@@ -300,6 +305,14 @@ export class PrepareNextSlotScheduler {
             finalizedBlockHash,
             feeRecipient,
           });
+          this.alternates?.request({
+            clockSlot,
+            headRoot,
+            primaryParent: updatedHead,
+            primary: primaryAttributes,
+            preparedState,
+          });
+          payloadAttributes = primaryAttributes.payloadAttributes;
         }
 
         if (feeRecipient) {
@@ -459,7 +472,7 @@ export class PrepareNextSlotScheduler {
       finalizedBlockHash: RootHex;
       feeRecipient: string | undefined;
     }
-  ): PayloadAttributes {
+  ): SSEPayloadAttributes {
     const data = getPayloadAttributesForSSE(fork, this.chain, {
       prepareState,
       prepareSlot,
@@ -475,7 +488,7 @@ export class PrepareNextSlotScheduler {
       parentBlockRoot: parentBlock.blockRoot,
       parentBlockHash: toRootHex(parentBlockHash),
     };
-    return data.payloadAttributes;
+    return data;
   }
 
   private onBlockImported = ({slot, block}: routes.events.EventData[routes.events.EventType.block]): void => {
@@ -637,7 +650,7 @@ export class PrepareNextSlotScheduler {
       return;
     }
 
-    this.emitPayloadAttributes(fork, {
+    const primary = this.emitPayloadAttributes(fork, {
       prepareSlot,
       parentBlock: head,
       parentBlockHash,
@@ -649,6 +662,7 @@ export class PrepareNextSlotScheduler {
       finalizedBlockHash: getFinalizedExecutionBlockHash(this.chain.forkChoice),
       feeRecipient: this.chain.beaconProposerCache.get(preparedState.getBeaconProposer(prepareSlot)),
     });
+    this.alternates?.request({clockSlot, headRoot: head.blockRoot, primaryParent: head, primary, preparedState});
     this.logger.verbose("Emitted early payload attributes", {
       prepareSlot,
       parentBlockRoot: head.blockRoot,
