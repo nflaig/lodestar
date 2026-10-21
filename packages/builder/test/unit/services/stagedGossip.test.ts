@@ -575,6 +575,19 @@ describe("staged P2P gossip", () => {
       await building;
       expect(sign).not.toHaveBeenCalled();
       expect(published().map((bid) => bid.message.builderIndex)).toEqual([1, 3]);
+      const skipped = vi
+        .mocked(logger.info)
+        .mock.calls.find(
+          ([message, context]) =>
+            message === "Skipped staged execution payload bid" &&
+            context !== null &&
+            typeof context === "object" &&
+            "builderIndex" in context &&
+            context.builderIndex === 2
+        )?.[1];
+      expect(skipped).toMatchObject({reason: "no_prepared_bid", phase: "after_preparation"});
+      expect(skipped).not.toHaveProperty("computedValueGwei");
+      expect(skipped).not.toHaveProperty("minimumValueGwei");
     });
 
     it.each(["acknowledged", "lost"])("bounds busy retention and never retries its late %s reply", async (reply) => {
