@@ -1595,6 +1595,8 @@ export class Bidder {
               refreshAttempted: boolean;
               refreshTimedOut: boolean;
               refreshMs: number;
+              computedValueGwei?: number;
+              minimumValueGwei?: number;
             }
           ): void =>
             logger.info("Skipped staged execution payload bid", {
@@ -1650,11 +1652,9 @@ export class Bidder {
               minimum - 1,
               undefined,
               undefined,
-              valueWaiters
-                ? (value) => {
-                    belowFloorValue = value;
-                  }
-                : undefined
+              (value) => {
+                belowFloorValue = value;
+              }
             );
             if (!signed && belowFloorValue !== undefined && valueWaiters) {
               if (stage.bidPublisher.hasPendingRevisions(slot)) {
@@ -1726,6 +1726,7 @@ export class Bidder {
               ownsPublication = true;
               stageStarted = performance.now();
               const deferredPayload = stored.payload;
+              belowFloorValue = undefined;
               try {
                 signed = await withTimeout(
                   (prepareSignal = signal) =>
@@ -1740,7 +1741,12 @@ export class Bidder {
                       prepareSignal,
                       true,
                       stage,
-                      minimum - 1
+                      minimum - 1,
+                      undefined,
+                      undefined,
+                      (value) => {
+                        belowFloorValue = value;
+                      }
                     ),
                   budget,
                   signal
@@ -1763,13 +1769,23 @@ export class Bidder {
             if (!signed || signal.aborted || Date.now() >= expires || signed.message.value <= highestAttemptedValue) {
               logSkipped(
                 !signed
-                  ? "no_prepared_bid"
+                  ? belowFloorValue !== undefined
+                    ? "below_gossip_minimum"
+                    : "no_prepared_bid"
                   : signal.aborted
                     ? "aborted"
                     : Date.now() >= expires
                       ? "stage_expired"
                       : "value_not_increased",
-                {initialPrepareMs, refreshAttempted: false, refreshTimedOut: false, refreshMs: 0}
+                {
+                  initialPrepareMs,
+                  refreshAttempted: false,
+                  refreshTimedOut: false,
+                  refreshMs: 0,
+                  ...(belowFloorValue !== undefined
+                    ? {computedValueGwei: belowFloorValue, minimumValueGwei: minimum}
+                    : {}),
+                }
               );
               return;
             }

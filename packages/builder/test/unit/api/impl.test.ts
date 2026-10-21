@@ -399,6 +399,53 @@ describe("builder api", () => {
         status: 202,
       });
     });
+
+    it("fences HTTP and stream offers on FULL, EMPTY and parent branches but keeps old commitments", async () => {
+      const lease = {
+        generation: "0x0",
+        ready: true,
+        validUntil: performance.now() + 10000,
+        validUntilUnixMs: Date.now() + 10000,
+      };
+      bidStore.add(signedBid, {generation: "0x0", lease});
+      const branches = [
+        {parentHash, parentRoot},
+        {parentHash: Buffer.alloc(32, 7), parentRoot},
+        {parentHash: Buffer.alloc(32, 7), parentRoot: Buffer.alloc(32, 8)},
+      ].map((parent, i) => {
+        const bid = structuredClone(signedBid);
+        bid.message.parentBlockHash = parent.parentHash;
+        bid.message.parentBlockRoot = parent.parentRoot;
+        bid.message.blockHash = Buffer.alloc(32, 20 + i);
+        bid.message.value = 10 + i;
+        bidStore.add(bid, {generation: "0x0", lease});
+        return {bid, request: bidRequest(parent)};
+      });
+      const streams = await Promise.all(branches.map(({request}) => streamApi.open(request)));
+      for (const [i, {bid, request}] of branches.entries()) {
+        expect(streams[i].current()).toBe(bid);
+        expect((await builderApi.getExecutionPayloadBid(request)).data).toBe(bid);
+      }
+      lease.generation = "0x1";
+      for (const [i, {bid, request}] of branches.entries()) {
+        expect(streams[i].current()).toBeNull();
+        expect(streams[i].canOffer(bid)).toBe(false);
+        expect((await builderApi.getExecutionPayloadBid(request)).status).toBe(204);
+        expect(bidStore.has(bid)).toBe(true);
+        signedBid = bid;
+        await expect(builderApi.submitSignedBeaconBlock({signedBlock: {data: signBlock()}})).resolves.toEqual({
+          status: 202,
+        });
+      }
+      const replacement = structuredClone(branches[1].bid);
+      replacement.message.blockHash = Buffer.alloc(32, 30);
+      replacement.message.value = 20;
+      bidStore.add(replacement, {generation: "0x1", lease});
+      expect(streams[1].current()).toBe(replacement);
+      expect((await builderApi.getExecutionPayloadBid(branches[1].request)).data).toBe(replacement);
+      expect(streams[0].current()).toBeNull();
+      expect(streams[2].current()).toBeNull();
+    });
   });
 
   describe("getExecutionPayloadBid", () => {

@@ -260,6 +260,33 @@ describe("staged P2P gossip", () => {
     );
   });
 
+  it("reports a late 1.3% improvement below the gossip floor while retaining the higher API bid", async () => {
+    source.getPayload.mockImplementation(async () =>
+      payload(Date.now() >= 10800 ? 2 : 1, Date.now() >= 10800 ? 32_288_889 : 31_862_347)
+    );
+    const second = identity(2);
+    const primary = identity(1, [second.stage]);
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(13300);
+    await building;
+    const offered = published();
+    expect(offered).toHaveLength(1);
+    const latest = primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot));
+    if (!latest) throw Error("Missing higher API bid");
+    expect(latest.message.value).toBeGreaterThan(offered[0].message.value);
+    expect(latest.message.value).toBeLessThan(getMinGossipBidValue(offered[0].message.value));
+    expect(second.ledger.getBidsForSlot(slot)).toHaveLength(0);
+    expect(logger.info).toHaveBeenCalledWith(
+      "Skipped staged execution payload bid",
+      expect.objectContaining({
+        builderIndex: 2,
+        reason: "below_gossip_minimum",
+        computedValueGwei: latest.message.value,
+        minimumValueGwei: getMinGossipBidValue(offered[0].message.value),
+      })
+    );
+  });
+
   it.each([false, true])("skips a pending gossip without deferring it (enabled: %s)", async (enabled) => {
     const transport = defer<Awaited<ReturnType<typeof api.beacon.publishExecutionPayloadBid>>>();
     api.beacon.publishExecutionPayloadBid.mockReturnValueOnce(transport.promise);
