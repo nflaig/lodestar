@@ -32,6 +32,8 @@ import {
   gossipJournalDirectory,
   validateGossipStages,
 } from "./services/gossipStages.js";
+import {OrderExposure} from "./services/orderExposure.js";
+import {isOrderOfferAllowed} from "./services/orderMetadata.js";
 import {PayloadOrchestrator} from "./services/payloadOrchestrator.js";
 import {PayloadSource} from "./services/payloadSource.js";
 import {PayloadStore} from "./services/payloadStore.js";
@@ -114,6 +116,7 @@ export type BuilderOptions = {
  * Main class for the Builder client.
  */
 export class Builder {
+  readonly orderExposure: OrderExposure;
   readonly builderSigner: BuilderSigner;
   readonly proposerPreferencesTracker: ProposerPreferencesTracker;
   readonly builderApi: BuilderApi | null;
@@ -157,6 +160,7 @@ export class Builder {
     preferencesCache,
     gossipIdentities = [],
   }: BuilderModules) {
+    this.orderExposure = new OrderExposure([journal, ...gossipIdentities.map((identity) => identity.journal)]);
     this.builderSigner = builderSigner;
     this.blockObserver = blockObserver;
     this.builderStatusTracker = builderStatusTracker;
@@ -406,6 +410,7 @@ export class Builder {
             ledger: extraLedger,
             builderIndex: identity.index,
             hasPayload: ({blockHash}) => payloadStore.has(blockHash),
+            canSign: ({blockHash}) => isOrderOfferAllowed(payloadStore.get(blockHash)?.payload.orderMetadata),
             retainCommitment: async (bid) => {
               const stored = payloadStore.get(toRootHex(bid.message.blockHash));
               if (!stored) throw Error("COMMITMENT_PAYLOAD_MISSING");
@@ -476,6 +481,7 @@ export class Builder {
             ledger,
             builderIndex: index,
             hasPayload: ({blockHash}) => payloadStore.has(blockHash),
+            canSign: ({blockHash}) => isOrderOfferAllowed(payloadStore.get(blockHash)?.payload.orderMetadata),
             retainCommitment: journal
               ? async (bid) => {
                   if (config.getForkName(bid.message.slot) !== ForkName.gloas)

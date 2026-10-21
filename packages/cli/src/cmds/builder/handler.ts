@@ -324,12 +324,14 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
         port: args["builderApi.port"],
         bidStream: args["builderApi.bidStream"],
         bidStreamAdaptiveTiming: args["builderApi.bidStreamAdaptiveTiming"],
+        orderExposureTokenFile: args["builderApi.orderExposureTokenFile"],
       },
       {
         config,
         logger,
         api: getBuilderApiBeforeInit(config, () => builder?.builderApi ?? null),
         getBidStreamApi: () => builder?.builderBidStreamApi ?? null,
+        getOrderExposure: () => builder?.orderExposure ?? null,
         metrics: null,
       }
     );

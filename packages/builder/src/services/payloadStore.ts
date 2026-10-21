@@ -4,10 +4,12 @@ import {BlobsBundle, ExecutionPayload, Root, RootHex, Slot, gloas, ssz} from "@l
 import {LodestarError} from "@lodestar/utils";
 import {MAX_RETAINED_PAYLOADS, PAYLOAD_RETENTION_SLOTS} from "./commitmentLimits.js";
 import type {OfferEligibility} from "./offerEligibility.js";
+import {type OrderMetadata, isOrderOfferAllowed, parseOrderMetadata, sameOrderMetadata} from "./orderMetadata.js";
 
 // NOTE: BuiltPayload will migrate to payloadSource.ts when the payload source lands; the store
 // holds it here for now.
 export type BuiltPayload = {
+  orderMetadata?: OrderMetadata;
   sourceId: string;
   executionPayload: ExecutionPayload<ForkPostGloas>;
   executionRequests: gloas.ExecutionRequests;
@@ -51,7 +53,14 @@ export class PayloadStore {
   ) {}
 
   add(payload: StoredPayload, admission: "offer" | "recovery" | "alternate" = "offer"): void {
-    if (this.byBlockHash.has(payload.blockHash)) return;
+    const metadata = parseOrderMetadata(payload.payload.orderMetadata);
+    const previous = this.byBlockHash.get(payload.blockHash);
+    if (previous) {
+      if (!sameOrderMetadata(previous.payload.orderMetadata, metadata)) throw Error("ORDER_METADATA_CONFLICT");
+      return;
+    }
+    if (admission !== "recovery" && !isOrderOfferAllowed(metadata)) throw Error("ORDER_OFFER_TOO_EARLY");
+    payload = {...payload, payload: {...payload.payload, orderMetadata: metadata}};
     const {executionPayload, executionRequests, blobsBundle} = payload.payload;
     const existing = this.blobsBySlot.get(payload.slot);
     const added = new Map<string, Sidecar>();
@@ -83,7 +92,8 @@ export class PayloadStore {
       ssz.gloas.ExecutionPayload.value_serializedSize(executionPayload) +
       ssz.gloas.ExecutionRequests.value_serializedSize(executionRequests) +
       ssz.gloas.BlobsBundle.value_serializedSize(blobsBundle) +
-      1024 -
+      1024 +
+      (metadata?.orderIds?.length ?? 0) * 68 -
       blobsBundle.blobs.length * BLOB_BYTES;
     const additionalBytes = bytes + added.size * BLOB_BYTES;
     const slotBytes = this.bytesBySlot.get(payload.slot) ?? 0;

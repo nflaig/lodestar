@@ -4,15 +4,23 @@ import {ssz} from "@lodestar/types";
 import {defer} from "@lodestar/utils";
 import type {DurablePayload, JournalIdentity, RevealRecord} from "./commitmentJournal.js";
 import {CommitmentJournalError} from "./commitmentJournalError.js";
+import type {JournalExposure} from "./orderExposure.js";
 import type {StoredPayload} from "./payloadStore.js";
 
 export type JournalOperation =
   | {kind: "retain"; bid: gloas.SignedExecutionPayloadBid; stored: StoredPayload}
   | {kind: "retainReference"; bid: gloas.SignedExecutionPayloadBid; reference: DurablePayload}
   | {kind: "reveal"; record: RevealRecord}
-  | {kind: "prune"; slot: number};
+  | {kind: "prune"; slot: number}
+  | {kind: "exposure"; orderId: string; admittedAtUnixMs: number};
 export type JournalRequest = {id: number; operation: JournalOperation};
-export type JournalReply = {id: number; error?: string; reference?: DurablePayload};
+export type JournalReply = {
+  id: number;
+  error?: string;
+  reference?: DurablePayload;
+  exposure?: JournalExposure;
+  coverageLost?: boolean;
+};
 export type JournalWorkerData = {directory: string; identity: JournalIdentity; sharedPayloadDirectory?: string};
 export type JournalThread = {
   on(event: "message", listener: (reply: JournalReply) => void): unknown;
@@ -28,7 +36,11 @@ const MAX_PENDING_OPERATIONS = 16;
 const OPERATION_TIMEOUT = 10_000;
 const STARTUP_TIMEOUT = 30_000;
 
-type Pending = JournalRequest & {bytes: number; result: ReturnType<typeof defer<void>>; timedOut?: boolean};
+type Pending = JournalRequest & {
+  bytes: number;
+  result: ReturnType<typeof defer<JournalExposure | undefined>>;
+  timedOut?: boolean;
+};
 
 /** One worker owns journal mutation. Only one request is cloned into it at a
  * time; queued payloads borrow the publisher's immutable retained snapshots.
@@ -41,6 +53,8 @@ export class AsyncCommitmentJournal {
   private pendingOffers = 0;
   private nextId = 1;
   private failure?: Error;
+  private exposureUncertain = false;
+  private readonly sharedRetentions = new Set<Promise<void>>();
   private closing = false;
   private initialized = false;
   private readonly references = new WeakMap<StoredPayload, DurablePayload>();
@@ -76,7 +90,7 @@ export class AsyncCommitmentJournal {
       ssz.gloas.ExecutionRequests.value_serializedSize(stored.payload.executionRequests) +
       ssz.gloas.BlobsBundle.value_serializedSize(stored.payload.blobsBundle) +
       4096;
-    return this.enqueue({kind: "retain", bid, stored}, bytes);
+    return this.enqueue({kind: "retain", bid, stored}, bytes) as Promise<void>;
   }
 
   canRetainAlternate(): boolean {
@@ -84,7 +98,7 @@ export class AsyncCommitmentJournal {
   }
 
   retainReveal(record: RevealRecord): Promise<void> {
-    return this.enqueue({kind: "reveal", record}, 1024);
+    return this.enqueue({kind: "reveal", record}, 1024) as Promise<void>;
   }
 
   getReference(stored: StoredPayload): DurablePayload | undefined {
@@ -92,7 +106,10 @@ export class AsyncCommitmentJournal {
   }
 
   retainReference(bid: gloas.SignedExecutionPayloadBid, reference: DurablePayload): Promise<void> {
-    return this.enqueue({kind: "retainReference", bid, reference}, 4096 + reference.files.length * 512);
+    return this.enqueue(
+      {kind: "retainReference", bid, reference},
+      4096 + reference.files.length * 512
+    ) as Promise<void>;
   }
 
   async retainShared(
@@ -100,27 +117,46 @@ export class AsyncCommitmentJournal {
     stored: StoredPayload,
     reference: DurablePayload | undefined
   ): Promise<"reference" | "snapshot"> {
-    if (reference) {
-      try {
-        await this.retainReference(bid, reference);
-        return "reference";
-      } catch (error) {
-        if (!(error instanceof CommitmentJournalError) || error.message !== "COMMITMENT_REFERENCE_UNAVAILABLE")
-          throw error;
+    const completed = defer<void>();
+    this.sharedRetentions.add(completed.promise);
+    try {
+      if (reference) {
+        try {
+          await this.retainReference(bid, reference);
+          return "reference";
+        } catch (error) {
+          if (!(error instanceof CommitmentJournalError) || error.message !== "COMMITMENT_REFERENCE_UNAVAILABLE")
+            throw error;
+        }
       }
+      await this.retain(bid, stored);
+      return "snapshot";
+    } finally {
+      this.sharedRetentions.delete(completed.promise);
+      completed.resolve();
     }
-    await this.retain(bid, stored);
-    return "snapshot";
   }
 
   prune(slot: number): Promise<void> {
     for (const pending of this.queue) {
       if (pending.operation.kind === "prune") {
         pending.operation.slot = Math.max(pending.operation.slot, slot);
-        return pending.result.promise;
+        return pending.result.promise as Promise<void>;
       }
     }
-    return this.enqueue({kind: "prune", slot}, 0);
+    return this.enqueue({kind: "prune", slot}, 0) as Promise<void>;
+  }
+
+  isHealthy(): boolean {
+    return this.initialized && !this.failure && !this.closing && !this.exposureUncertain;
+  }
+
+  async queryExposure(orderId: string, admittedAtUnixMs: number): Promise<JournalExposure> {
+    // Reference fallback is enqueued after its reply; a queue-only barrier could overtake it.
+    if (this.sharedRetentions.size > 0) await Promise.all(this.sharedRetentions);
+    const result = await this.enqueue({kind: "exposure", orderId, admittedAtUnixMs}, 0);
+    if (!result) throw Error("COMMITMENT_EXPOSURE_RESPONSE");
+    return result;
   }
 
   async close(): Promise<void> {
@@ -132,16 +168,21 @@ export class AsyncCommitmentJournal {
     await this.closed.promise;
   }
 
-  private enqueue(operation: JournalOperation, bytes: number): Promise<void> {
+  private enqueue(operation: JournalOperation, bytes: number): Promise<JournalExposure | undefined> {
     if (this.failure) return Promise.reject(new CommitmentJournalError(this.failure.message, false));
     if (this.closing) return Promise.reject(new CommitmentJournalError("COMMITMENT_WORKER_CLOSED", false));
+    const exposurePending =
+      Number(this.active?.operation.kind === "exposure") +
+      this.queue.filter((pending) => pending.operation.kind === "exposure").length;
+    if (operation.kind === "exposure" && exposurePending > 0)
+      return Promise.reject(new CommitmentJournalError("COMMITMENT_EXPOSURE_BUSY", false));
     if (
-      this.queue.length + Number(this.active !== undefined) >= MAX_PENDING_OPERATIONS ||
+      this.queue.length + Number(this.active !== undefined) - exposurePending >= MAX_PENDING_OPERATIONS ||
       ((operation.kind === "retain" || operation.kind === "retainReference") &&
         (this.pendingOffers >= MAX_PENDING_OFFERS || this.pendingBytes + bytes > MAX_PENDING_BYTES))
     )
       return Promise.reject(new CommitmentJournalError("COMMITMENT_WORKER_CAPACITY", false));
-    const pending = {id: this.nextId++, operation, bytes, result: defer<void>()};
+    const pending = {id: this.nextId++, operation, bytes, result: defer<JournalExposure | undefined>()};
     this.pendingBytes += bytes;
     if (operation.kind === "retain" || operation.kind === "retainReference") this.pendingOffers++;
     if (operation.kind === "reveal") this.queue.unshift(pending);
@@ -164,6 +205,7 @@ export class AsyncCommitmentJournal {
         // The caller stops waiting, but a slow disk can still complete. Keep
         // ownership until the late reply so pending reveals can then proceed.
         this.active.timedOut = true;
+        this.exposureUncertain = true;
         this.active.result.reject(new CommitmentJournalError("COMMITMENT_WORKER_TIMEOUT", true));
       }
     }, OPERATION_TIMEOUT);
@@ -177,6 +219,7 @@ export class AsyncCommitmentJournal {
 
   private onReply(reply: JournalReply): void {
     clearTimeout(this.timer);
+    if (reply.coverageLost) this.exposureUncertain = true;
     if (reply.id === 0) {
       if (this.initialized) this.fail(Error("COMMITMENT_WORKER_RESPONSE"));
       else if (reply.error) this.fail(Error(reply.error));
@@ -195,11 +238,13 @@ export class AsyncCommitmentJournal {
     this.active = undefined;
     this.pendingBytes -= pending.bytes;
     if (pending.operation.kind === "retain" || pending.operation.kind === "retainReference") this.pendingOffers--;
-    if (reply.error) pending.result.reject(new CommitmentJournalError(reply.error, true));
-    else {
+    if (reply.error) {
+      if (reply.error !== "COMMITMENT_REFERENCE_UNAVAILABLE") this.exposureUncertain = true;
+      pending.result.reject(new CommitmentJournalError(reply.error, true));
+    } else {
       if (pending.operation.kind === "retain" && reply.reference)
         this.references.set(pending.operation.stored, reply.reference);
-      pending.result.resolve();
+      pending.result.resolve(reply.exposure);
     }
     this.pump();
   }

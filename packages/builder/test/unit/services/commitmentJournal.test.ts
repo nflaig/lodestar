@@ -770,7 +770,7 @@ describe("CommitmentJournal", () => {
     if (!bidName) throw Error("Missing fixture bid");
     const filename = path.join(directory, bidName);
     const record = JSON.parse(fs.readFileSync(filename, "utf8"));
-    record.data.message.value = "999";
+    record.data.signedBid.message.value = "999";
     fs.writeFileSync(filename, JSON.stringify(record));
     expect(() => recover(directory)).toThrow("COMMITMENT_JOURNAL_CHECKSUM");
   });

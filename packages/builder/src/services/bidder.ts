@@ -23,6 +23,7 @@ import {MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import {GossipStage, getMinGossipBidValue, validateGossipStages} from "./gossipStages.js";
 import {PayloadSourceNotReady, isOfferEligible} from "./offerEligibility.js";
+import {isOrderOfferAllowed, parseOrderMetadata, sameOrderMetadata} from "./orderMetadata.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuildHandle, BuiltPayload, PayloadSourceResources} from "./payloadSource.js";
 import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
@@ -1986,6 +1987,16 @@ export class Bidder {
     if (alternateAdmission && Date.now() >= alternateAdmission.deadline) {
       logger.debug("Skipping alternate parent bid", {...logCtx, reason: "deadline_before_retention"});
       return null;
+    }
+    const metadata = parseOrderMetadata(payload.orderMetadata);
+    const retainedMetadata = this.modules.payloadStore.get(toRootHex(payload.executionPayload.blockHash));
+    if (retainedMetadata && !sameOrderMetadata(retainedMetadata.payload.orderMetadata, metadata))
+      throw Error("ORDER_METADATA_CONFLICT");
+    if (!isOrderOfferAllowed(metadata)) return null;
+    if (metadata) {
+      if (!payload.offerEligibility) throw Error("ORDER_OFFER_LEASE_MISSING");
+      payload.orderMetadata = metadata;
+      payload.offerEligibility.doNotOfferBefore = metadata.doNotOfferBefore;
     }
     if (!isOfferEligible(payload.offerEligibility)) return null;
     if (this.opts.dryRun) {

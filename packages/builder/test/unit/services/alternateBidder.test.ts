@@ -69,7 +69,12 @@ describe("alternate parent bidder", () => {
     vi.useRealTimers();
   });
 
-  function setup(options: Partial<BidderOptions> = {}, stageDeadlines: number[] = [], generations = false) {
+  function setup(
+    options: Partial<BidderOptions> = {},
+    stageDeadlines: number[] = [],
+    generations = false,
+    trackOrders = false
+  ) {
     const api = getApiClientStub();
     api.validator.getProposerDutiesV2.mockResolvedValue(
       mockApiResponse({
@@ -109,6 +114,9 @@ describe("alternate parent bidder", () => {
           blockHash: Buffer.alloc(32, nextId),
         }),
         fork: ForkName.gloas,
+        ...(trackOrders
+          ? {orderMetadata: {version: 1 as const, orderIds: [`0x${"12".repeat(32)}`], doNotOfferBefore: 0}}
+          : {}),
       };
       if (generations) {
         payload.offerEligibility = {
@@ -279,6 +287,34 @@ describe("alternate parent bidder", () => {
   }
 
   describe("alternate gossip", () => {
+    it("refuses tracked metadata without an existing native offer lease", async () => {
+      const m = setup({}, [], false, true);
+      const primary = attributes(4, 5);
+      m.start(primary);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(m.payloadSource.getPayload).toHaveBeenCalled();
+      expect(m.retainCommitment).not.toHaveBeenCalled();
+      expect(m.offer(primary)).toBeNull();
+    });
+
+    it("does not mutate a shared eligibility floor when metadata conflicts", async () => {
+      const m = setup({}, [], true, true);
+      m.start(attributes(4, 5));
+      await vi.advanceTimersByTimeAsync(100);
+      const session = m.sessions.get("1");
+      if (!session?.payload.offerEligibility) throw Error("Missing primary eligibility");
+      const eligibility = session.payload.offerEligibility;
+      expect(m.retainCommitment).toHaveBeenCalled();
+      expect(eligibility.doNotOfferBefore).toBe(0);
+      session.payload.orderMetadata = {
+        version: 1,
+        orderIds: [`0x${"34".repeat(32)}`],
+        doNotOfferBefore: Date.now() + 1000,
+      };
+      await vi.advanceTimersByTimeAsync(100);
+      expect(eligibility.doNotOfferBefore).toBe(0);
+    });
+
     it("keeps deferred primary stages independent of retained alternate gossip", async () => {
       const m = setup({alternateGossip: true, deferUnusedGossipStages: true, primaryHandoff: true}, [9000], true);
       const primary = attributes(4, 5);
@@ -338,10 +374,14 @@ describe("alternate parent bidder", () => {
       return {...m, alternate, signed, eligibility, retained: eligibility.retained, alternateCalls};
     }
 
-    it.each([false, true])(
-      "gossips durable branch tuples only when enabled=%s, without new retention",
-      async (enabled) => {
-        const m = setup({alternateGossip: enabled}, [9500], true);
+    it.each([
+      {enabled: false, trackOrders: false},
+      {enabled: true, trackOrders: false},
+      {enabled: true, trackOrders: true},
+    ])(
+      "gossips durable branch tuples enabled=$enabled, metadata=$trackOrders, without new retention",
+      async ({enabled, trackOrders}) => {
+        const m = setup({alternateGossip: enabled}, [9500], true, trackOrders);
         const contexts = [attributes(4, 5), attributes(4, 6), attributes(3, 6), attributes(3, 7)];
         const sentAt: number[] = [];
         m.api.beacon.publishExecutionPayloadBid.mockImplementation(async (_args, init) => {

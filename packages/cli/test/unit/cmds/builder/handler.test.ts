@@ -60,6 +60,11 @@ describe("cmds / builder / args handler", () => {
     await expect(runBuilderHandler({})).rejects.toThrow("Gloas must be scheduled via GLOAS_FORK_EPOCH");
   });
 
+  it("keeps the private exposure endpoint opt-in and requires the builder API", () => {
+    expect(builderOptions["builderApi.orderExposureTokenFile"].default).toBeUndefined();
+    expect(builderOptions["builderApi.orderExposureTokenFile"].implies).toEqual(["builderApi"]);
+  });
+
   it("keeps adaptive stream timing disabled by default", () => {
     expect(builderOptions["builderApi.bidStreamAdaptiveTiming"].default).toBe(false);
   });

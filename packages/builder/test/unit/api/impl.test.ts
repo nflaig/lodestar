@@ -355,6 +355,32 @@ describe("builder api", () => {
       await expect(streamApi.open(bidRequest({requestAuth}))).rejects.toMatchObject({statusCode});
     });
 
+    it("enforces not-before for HTTP and each stream frame, including a backwards clock", async () => {
+      const now = Date.now();
+      const lease = {
+        generation: "0x0",
+        ready: true,
+        validUntil: performance.now() + 10000,
+        validUntilUnixMs: now + 10000,
+      };
+      bidStore.add(signedBid, {generation: "0x0", lease, doNotOfferBefore: now + 1});
+      const wall = vi.spyOn(Date, "now").mockReturnValue(now);
+      try {
+        const stream = await streamApi.open(bidRequest());
+        expect(stream.current()).toBeNull();
+        expect((await builderApi.getExecutionPayloadBid(bidRequest())).status).toBe(204);
+        wall.mockReturnValue(now + 1);
+        expect(stream.current()).toBe(signedBid);
+        expect((await builderApi.getExecutionPayloadBid(bidRequest())).data).toBe(signedBid);
+        wall.mockReturnValue(now);
+        expect(stream.canOffer(signedBid)).toBe(false);
+        expect((await builderApi.getExecutionPayloadBid(bidRequest())).status).toBe(204);
+        expect(bidStore.has(signedBid)).toBe(true);
+      } finally {
+        wall.mockRestore();
+      }
+    });
+
     it("withdraws future stream offers without losing previously signed reveal obligations", async () => {
       const lease = {
         generation: "0x0",

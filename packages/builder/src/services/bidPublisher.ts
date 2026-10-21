@@ -18,6 +18,7 @@ export type BidPublisherModules = {
   ledger: BidLedger;
   builderIndex: BuilderIndex;
   hasPayload: (identity: BidIdentity) => boolean;
+  canSign?: (identity: BidIdentity) => boolean;
   /** Must finish durable retention before the signature can be exposed. */
   retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => void | Promise<void>;
 };
@@ -137,6 +138,7 @@ export class BidPublisher {
       );
     }
 
+    if (this.modules.canSign?.(identity) === false) throw Error("ORDER_OFFER_TOO_EARLY");
     ledger.assertCanRecordRevision(identity, revisionLimit);
     for (const slot of this.pendingRevisions.keys()) {
       if (slot + BID_HISTORY_SLOTS < bid.slot) this.pendingRevisions.delete(slot);
@@ -148,11 +150,13 @@ export class BidPublisher {
     let persistenceAttempted = false;
     let recorded = false;
     try {
+      if (this.modules.canSign?.(identity) === false) throw Error("ORDER_OFFER_TOO_EARLY");
       const signedExecutionPayloadBid = signer.signExecutionPayloadBid(bid);
       const signedBidRoot = toRootHex(
         sszTypesFor(fork, "SignedExecutionPayloadBid").hashTreeRoot(signedExecutionPayloadBid)
       );
       if (this.modules.retainCommitment) {
+        if (this.modules.canSign?.(identity) === false) throw Error("ORDER_OFFER_TOO_EARLY");
         persistenceAttempted = true;
         await this.modules.retainCommitment(signedExecutionPayloadBid);
       }
@@ -186,6 +190,15 @@ export class BidPublisher {
     const assertEligible = (): void => {
       signal.throwIfAborted();
       if (!isOfferEligible(eligibility)) throw Error("BID_OFFER_INELIGIBLE");
+      if (
+        this.modules.canSign?.({
+          slot: signedExecutionPayloadBid.message.slot,
+          parentBlockHash: toRootHex(signedExecutionPayloadBid.message.parentBlockHash),
+          parentBlockRoot: toRootHex(signedExecutionPayloadBid.message.parentBlockRoot),
+          blockHash: toRootHex(signedExecutionPayloadBid.message.blockHash),
+        }) === false
+      )
+        throw Error("ORDER_OFFER_TOO_EARLY");
       beforeRequest?.();
     };
     assertEligible();
