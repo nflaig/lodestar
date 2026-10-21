@@ -29,6 +29,10 @@ const KEEP_SLOTS = BID_HISTORY_SLOTS;
 const MAX_BYTES = MAX_COMMITMENT_JOURNAL_BYTES;
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
 const MAX_FILES = MAX_COMMITMENT_JOURNAL_FILES;
+// Index the retained bid history within the journal's file quota. The byte budget
+// charges encoded records, not heap usage, and remains independently fail-closed.
+const MAX_EXPOSURE_BYTES = 64 * 1024 * 1024;
+const MAX_EXPOSURE_FILE_BYTES = 32 * 1024;
 const MAX_FORGOTTEN_ORDER_IDS = 8192;
 const recordName = /^(payload|bid|reveal|blob)-(\d+)-(0x[0-9a-f]{64})\.(json|bin)$/;
 const BLOB_BYTES = FIELD_ELEMENTS_PER_BLOB * 32;
@@ -139,7 +143,11 @@ export class CommitmentJournal {
     if (this.bytes > MAX_BYTES || this.sizes.size > MAX_FILES) throw Error("COMMITMENT_JOURNAL_CAPACITY");
     for (const [name, size] of this.sizes) {
       if (name.startsWith("bid-")) {
-        if (size > 32 * 1024 || this.exposure.size >= 8192 || this.exposureBytes + size > 16 * 1024 * 1024) {
+        if (
+          size > MAX_EXPOSURE_FILE_BYTES ||
+          this.exposure.size >= MAX_FILES ||
+          this.exposureBytes + size > MAX_EXPOSURE_BYTES
+        ) {
           this.exposureIncomplete = true;
         } else {
           this.indexExposure(name, this.read(name), size);
@@ -623,7 +631,11 @@ export class CommitmentJournal {
   }
 
   private indexExposure(name: string, data: unknown, bytes: number): void {
-    if (this.exposure.size >= 8192 || this.exposureBytes + bytes > 16 * 1024 * 1024) {
+    if (
+      bytes > MAX_EXPOSURE_FILE_BYTES ||
+      this.exposure.size >= MAX_FILES ||
+      this.exposureBytes + bytes > MAX_EXPOSURE_BYTES
+    ) {
       this.exposureIncomplete = true;
       return;
     }
