@@ -14,7 +14,7 @@ import {
 import {BidLedger} from "../../../src/services/bidLedger.js";
 import {BidStore} from "../../../src/services/bidStore.js";
 import {CommitmentJournal} from "../../../src/services/commitmentJournal.js";
-import {BID_HISTORY_SLOTS} from "../../../src/services/commitmentLimits.js";
+import {BID_HISTORY_SLOTS, MAX_BID_REVISIONS_PER_SLOT} from "../../../src/services/commitmentLimits.js";
 import {OrderExposure, type OrderExposureQuery} from "../../../src/services/orderExposure.js";
 import {parseOrderMetadata} from "../../../src/services/orderMetadata.js";
 import {PayloadStore} from "../../../src/services/payloadStore.js";
@@ -125,6 +125,156 @@ afterEach(() => {
 });
 
 describe("order exposure receipts", () => {
+  it("keeps receipt coverage after restarting with over ten thousand unexpired bid revisions", async () => {
+    vi.useFakeTimers();
+    const {directory, worker: previous} = setup();
+    await previous.close();
+    const count = 10_039;
+    const currentSlot = 100 + BID_HISTORY_SLOTS;
+    let totalBytes = 0;
+    let legacyFilename = "";
+    let legacyData: unknown;
+    for (let i = 0; i < count; i++) {
+      const bid = ssz.gloas.SignedExecutionPayloadBid.defaultValue();
+      bid.message.slot = 100 + Math.floor(i / MAX_BID_REVISIONS_PER_SLOT);
+      bid.message.value = i + 1;
+      bid.message.blobKzgCommitments = Array.from({length: 8}, () => new Uint8Array(48));
+      const signedBid = ssz.gloas.SignedExecutionPayloadBid.toJson(bid);
+      const data = {
+        version: 2,
+        signedBid,
+        orderMetadata: {version: 1, orderIds: [orderId], doNotOfferBefore: 0},
+        possibleExposureAtUnixMs: Date.now(),
+      };
+      const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(bid));
+      const filename = path.join(directory, `bid-${bid.message.slot}-${root}.json`);
+      const text = JSON.stringify({
+        data,
+        checksum: createHash("sha256").update(JSON.stringify(data)).digest("hex"),
+      });
+      fs.writeFileSync(filename, text);
+      totalBytes += Buffer.byteLength(text);
+      legacyFilename = filename;
+      legacyData = signedBid;
+    }
+    expect(totalBytes).toBeGreaterThan(16 * 1024 * 1024);
+    expect(totalBytes).toBeLessThan(64 * 1024 * 1024);
+
+    const recovered = new CommitmentJournal(directory, identity, currentSlot);
+    expect(recovered.recover(currentSlot, new PayloadStore(), new BidStore(), new BidLedger())).toBe(count);
+    expect(recovered.hasExposureCoverage()).toBe(true);
+    const thread = new Thread(recovered);
+    const worker = new AsyncCommitmentJournal(thread);
+    thread.emit("message", {id: 0, coverageLost: !recovered.hasExposureCoverage()});
+    const exposure = new OrderExposure([worker]);
+    expect(exposure.capabilities().ready).toBe(true);
+    const absent = exposure.query(request(exposure, otherId));
+    thread.finish();
+    expect(await absent).toMatchObject({priorCommitmentExposure: "none", coverageComplete: true});
+    const positive = exposure.query(request(exposure));
+    thread.finish();
+    expect(await positive).toMatchObject({
+      priorCommitmentExposure: "possible",
+      coverageComplete: true,
+      commitmentCount: count,
+      truncated: true,
+    });
+
+    const fresh = distinctFixture(1, [otherId], currentSlot);
+    const retained = worker.retain(fresh.bid, fresh.stored);
+    thread.finish();
+    await retained;
+    const offered = exposure.query(request(exposure, otherId));
+    thread.finish();
+    expect(await offered).toMatchObject({priorCommitmentExposure: "possible", commitmentCount: 1});
+    await worker.close();
+
+    fs.writeFileSync(
+      legacyFilename,
+      JSON.stringify({
+        data: legacyData,
+        checksum: createHash("sha256").update(JSON.stringify(legacyData)).digest("hex"),
+      })
+    );
+    const legacy = new CommitmentJournal(directory, identity, currentSlot);
+    expect(legacy.hasExposureCoverage()).toBe(true);
+    expect(legacy.queryExposure(`0x${"56".repeat(32)}`, Date.now())).toMatchObject({
+      coverageComplete: false,
+      commitmentCount: 0,
+    });
+    expect(legacy.queryExposure(orderId, Date.now())).toMatchObject({
+      coverageComplete: false,
+      commitmentCount: count - 1,
+    });
+    const payloads = new PayloadStore();
+    const bids = new BidStore();
+    expect(legacy.recover(currentSlot, payloads, bids, new BidLedger())).toBe(count + 1);
+    expect(bids.has(fresh.bid)).toBe(true);
+    const restored = payloads.get(fresh.stored.blockHash);
+    if (!restored) throw Error("Missing recovered payload");
+    expect(ssz.gloas.ExecutionPayload.serialize(restored.payload.executionPayload)).toEqual(
+      ssz.gloas.ExecutionPayload.serialize(fresh.stored.payload.executionPayload)
+    );
+  });
+
+  it("keeps the 64 MiB exposure budget fail-closed across append, restart and pruning", () => {
+    vi.useFakeTimers();
+    const {directory} = setup();
+    const ids = [orderId, ...Array.from({length: 255}, (_, i) => `0x${i.toString(16).padStart(64, "0")}`)];
+    const maxBytes = 64 * 1024 * 1024;
+    let totalBytes = 0;
+    let count = 0;
+    for (;;) {
+      const bid = ssz.gloas.SignedExecutionPayloadBid.defaultValue();
+      bid.message.slot = 100 + Math.floor(count / MAX_BID_REVISIONS_PER_SLOT);
+      bid.message.value = count + 1;
+      const data = {
+        version: 2,
+        signedBid: ssz.gloas.SignedExecutionPayloadBid.toJson(bid),
+        orderMetadata: {version: 1, orderIds: ids, doNotOfferBefore: 0},
+        possibleExposureAtUnixMs: Date.now(),
+      };
+      const text = JSON.stringify({
+        data,
+        checksum: createHash("sha256").update(JSON.stringify(data)).digest("hex"),
+      });
+      const bytes = Buffer.byteLength(text);
+      expect(bytes, `record ${count}`).toBeLessThan(32 * 1024);
+      if (totalBytes + bytes > maxBytes) break;
+      const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(bid));
+      fs.writeFileSync(path.join(directory, `bid-${bid.message.slot}-${root}.json`), text);
+      totalBytes += bytes;
+      count++;
+    }
+    const currentSlot = 100 + BID_HISTORY_SLOTS;
+    const journal = new CommitmentJournal(directory, identity, currentSlot);
+    expect(journal.hasExposureCoverage()).toBe(true);
+    expect(journal.queryExposure(orderId, Date.now())).toMatchObject({
+      coverageComplete: true,
+      commitmentCount: count,
+    });
+    const overflow = distinctFixture(0, ids, currentSlot);
+    overflow.bid.message.value = Number.MAX_SAFE_INTEGER;
+    journal.retain(overflow.bid, overflow.stored);
+    expect(journal.hasExposureCoverage()).toBe(false);
+    expect(journal.queryExposure(otherId, Date.now()).coverageComplete).toBe(false);
+    const recovered = new CommitmentJournal(directory, identity, currentSlot);
+    expect(recovered.hasExposureCoverage()).toBe(false);
+    expect(recovered.queryExposure(otherId, Date.now()).coverageComplete).toBe(false);
+    recovered.prune(currentSlot + BID_HISTORY_SLOTS + 1);
+    vi.advanceTimersByTime(1000);
+    for (const instance of [journal, recovered]) {
+      expect(instance.hasExposureCoverage()).toBe(false);
+      expect(instance.queryExposure(otherId, Date.now()).coverageComplete).toBe(false);
+    }
+    const fresh = distinctFixture(1, [otherId], currentSlot + BID_HISTORY_SLOTS + 1);
+    recovered.retain(fresh.bid, fresh.stored);
+    expect(recovered.queryExposure(otherId, Date.now())).toMatchObject({
+      coverageComplete: false,
+      commitmentCount: 1,
+    });
+  });
+
   it("waits for primary and staged durable writes, including shared payload references", async () => {
     const primary = setup();
     const staged = setup(primary.directory);
