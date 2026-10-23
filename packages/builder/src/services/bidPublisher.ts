@@ -10,6 +10,7 @@ import type {BuilderSigner} from "./builderSigner.js";
 import {CommitmentJournalError} from "./commitmentJournalError.js";
 import {BID_HISTORY_SLOTS, MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 import {type OfferEligibility, isOfferEligible} from "./offerEligibility.js";
+import type {StoredPayload} from "./payloadStore.js";
 
 export type BidPublisherModules = {
   api: ApiClient;
@@ -18,9 +19,9 @@ export type BidPublisherModules = {
   ledger: BidLedger;
   builderIndex: BuilderIndex;
   hasPayload: (identity: BidIdentity) => boolean;
-  canSign?: (identity: BidIdentity) => boolean;
+  canSign?: (identity: BidIdentity, offered?: StoredPayload) => boolean;
   /** Must finish durable retention before the signature can be exposed. */
-  retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => void | Promise<void>;
+  retainCommitment?: (bid: gloas.SignedExecutionPayloadBid, offered?: StoredPayload) => void | Promise<void>;
 };
 
 export enum BidPublisherErrorCode {
@@ -105,7 +106,8 @@ export class BidPublisher {
   /** Sign a retained payload and journal the commitment before the API can expose it. */
   async prepare(
     bid: gloas.ExecutionPayloadBid,
-    revisionLimit = MAX_BID_REVISIONS_PER_SLOT
+    revisionLimit = MAX_BID_REVISIONS_PER_SLOT,
+    offered?: StoredPayload
   ): Promise<gloas.SignedExecutionPayloadBid> {
     if (!Number.isSafeInteger(revisionLimit) || revisionLimit < 1 || revisionLimit > MAX_BID_REVISIONS_PER_SLOT)
       throw new RangeError("Invalid bid revision limit");
@@ -138,7 +140,7 @@ export class BidPublisher {
       );
     }
 
-    if (this.modules.canSign?.(identity) === false) throw Error("ORDER_OFFER_TOO_EARLY");
+    if (this.modules.canSign?.(identity, offered) === false) throw Error("ORDER_OFFER_TOO_EARLY");
     ledger.assertCanRecordRevision(identity, revisionLimit);
     for (const slot of this.pendingRevisions.keys()) {
       if (slot + BID_HISTORY_SLOTS < bid.slot) this.pendingRevisions.delete(slot);
@@ -150,15 +152,15 @@ export class BidPublisher {
     let persistenceAttempted = false;
     let recorded = false;
     try {
-      if (this.modules.canSign?.(identity) === false) throw Error("ORDER_OFFER_TOO_EARLY");
+      if (this.modules.canSign?.(identity, offered) === false) throw Error("ORDER_OFFER_TOO_EARLY");
       const signedExecutionPayloadBid = signer.signExecutionPayloadBid(bid);
       const signedBidRoot = toRootHex(
         sszTypesFor(fork, "SignedExecutionPayloadBid").hashTreeRoot(signedExecutionPayloadBid)
       );
       if (this.modules.retainCommitment) {
-        if (this.modules.canSign?.(identity) === false) throw Error("ORDER_OFFER_TOO_EARLY");
+        if (this.modules.canSign?.(identity, offered) === false) throw Error("ORDER_OFFER_TOO_EARLY");
         persistenceAttempted = true;
-        await this.modules.retainCommitment(signedExecutionPayloadBid);
+        await this.modules.retainCommitment(signedExecutionPayloadBid, offered);
       }
       if (!hasPayload(identity))
         throw new BidPublisherError({code: BidPublisherErrorCode.PAYLOAD_NOT_RETAINED, ...identity});

@@ -4,7 +4,7 @@ import {BlobsBundle, ExecutionPayload, Root, RootHex, Slot, gloas, ssz} from "@l
 import {LodestarError} from "@lodestar/utils";
 import {MAX_RETAINED_PAYLOADS, PAYLOAD_RETENTION_SLOTS} from "./commitmentLimits.js";
 import type {OfferEligibility} from "./offerEligibility.js";
-import {type OrderMetadata, isOrderOfferAllowed, parseOrderMetadata, sameOrderMetadata} from "./orderMetadata.js";
+import {type OrderMetadata, isOrderOfferAllowed, parseOrderMetadata} from "./orderMetadata.js";
 
 // NOTE: BuiltPayload will migrate to payloadSource.ts when the payload source lands; the store
 // holds it here for now.
@@ -52,15 +52,35 @@ export class PayloadStore {
     private readonly maxPayloads = MAX_RETAINED_PAYLOADS
   ) {}
 
-  add(payload: StoredPayload, admission: "offer" | "recovery" | "alternate" = "offer"): void {
+  add(payload: StoredPayload, admission: "offer" | "recovery" | "alternate" = "offer"): StoredPayload {
     const metadata = parseOrderMetadata(payload.payload.orderMetadata);
+    if (admission !== "recovery" && !isOrderOfferAllowed(metadata)) throw Error("ORDER_OFFER_TOO_EARLY");
     const previous = this.byBlockHash.get(payload.blockHash);
     if (previous) {
-      if (!sameOrderMetadata(previous.payload.orderMetadata, metadata)) throw Error("ORDER_METADATA_CONFLICT");
-      return;
+      if (
+        previous.slot !== payload.slot ||
+        !ssz.Root.equals(previous.parentBlockRoot, payload.parentBlockRoot) ||
+        (previous.payload.executionPayload !== payload.payload.executionPayload &&
+          !ssz.gloas.ExecutionPayload.equals(previous.payload.executionPayload, payload.payload.executionPayload)) ||
+        (previous.payload.executionRequests !== payload.payload.executionRequests &&
+          !ssz.gloas.ExecutionRequests.equals(previous.payload.executionRequests, payload.payload.executionRequests)) ||
+        (previous.payload.blobsBundle !== payload.payload.blobsBundle &&
+          !ssz.gloas.BlobsBundle.equals(previous.payload.blobsBundle, payload.payload.blobsBundle))
+      )
+        throw Error("PAYLOAD_STORE_BODY_CONFLICT");
+      // Attribution belongs to this admission, while the original reveal body stays immutable.
+      return {
+        ...payload,
+        payload: {
+          ...payload.payload,
+          orderMetadata: metadata,
+          executionPayload: previous.payload.executionPayload,
+          executionRequests: previous.payload.executionRequests,
+          blobsBundle: previous.payload.blobsBundle,
+        },
+      };
     }
-    if (admission !== "recovery" && !isOrderOfferAllowed(metadata)) throw Error("ORDER_OFFER_TOO_EARLY");
-    payload = {...payload, payload: {...payload.payload, orderMetadata: metadata}};
+    if (metadata !== undefined) payload = {...payload, payload: {...payload.payload, orderMetadata: metadata}};
     const {executionPayload, executionRequests, blobsBundle} = payload.payload;
     const existing = this.blobsBySlot.get(payload.slot);
     const added = new Map<string, Sidecar>();
@@ -128,6 +148,7 @@ export class PayloadStore {
     this.sizes.set(payload.blockHash, bytes);
     this.retainedBytes += additionalBytes;
     this.bytesBySlot.set(payload.slot, slotBytes + additionalBytes);
+    return payload;
   }
 
   get(blockHash: RootHex): StoredPayload | null {
