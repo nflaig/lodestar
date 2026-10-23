@@ -243,8 +243,11 @@ export class AsyncCommitmentJournal {
     this.pendingBytes -= pending.bytes;
     if (pending.operation.kind === "retain" || pending.operation.kind === "retainReference") this.pendingOffers--;
     if (reply.error) {
-      if (reply.error !== "COMMITMENT_REFERENCE_UNAVAILABLE") this.exposureUncertain = true;
-      pending.result.reject(new CommitmentJournalError(reply.error, true));
+      // This refusal is checked before any journal write/link, including after
+      // recovery. It cannot make an earlier exposure uncertain.
+      const admissionRefused = reply.error === "COMMITMENT_SLOT_ADMISSION_LIMIT";
+      if (!admissionRefused && reply.error !== "COMMITMENT_REFERENCE_UNAVAILABLE") this.exposureUncertain = true;
+      pending.result.reject(new CommitmentJournalError(reply.error, !admissionRefused));
     } else {
       if (pending.operation.kind === "retain" && reply.reference)
         this.references.set(pending.operation.stored.payload.executionPayload, reply.reference);

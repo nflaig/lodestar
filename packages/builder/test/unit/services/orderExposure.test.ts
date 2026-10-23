@@ -766,6 +766,38 @@ describe("order exposure receipts", () => {
     expect(restored.queryExposure(firstId, Date.now()).commitmentCount).toBe(1);
   });
 
+  it("keeps async exposure healthy after a recovered admission cap rejects before any write", async () => {
+    const primary = setup();
+    for (let i = 0; i < MAX_BID_REVISIONS_PER_SLOT; i++) {
+      const f = fixture(0, [`0x${i.toString(16).padStart(64, "0")}`]);
+      primary.journal.retain(f.bid, f.stored);
+    }
+    const restored = new CommitmentJournal(primary.directory, identity);
+    const thread = new Thread(restored);
+    const worker = new AsyncCommitmentJournal(thread);
+    thread.emit("message", {id: 0});
+    const names = fs.readdirSync(primary.directory).sort();
+    const fresh = distinctFixture(1234, [otherId]);
+    const refused = worker.retain(fresh.bid, fresh.stored);
+    thread.finish();
+    await expect(refused).rejects.toMatchObject({message: "COMMITMENT_SLOT_ADMISSION_LIMIT", uncertain: false});
+    expect(worker.isHealthy()).toBe(true);
+    expect(fs.readdirSync(primary.directory).sort()).toEqual(names);
+    const original = fixture(0, [`0x${"00".repeat(32)}`]);
+    const retry = worker.retain(original.bid, original.stored);
+    thread.finish();
+    await retry;
+    const next = distinctFixture(1235, [otherId], 101);
+    const admitted = worker.retain(next.bid, next.stored);
+    thread.finish();
+    await admitted;
+    const exposure = worker.queryExposure(otherId, Date.now());
+    thread.finish();
+    expect(await exposure).toMatchObject({coverageComplete: true, commitmentCount: 1});
+    expect(worker.isHealthy()).toBe(true);
+    await worker.close();
+  });
+
   it("returns unknown on a bounded wait, then preserves a late durable positive", async () => {
     vi.useFakeTimers();
     const primary = setup();

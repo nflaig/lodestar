@@ -7,6 +7,7 @@ import {RootHex, gloas, ssz} from "@lodestar/types";
 import {fromHex, toHex, toRootHex} from "@lodestar/utils";
 import {BidLedger} from "./bidLedger.js";
 import {BidStore} from "./bidStore.js";
+import {CommitmentJournalError} from "./commitmentJournalError.js";
 import {
   BID_HISTORY_SLOTS,
   MAX_BID_REVISIONS_PER_SLOT,
@@ -192,6 +193,7 @@ export class CommitmentJournal {
     const executionRequestsRoot = toRootHex(ssz.gloas.ExecutionRequests.hashTreeRoot(payload.executionRequests));
     if (executionRequestsRoot !== toRootHex(signedBid.message.executionRequestsRoot))
       throw Error("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
+    this.assertAdmissionCapacity(signedBid, orderMetadata);
     const payloadName = `payload-${slot}-${blockHash}.json`;
     let payloadRecord: PayloadRecord | undefined;
     if (!this.sizes.has(payloadName)) {
@@ -333,6 +335,7 @@ export class CommitmentJournal {
       )
         throw Error("COMMITMENT_PAYLOAD_REFERENCE");
     }
+    this.assertAdmissionCapacity(signedBid, orderMetadata);
     // Blobs must be durable before linking their payload, including orphan payloads recovered after
     // a crash. A partial group also needs a barrier before an unavailable source can fall back.
     for (const filesToLink of this.sizes.has(files[0].name) ? [] : [files.slice(1), [files[0]]]) {
@@ -624,7 +627,7 @@ export class CommitmentJournal {
       }
     }
     const count = this.admissionsBySlot.get(signed.message.slot) ?? 0;
-    if (count >= MAX_BID_REVISIONS_PER_SLOT) throw Error("COMMITMENT_SLOT_ADMISSION_LIMIT");
+    this.assertAdmissionCapacity(signed, metadata);
     // The original signature's attribution and exposure time are never rewritten.
     // A fresh authorization for identical signed bytes is a separate admission.
     const data = {
@@ -636,6 +639,25 @@ export class CommitmentJournal {
     this.write(name, data);
     this.admissionsBySlot.set(signed.message.slot, count + 1);
     this.indexExposure(name, data, this.sizes.get(name) ?? 0);
+  }
+
+  /** A definite refusal before any payload, blob, link or bid write. Exact durable
+   * retries remain allowed; all journal mutations run serially on one owner. */
+  private assertAdmissionCapacity(signed: gloas.SignedExecutionPayloadBid, metadata: OrderMetadata | undefined): void {
+    if ((this.admissionsBySlot.get(signed.message.slot) ?? 0) < MAX_BID_REVISIONS_PER_SLOT) return;
+    const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signed));
+    const original = `bid-${signed.message.slot}-${root}.json`;
+    if (this.sizes.has(original)) {
+      if (sameOrderMetadata(decodeBidRecord(this.read(original)).metadata, metadata)) return;
+      const name = bidRecordName({signed, metadata, version: 3});
+      if (this.sizes.has(name)) {
+        const prior = decodeBidRecord(this.read(name));
+        if (bidRecordName(prior) !== name || !sameOrderMetadata(prior.metadata, metadata))
+          throw Error("ORDER_METADATA_CONFLICT");
+        return;
+      }
+    }
+    throw new CommitmentJournalError("COMMITMENT_SLOT_ADMISSION_LIMIT", false);
   }
 
   private checkExposureClock(): number {

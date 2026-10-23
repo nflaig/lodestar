@@ -24,7 +24,10 @@ export class BidStore {
     const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid));
     const copiedMetadata = parseOrderMetadata(metadata);
     this.revisions.set(root, signedBid);
-    this.offerMetadata.set(root, copiedMetadata);
+    const previousEligibility = this.eligibility.get(root);
+    // An unqualified add must not mix new metadata with an existing live lease.
+    if (eligibility !== undefined || !previousEligibility || previousEligibility.generation === "recovered")
+      this.offerMetadata.set(root, copiedMetadata);
     if (eligibility !== undefined)
       this.eligibility.set(root, eligibility === "recovery" ? recoveredOfferEligibility() : eligibility);
     else if (this.eligibility.get(root)?.generation === "recovered")

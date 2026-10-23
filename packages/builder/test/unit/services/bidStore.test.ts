@@ -44,6 +44,17 @@ describe("BidStore", () => {
     expect(store.getOfferOrderMetadata(bid)?.orderIds).toBeNull();
   });
 
+  it("keeps membership paired with its existing lease on an unqualified duplicate", () => {
+    const store = new BidStore();
+    const bid = signedBid(5);
+    const lease = {generation: "0x1", ready: true, validUntil: Infinity, validUntilUnixMs: Infinity};
+    const id = `0x${"22".repeat(32)}`;
+    store.add(bid, {generation: "0x1", lease}, {version: 1, orderIds: [id], doNotOfferBefore: 0});
+    store.add(bid);
+    expect(store.getOfferOrderMetadata(bid)?.orderIds).toEqual([id]);
+    expect(store.getOfferEligibility(bid)?.lease).toBe(lease);
+  });
+
   it("validates admission metadata before changing the store", () => {
     const store = new BidStore();
     const bid = signedBid(5);

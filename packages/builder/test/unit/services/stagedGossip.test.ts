@@ -198,6 +198,7 @@ describe("staged P2P gossip", () => {
     expect(published().map((bid) => bid.message.builderIndex)).toEqual([index]);
     expect(stage.journal?.queryExposure(oldId, Date.now()).commitmentCount).toBe(0);
     expect(stage.journal?.queryExposure(newId, Date.now()).commitmentCount).toBe(1);
+    expect(stage.bidStore.getOfferEligibility(published()[0])?.generation).toBe("0x1");
     expect(primary.journal?.queryExposure(oldId, Date.now()).commitmentCount).toBe(1);
     expect(payloadStore.size).toBe(1);
     expect(payloadStore.get(toRootHex(published()[0].message.blockHash))?.payload.orderMetadata?.orderIds).toEqual([

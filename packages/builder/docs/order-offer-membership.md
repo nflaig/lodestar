@@ -26,7 +26,9 @@ refer to admissions, which can share a signed root. A publisher bounds preparati
 at 256 per slot even for repeated signed bytes, and the journal separately bounds
 distinct durable admissions at 256 per slot across restarts. Exact journal retries
 remain idempotent; a recovered journal at its cap rejects a new admission before
-exposure, even if the caller has already computed its signature.
+exposure, even if the caller has already computed its signature. The cap check
+runs before payload/blob writes or reference links. Its definite refusal keeps
+async exposure health intact, and following slots remain usable.
 
 Recovery reads legacy bare signed records and v2 records, and validates v3 record
 names against their exact membership. Unknown future versions are rejected.
