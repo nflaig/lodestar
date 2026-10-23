@@ -71,6 +71,41 @@ describe("BidPublisher", () => {
     await Promise.all([one, two]);
   });
 
+  it("requires context before signing on production publishers and forwards it through publish", async () => {
+    const retain = vi.fn();
+    const {publisher, signer} = createPublisher({
+      hasPayload: () => true,
+      retainCommitment: retain,
+      requireOfferContext: true,
+    });
+    const sign = vi.spyOn(signer, "signExecutionPayloadBid");
+    await expect(publisher.prepare(createBid())).rejects.toThrow("COMMITMENT_OFFER_MISSING");
+    await expect(publisher.publish(createBid(), new AbortController().signal)).rejects.toThrow(
+      "COMMITMENT_OFFER_MISSING"
+    );
+    expect(sign).not.toHaveBeenCalled();
+    expect(retain).not.toHaveBeenCalled();
+    const payload = mockBuiltPayload();
+    const offered = {
+      slot: 10,
+      parentBlockRoot: Buffer.alloc(32),
+      blockHash: toRootHex(payload.executionPayload.blockHash),
+      payload,
+    };
+    await publisher.publish(createBid(), new AbortController().signal, undefined, offered);
+    expect(retain.mock.calls[0][1]).toBe(offered);
+  });
+
+  it("bounds repeated same-signature admissions independently of ledger deduplication", async () => {
+    const {publisher, ledger, signer} = createPublisher({hasPayload: () => true});
+    const sign = vi.spyOn(signer, "signExecutionPayloadBid");
+    const bid = createBid();
+    for (let i = 0; i < 4; i++) await publisher.prepare(bid, 4);
+    expect(ledger.getRevisionCount(bid.slot)).toBe(1);
+    await expect(publisher.prepare(bid, 4)).rejects.toMatchObject({type: {code: BidLedgerErrorCode.REVISION_LIMIT}});
+    expect(sign).toHaveBeenCalledTimes(4);
+  });
+
   it("reserves primary revision headroom across pending and uncertain alternate writes", async () => {
     const disk = defer<void>();
     const retainCommitment = vi.fn(() => disk.promise);
@@ -406,10 +441,12 @@ function createPublisher({
   fork = ForkName.gloas,
   retainCommitment,
   canSign,
+  requireOfferContext,
 }: {
   hasPayload: (identity: BidIdentity) => boolean;
   canSign?: ConstructorParameters<typeof BidPublisher>[0]["canSign"];
   fork?: ForkName;
+  requireOfferContext?: boolean;
   retainCommitment?: ConstructorParameters<typeof BidPublisher>[0]["retainCommitment"];
 }) {
   const config = createBeaconConfig(getConfig(fork), Buffer.alloc(32, 9));
@@ -428,6 +465,7 @@ function createPublisher({
     hasPayload,
     retainCommitment,
     canSign,
+    requireOfferContext,
   });
   return {api, config, keys, ledger, publisher, signer};
 }

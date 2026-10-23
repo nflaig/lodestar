@@ -9,6 +9,7 @@ import {BidLedger} from "./bidLedger.js";
 import {BidStore} from "./bidStore.js";
 import {
   BID_HISTORY_SLOTS,
+  MAX_BID_REVISIONS_PER_SLOT,
   MAX_COMMITMENT_JOURNAL_BYTES,
   MAX_COMMITMENT_JOURNAL_FILES,
   MAX_REVEAL_RECORD_BYTES,
@@ -75,6 +76,7 @@ export type DurablePayload = {
  * consumes their gossip allowance. This covers selection events missed offline. */
 export class CommitmentJournal {
   private readonly sizes = new Map<string, number>();
+  private readonly admissionsBySlot = new Map<number, number>();
   private bytes = 0;
   private revealBytes = 0;
   private revealFiles = 0;
@@ -113,6 +115,10 @@ export class CommitmentJournal {
         throw Error("COMMITMENT_JOURNAL_INVALID_FILE");
       this.sizes.set(name, info.size);
       this.bytes += info.size;
+      if (match?.[1] === "bid") {
+        const slot = Number(match[2]);
+        this.admissionsBySlot.set(slot, (this.admissionsBySlot.get(slot) ?? 0) + 1);
+      }
       if (match?.[1] === "reveal") {
         this.revealBytes += info.size;
         this.revealFiles++;
@@ -501,7 +507,7 @@ export class CommitmentJournal {
           toRootHex(bid.executionRequestsRoot)
         )
           throw Error("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
-        bids.add(signed, "recovery");
+        bids.add(signed, "recovery", decoded.metadata);
       }
       recovered++;
     }
@@ -556,6 +562,12 @@ export class CommitmentJournal {
         this.revealFiles--;
       }
       this.sizes.delete(name);
+      if (match[1] === "bid") {
+        const slot = Number(match[2]);
+        const remaining = (this.admissionsBySlot.get(slot) ?? 1) - 1;
+        if (remaining > 0) this.admissionsBySlot.set(slot, remaining);
+        else this.admissionsBySlot.delete(slot);
+      }
       this.references.delete(name);
     }
     // Unsynced deletion can only restore expired records after a crash. Recovery
@@ -611,6 +623,8 @@ export class CommitmentJournal {
         return;
       }
     }
+    const count = this.admissionsBySlot.get(signed.message.slot) ?? 0;
+    if (count >= MAX_BID_REVISIONS_PER_SLOT) throw Error("COMMITMENT_SLOT_ADMISSION_LIMIT");
     // The original signature's attribution and exposure time are never rewritten.
     // A fresh authorization for identical signed bytes is a separate admission.
     const data = {
@@ -620,6 +634,7 @@ export class CommitmentJournal {
       possibleExposureAtUnixMs: Date.now(),
     };
     this.write(name, data);
+    this.admissionsBySlot.set(signed.message.slot, count + 1);
     this.indexExposure(name, data, this.sizes.get(name) ?? 0);
   }
 

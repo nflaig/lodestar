@@ -16,6 +16,43 @@ function signedBid(slot: number, parentHash = parentBlockHash) {
 }
 
 describe("BidStore", () => {
+  it("copies current admission membership without mutating an earlier owner's wrapper", () => {
+    const store = new BidStore();
+    const bid = signedBid(5);
+    const oldId = `0x${"11".repeat(32)}`;
+    const newId = `0x${"22".repeat(32)}`;
+    const oldIds = [oldId];
+    store.add(bid, undefined, {version: 1, orderIds: oldIds, doNotOfferBefore: 0});
+    const previous = store.getOfferOrderMetadata(bid);
+    oldIds[0] = newId;
+    expect(previous?.orderIds).toEqual([oldId]);
+    expect(Object.isFrozen(previous?.orderIds)).toBe(true);
+    store.add(bid, undefined, {version: 1, orderIds: [newId], doNotOfferBefore: 0});
+    expect(store.getOfferOrderMetadata(bid)?.orderIds).toEqual([newId]);
+    expect(previous?.orderIds).toEqual([oldId]);
+    store.prune(8);
+    expect(store.getOfferOrderMetadata(bid)).toBeUndefined();
+  });
+
+  it("does not borrow earlier membership for an unknown current admission", () => {
+    const store = new BidStore();
+    const bid = signedBid(5);
+    store.add(bid, undefined, {version: 1, orderIds: [`0x${"11".repeat(32)}`], doNotOfferBefore: 0});
+    store.add(bid);
+    expect(store.getOfferOrderMetadata(bid)).toBeUndefined();
+    store.add(bid, undefined, {version: 1, orderIds: null, doNotOfferBefore: 0});
+    expect(store.getOfferOrderMetadata(bid)?.orderIds).toBeNull();
+  });
+
+  it("validates admission metadata before changing the store", () => {
+    const store = new BidStore();
+    const bid = signedBid(5);
+    expect(() => store.add(bid, undefined, {version: 1, orderIds: ["bad"], doNotOfferBefore: 0})).toThrow(
+      "ORDER_METADATA_INVALID"
+    );
+    expect(store.has(bid)).toBe(false);
+    expect(store.get(5, toRootHex(parentBlockHash), toRootHex(parentBlockRoot))).toBeNull();
+  });
   it("returns the bid of a slot and parent", () => {
     const store = new BidStore();
     const bid = signedBid(5);

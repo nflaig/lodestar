@@ -744,6 +744,28 @@ describe("order exposure receipts", () => {
     }
   });
 
+  it("bounds all same-signature admission files per slot across restart and keeps old reveals", () => {
+    const {journal, directory} = setup();
+    const f = fixture();
+    for (let i = 0; i < MAX_BID_REVISIONS_PER_SLOT; i++) {
+      const current = fixture(0, [`0x${i.toString(16).padStart(64, "0")}`]);
+      journal.retain(current.bid, current.stored);
+    }
+    const next = fixture(0, [otherId]);
+    expect(() => journal.retain(next.bid, next.stored)).toThrow("COMMITMENT_SLOT_ADMISSION_LIMIT");
+    const restored = new CommitmentJournal(directory, identity);
+    expect(() => restored.retain(next.bid, next.stored)).toThrow("COMMITMENT_SLOT_ADMISSION_LIMIT");
+    const firstId = `0x${"00".repeat(32)}`;
+    const first = fixture(0, [firstId]);
+    expect(() => restored.retain(first.bid, first.stored)).not.toThrow();
+    const payloads = new PayloadStore();
+    const ledger = new BidLedger();
+    expect(restored.recover(100, payloads, new BidStore(), ledger)).toBe(MAX_BID_REVISIONS_PER_SLOT);
+    expect(ledger.getRevisionCount(100)).toBe(1);
+    expect(payloads.has(f.stored.blockHash)).toBe(true);
+    expect(restored.queryExposure(firstId, Date.now()).commitmentCount).toBe(1);
+  });
+
   it("returns unknown on a bounded wait, then preserves a late durable positive", async () => {
     vi.useFakeTimers();
     const primary = setup();

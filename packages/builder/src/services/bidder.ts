@@ -1392,7 +1392,7 @@ export class Bidder {
                 isOfferEligible(payload.offerEligibility) &&
                 !isOfferEligible(this.modules.bidStore.getOfferEligibility(retained.signed))
               )
-                this.modules.bidStore.add(retained.signed, payload.offerEligibility);
+                this.modules.bidStore.add(retained.signed, payload.offerEligibility, payload.orderMetadata);
               this.gossipRetainedAlternate(retained);
               if (
                 signed &&
@@ -1641,6 +1641,7 @@ export class Bidder {
                 fork: ForkName.gloas,
                 // The same immutable hash can be re-admitted in a new order
                 // generation. Its durable snapshot may carry an older lease.
+                orderMetadata: this.modules.bidStore.getOfferOrderMetadata(initialBest),
                 offerEligibility: this.modules.bidStore.getOfferEligibility(initialBest),
               },
               data,
@@ -1733,6 +1734,7 @@ export class Bidder {
                       {
                         ...deferredPayload,
                         fork: ForkName.gloas,
+                        orderMetadata: this.modules.bidStore.getOfferOrderMetadata(initialBest),
                         offerEligibility: this.modules.bidStore.getOfferEligibility(initialBest),
                       },
                       data,
@@ -1816,6 +1818,7 @@ export class Bidder {
                         {
                           ...refreshedPayload.payload,
                           fork: ForkName.gloas,
+                          orderMetadata: this.modules.bidStore.getOfferOrderMetadata(refreshBest),
                           offerEligibility: this.modules.bidStore.getOfferEligibility(refreshBest),
                         },
                         data,
@@ -2093,7 +2096,11 @@ export class Bidder {
     // or arrives after cancellation. Reveal ownership does not expire with offers.
     const deadlineExpired = alternateAdmission !== undefined && Date.now() >= alternateAdmission.deadline;
     const alternateExpired = alternateAdmission && (signal.aborted || deadlineExpired);
-    bidStore.add(signedBid, alternateExpired || (onDurable && signal.aborted) ? "recovery" : payload.offerEligibility);
+    bidStore.add(
+      signedBid,
+      alternateExpired || (onDurable && signal.aborted) ? "recovery" : payload.offerEligibility,
+      metadata
+    );
     onDurable?.(signedBid);
     if (alternateExpired) {
       logger.debug("Skipping alternate parent bid", {

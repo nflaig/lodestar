@@ -410,11 +410,12 @@ export class Builder {
             ledger: extraLedger,
             builderIndex: identity.index,
             hasPayload: ({blockHash}) => payloadStore.has(blockHash),
+            requireOfferContext: true,
             canSign: ({blockHash}, offered) =>
               isOrderOfferAllowed((offered ?? payloadStore.get(blockHash))?.payload.orderMetadata),
             retainCommitment: async (bid, offered) => {
-              const stored = offered ?? payloadStore.get(toRootHex(bid.message.blockHash));
-              if (!stored) throw Error("COMMITMENT_PAYLOAD_MISSING");
+              const stored = offered;
+              if (!stored) throw Error("COMMITMENT_OFFER_MISSING");
               const started = performance.now();
               const reference = journal?.getReference(stored);
               const retentionMode = await extraJournal.retainShared(bid, stored, reference);
@@ -482,14 +483,15 @@ export class Builder {
             ledger,
             builderIndex: index,
             hasPayload: ({blockHash}) => payloadStore.has(blockHash),
+            requireOfferContext: true,
             canSign: ({blockHash}, offered) =>
               isOrderOfferAllowed((offered ?? payloadStore.get(blockHash))?.payload.orderMetadata),
             retainCommitment: journal
               ? async (bid, offered) => {
                   if (config.getForkName(bid.message.slot) !== ForkName.gloas)
                     throw Error("COMMITMENT_UNSUPPORTED_FORK");
-                  const stored = offered ?? payloadStore.get(toRootHex(bid.message.blockHash));
-                  if (!stored) throw Error("COMMITMENT_PAYLOAD_MISSING");
+                  const stored = offered;
+                  if (!stored) throw Error("COMMITMENT_OFFER_MISSING");
                   const started = performance.now();
                   await journal.retain(bid, stored);
                   logger.debug("Persisted builder commitment", {

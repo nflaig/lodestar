@@ -19,6 +19,7 @@ export type BidPublisherModules = {
   ledger: BidLedger;
   builderIndex: BuilderIndex;
   hasPayload: (identity: BidIdentity) => boolean;
+  requireOfferContext?: boolean;
   canSign?: (identity: BidIdentity, offered?: StoredPayload) => boolean;
   /** Must finish durable retention before the signature can be exposed. */
   retainCommitment?: (bid: gloas.SignedExecutionPayloadBid, offered?: StoredPayload) => void | Promise<void>;
@@ -54,6 +55,7 @@ export class BidPublisherError extends LodestarError<BidPublisherErrorType> {}
 /** Signs and submits a bid only if its payload is retained locally. */
 export class BidPublisher {
   private readonly pendingRevisions = new Map<Slot, number>();
+  private readonly preparedAdmissions = new Map<Slot, number>();
   private readonly pendingGossip = new Set<string>();
   constructor(private readonly modules: BidPublisherModules) {}
 
@@ -65,17 +67,20 @@ export class BidPublisher {
   publish(
     bid: heze.ExecutionPayloadBid,
     signal: AbortSignal,
-    eligibility?: OfferEligibility
+    eligibility?: OfferEligibility,
+    offered?: StoredPayload
   ): Promise<heze.SignedExecutionPayloadBid>;
   publish(
     bid: gloas.ExecutionPayloadBid,
     signal: AbortSignal,
-    eligibility?: OfferEligibility
+    eligibility?: OfferEligibility,
+    offered?: StoredPayload
   ): Promise<gloas.SignedExecutionPayloadBid>;
   async publish(
     bid: gloas.ExecutionPayloadBid,
     signal: AbortSignal,
-    eligibility?: OfferEligibility
+    eligibility?: OfferEligibility,
+    offered?: StoredPayload
   ): Promise<gloas.SignedExecutionPayloadBid> {
     signal.throwIfAborted();
     this.modules.ledger.assertCanRecordBid({
@@ -94,7 +99,7 @@ export class BidPublisher {
     this.pendingGossip.add(key);
     try {
       if (!isOfferEligible(eligibility)) throw Error("BID_OFFER_INELIGIBLE");
-      const signed = await this.prepare(bid);
+      const signed = await this.prepare(bid, undefined, offered);
       if (!isOfferEligible(eligibility)) throw Error("BID_OFFER_INELIGIBLE");
       await this.gossip(signed, signal, eligibility);
       return signed;
@@ -109,6 +114,7 @@ export class BidPublisher {
     revisionLimit = MAX_BID_REVISIONS_PER_SLOT,
     offered?: StoredPayload
   ): Promise<gloas.SignedExecutionPayloadBid> {
+    if (this.modules.requireOfferContext && !offered) throw Error("COMMITMENT_OFFER_MISSING");
     if (!Number.isSafeInteger(revisionLimit) || revisionLimit < 1 || revisionLimit > MAX_BID_REVISIONS_PER_SLOT)
       throw new RangeError("Invalid bid revision limit");
     const {config, builderIndex, hasPayload, ledger, signer} = this.modules;
@@ -145,8 +151,13 @@ export class BidPublisher {
     for (const slot of this.pendingRevisions.keys()) {
       if (slot + BID_HISTORY_SLOTS < bid.slot) this.pendingRevisions.delete(slot);
     }
+    for (const slot of this.preparedAdmissions.keys()) {
+      if (slot + BID_HISTORY_SLOTS < bid.slot) this.preparedAdmissions.delete(slot);
+    }
+    const admitted = Math.max(this.preparedAdmissions.get(bid.slot) ?? 0, ledger.getRevisionCount(bid.slot));
+    this.preparedAdmissions.set(bid.slot, admitted);
     const pending = this.pendingRevisions.get(bid.slot) ?? 0;
-    if (ledger.getRevisionCount(bid.slot) + pending >= revisionLimit)
+    if (admitted + pending >= revisionLimit)
       throw new BidLedgerError({code: BidLedgerErrorCode.REVISION_LIMIT, ...identity});
     this.pendingRevisions.set(bid.slot, pending + 1);
     let persistenceAttempted = false;
@@ -167,6 +178,7 @@ export class BidPublisher {
       // A revision becomes eligible only after the worker confirms durability.
       ledger.recordRevision({...identity, valueGwei: bid.value, signedBidRoot});
       recorded = true;
+      this.preparedAdmissions.set(bid.slot, (this.preparedAdmissions.get(bid.slot) ?? 0) + 1);
       return signedExecutionPayloadBid;
     } catch (error) {
       if (error instanceof CommitmentJournalError && !error.uncertain) persistenceAttempted = false;

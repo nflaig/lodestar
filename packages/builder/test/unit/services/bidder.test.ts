@@ -266,9 +266,11 @@ describe("Bidder", () => {
     const original = BidPublisher.prototype.prepare;
     const prepare = vi.spyOn(BidPublisher.prototype, "prepare").mockImplementation(async function (
       this: BidPublisher,
-      bid
+      bid,
+      revisionLimit,
+      offered
     ) {
-      const signed = await original.call(this, bid);
+      const signed = await original.call(this, bid, revisionLimit, offered);
       await new Promise((resolve) => setTimeout(resolve, 300));
       return signed;
     });
