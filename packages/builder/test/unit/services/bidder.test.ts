@@ -266,9 +266,11 @@ describe("Bidder", () => {
     const original = BidPublisher.prototype.prepare;
     const prepare = vi.spyOn(BidPublisher.prototype, "prepare").mockImplementation(async function (
       this: BidPublisher,
-      bid
+      bid,
+      revisionLimit,
+      offered
     ) {
-      const signed = await original.call(this, bid);
+      const signed = await original.call(this, bid, revisionLimit, offered);
       await new Promise((resolve) => setTimeout(resolve, 300));
       return signed;
     });
@@ -392,6 +394,10 @@ describe("Bidder", () => {
     const first = bidStore.get(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot));
     const event = payloadAttributesEvent();
     event.data.parentBlockRoot = Buffer.alloc(32, 15);
+    payloadSource.getPayload.mockResolvedValue({
+      ...mockBuiltPayload({slot, parentHash: parentBlockHash, prevRandao, blockHash: Buffer.alloc(32, 16)}),
+      fork: ForkName.gloas,
+    });
     const secondBuild = bidder.onPayloadAttributes(event);
     await vi.advanceTimersByTimeAsync(0);
     await firstBuild;

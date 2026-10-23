@@ -5,7 +5,8 @@ import {defer} from "@lodestar/utils";
 import type {DurablePayload, JournalIdentity, RevealRecord} from "./commitmentJournal.js";
 import {CommitmentJournalError} from "./commitmentJournalError.js";
 import type {JournalExposure} from "./orderExposure.js";
-import type {StoredPayload} from "./payloadStore.js";
+import {parseOrderMetadata, sameOrderMetadata} from "./orderMetadata.js";
+import type {BuiltPayload, StoredPayload} from "./payloadStore.js";
 
 export type JournalOperation =
   | {kind: "retain"; bid: gloas.SignedExecutionPayloadBid; stored: StoredPayload}
@@ -57,7 +58,7 @@ export class AsyncCommitmentJournal {
   private readonly sharedRetentions = new Set<Promise<void>>();
   private closing = false;
   private initialized = false;
-  private readonly references = new WeakMap<StoredPayload, DurablePayload>();
+  private readonly references = new WeakMap<BuiltPayload["executionPayload"], DurablePayload>();
   private readonly closed = defer<void>();
   private timer: ReturnType<typeof setTimeout>;
 
@@ -102,7 +103,10 @@ export class AsyncCommitmentJournal {
   }
 
   getReference(stored: StoredPayload): DurablePayload | undefined {
-    return this.references.get(stored);
+    const reference = this.references.get(stored.payload.executionPayload);
+    if (!reference) return undefined;
+    const orderMetadata = parseOrderMetadata(stored.payload.orderMetadata);
+    return sameOrderMetadata(reference.orderMetadata, orderMetadata) ? reference : {...reference, orderMetadata};
   }
 
   retainReference(bid: gloas.SignedExecutionPayloadBid, reference: DurablePayload): Promise<void> {
@@ -239,11 +243,14 @@ export class AsyncCommitmentJournal {
     this.pendingBytes -= pending.bytes;
     if (pending.operation.kind === "retain" || pending.operation.kind === "retainReference") this.pendingOffers--;
     if (reply.error) {
-      if (reply.error !== "COMMITMENT_REFERENCE_UNAVAILABLE") this.exposureUncertain = true;
-      pending.result.reject(new CommitmentJournalError(reply.error, true));
+      // This refusal is checked before any journal write/link, including after
+      // recovery. It cannot make an earlier exposure uncertain.
+      const admissionRefused = reply.error === "COMMITMENT_SLOT_ADMISSION_LIMIT";
+      if (!admissionRefused && reply.error !== "COMMITMENT_REFERENCE_UNAVAILABLE") this.exposureUncertain = true;
+      pending.result.reject(new CommitmentJournalError(reply.error, !admissionRefused));
     } else {
       if (pending.operation.kind === "retain" && reply.reference)
-        this.references.set(pending.operation.stored, reply.reference);
+        this.references.set(pending.operation.stored.payload.executionPayload, reply.reference);
       pending.result.resolve(reply.exposure);
     }
     this.pump();

@@ -23,7 +23,7 @@ import {MAX_BID_REVISIONS_PER_SLOT} from "./commitmentLimits.js";
 import {createExecutionPayloadBid} from "./executionPayloadBid.js";
 import {GossipStage, getMinGossipBidValue, validateGossipStages} from "./gossipStages.js";
 import {PayloadSourceNotReady, isOfferEligible} from "./offerEligibility.js";
-import {isOrderOfferAllowed, parseOrderMetadata, sameOrderMetadata} from "./orderMetadata.js";
+import {isOrderOfferAllowed, parseOrderMetadata} from "./orderMetadata.js";
 import {type PayloadBuildJob, PayloadOrchestrator} from "./payloadOrchestrator.js";
 import type {BuildHandle, BuiltPayload, PayloadSourceResources} from "./payloadSource.js";
 import {PayloadStore, PayloadStoreCapacityError} from "./payloadStore.js";
@@ -1147,7 +1147,6 @@ export class Bidder {
   }
 
   private shareRetainedPayloadBody(payload: BuiltPayload): void {
-    if (!payload.offerEligibility?.retained) return;
     const stored = this.modules.payloadStore.get(toRootHex(payload.executionPayload.blockHash))?.payload;
     if (!stored) return;
     // Rebind the wrapper captured by renewal/cleanup too. Grant and valuation
@@ -1393,7 +1392,7 @@ export class Bidder {
                 isOfferEligible(payload.offerEligibility) &&
                 !isOfferEligible(this.modules.bidStore.getOfferEligibility(retained.signed))
               )
-                this.modules.bidStore.add(retained.signed, payload.offerEligibility);
+                this.modules.bidStore.add(retained.signed, payload.offerEligibility, payload.orderMetadata);
               this.gossipRetainedAlternate(retained);
               if (
                 signed &&
@@ -1642,6 +1641,7 @@ export class Bidder {
                 fork: ForkName.gloas,
                 // The same immutable hash can be re-admitted in a new order
                 // generation. Its durable snapshot may carry an older lease.
+                orderMetadata: this.modules.bidStore.getOfferOrderMetadata(initialBest),
                 offerEligibility: this.modules.bidStore.getOfferEligibility(initialBest),
               },
               data,
@@ -1734,6 +1734,7 @@ export class Bidder {
                       {
                         ...deferredPayload,
                         fork: ForkName.gloas,
+                        orderMetadata: this.modules.bidStore.getOfferOrderMetadata(initialBest),
                         offerEligibility: this.modules.bidStore.getOfferEligibility(initialBest),
                       },
                       data,
@@ -1817,6 +1818,7 @@ export class Bidder {
                         {
                           ...refreshedPayload.payload,
                           fork: ForkName.gloas,
+                          orderMetadata: this.modules.bidStore.getOfferOrderMetadata(refreshBest),
                           offerEligibility: this.modules.bidStore.getOfferEligibility(refreshBest),
                         },
                         data,
@@ -2005,9 +2007,6 @@ export class Bidder {
       return null;
     }
     const metadata = parseOrderMetadata(payload.orderMetadata);
-    const retainedMetadata = this.modules.payloadStore.get(toRootHex(payload.executionPayload.blockHash));
-    if (retainedMetadata && !sameOrderMetadata(retainedMetadata.payload.orderMetadata, metadata))
-      throw Error("ORDER_METADATA_CONFLICT");
     if (!isOrderOfferAllowed(metadata)) return null;
     if (metadata) {
       if (!payload.offerEligibility) throw Error("ORDER_OFFER_LEASE_MISSING");
@@ -2071,7 +2070,7 @@ export class Bidder {
     );
     if (revisionLimit === 0) return null;
     ledger.assertCanRecordRevision({slot, parentBlockHash, parentBlockRoot}, revisionLimit);
-    this.modules.payloadStore.add(
+    const offered = this.modules.payloadStore.add(
       {slot, parentBlockRoot: data.parentBlockRoot, blockHash, payload},
       alternate ? "alternate" : "offer"
     );
@@ -2092,12 +2091,16 @@ export class Bidder {
       return null;
     }
     alternateAdmission?.onRetentionAttempted();
-    const signedBid = await bidPublisher.prepare(bid, revisionLimit);
+    const signedBid = await bidPublisher.prepare(bid, revisionLimit, offered);
     // Retain before exposure, including when transport completion is uncertain
     // or arrives after cancellation. Reveal ownership does not expire with offers.
     const deadlineExpired = alternateAdmission !== undefined && Date.now() >= alternateAdmission.deadline;
     const alternateExpired = alternateAdmission && (signal.aborted || deadlineExpired);
-    bidStore.add(signedBid, alternateExpired || (onDurable && signal.aborted) ? "recovery" : payload.offerEligibility);
+    bidStore.add(
+      signedBid,
+      alternateExpired || (onDurable && signal.aborted) ? "recovery" : payload.offerEligibility,
+      metadata
+    );
     onDurable?.(signedBid);
     if (alternateExpired) {
       logger.debug("Skipping alternate parent bid", {
