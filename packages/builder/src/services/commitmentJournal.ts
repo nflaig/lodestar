@@ -7,8 +7,10 @@ import {RootHex, gloas, ssz} from "@lodestar/types";
 import {fromHex, toHex, toRootHex} from "@lodestar/utils";
 import {BidLedger} from "./bidLedger.js";
 import {BidStore} from "./bidStore.js";
+import {CommitmentJournalError} from "./commitmentJournalError.js";
 import {
   BID_HISTORY_SLOTS,
+  MAX_BID_REVISIONS_PER_SLOT,
   MAX_COMMITMENT_JOURNAL_BYTES,
   MAX_COMMITMENT_JOURNAL_FILES,
   MAX_REVEAL_RECORD_BYTES,
@@ -75,6 +77,7 @@ export type DurablePayload = {
  * consumes their gossip allowance. This covers selection events missed offline. */
 export class CommitmentJournal {
   private readonly sizes = new Map<string, number>();
+  private readonly admissionsBySlot = new Map<number, number>();
   private bytes = 0;
   private revealBytes = 0;
   private revealFiles = 0;
@@ -113,6 +116,10 @@ export class CommitmentJournal {
         throw Error("COMMITMENT_JOURNAL_INVALID_FILE");
       this.sizes.set(name, info.size);
       this.bytes += info.size;
+      if (match?.[1] === "bid") {
+        const slot = Number(match[2]);
+        this.admissionsBySlot.set(slot, (this.admissionsBySlot.get(slot) ?? 0) + 1);
+      }
       if (match?.[1] === "reveal") {
         this.revealBytes += info.size;
         this.revealFiles++;
@@ -186,6 +193,7 @@ export class CommitmentJournal {
     const executionRequestsRoot = toRootHex(ssz.gloas.ExecutionRequests.hashTreeRoot(payload.executionRequests));
     if (executionRequestsRoot !== toRootHex(signedBid.message.executionRequestsRoot))
       throw Error("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
+    this.assertAdmissionCapacity(signedBid, orderMetadata);
     const payloadName = `payload-${slot}-${blockHash}.json`;
     let payloadRecord: PayloadRecord | undefined;
     if (!this.sizes.has(payloadName)) {
@@ -223,10 +231,6 @@ export class CommitmentJournal {
       // The immutable file, not a fresh source response with the same hash,
       // determines what recovery can reveal for an additional signed offer.
       const reference = this.references.get(payloadName);
-      const previousMetadata = reference
-        ? reference.orderMetadata
-        : parseOrderMetadata((this.read(payloadName) as PayloadRecord).orderMetadata);
-      if (!sameOrderMetadata(previousMetadata, orderMetadata)) throw Error("ORDER_METADATA_CONFLICT");
       let retainedParent: RootHex;
       let retainedParentRoot: RootHex;
       let retainedRequestsRoot: RootHex;
@@ -266,7 +270,10 @@ export class CommitmentJournal {
         throw Error("COMMITMENT_BLOB_MISMATCH");
     }
     this.retainBid(signedBid, orderMetadata);
-    if (this.references.has(payloadName)) return this.references.get(payloadName);
+    if (this.references.has(payloadName)) {
+      const reference = this.references.get(payloadName);
+      return reference ? {...reference, orderMetadata} : undefined;
+    }
     let reference: DurablePayload | undefined;
     try {
       const record = payloadRecord ?? (this.read(payloadName) as PayloadRecord);
@@ -328,11 +335,7 @@ export class CommitmentJournal {
       )
         throw Error("COMMITMENT_PAYLOAD_REFERENCE");
     }
-    if (
-      this.sizes.has(files[0].name) &&
-      !sameOrderMetadata(parseOrderMetadata((this.read(files[0].name) as PayloadRecord).orderMetadata), orderMetadata)
-    )
-      throw Error("ORDER_METADATA_CONFLICT");
+    this.assertAdmissionCapacity(signedBid, orderMetadata);
     // Blobs must be durable before linking their payload, including orphan payloads recovered after
     // a crash. A partial group also needs a barrier before an unavailable source can fall back.
     for (const filesToLink of this.sizes.has(files[0].name) ? [] : [files.slice(1), [files[0]]]) {
@@ -469,10 +472,11 @@ export class CommitmentJournal {
     let recovered = 0;
     for (const name of this.sizes.keys()) {
       if (!name.startsWith("bid-")) continue;
-      const {signed} = decodeBidRecord(this.read(name));
+      const decoded = decodeBidRecord(this.read(name));
+      const {signed} = decoded;
       const bid = signed.message;
       const signedBidRoot = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signed));
-      if (name !== `bid-${bid.slot}-${signedBidRoot}.json`) throw Error("COMMITMENT_BID_MISMATCH");
+      if (name !== bidRecordName(decoded)) throw Error("COMMITMENT_BID_MISMATCH");
       const identity = {
         slot: bid.slot,
         parentBlockRoot: toRootHex(bid.parentBlockRoot),
@@ -506,7 +510,7 @@ export class CommitmentJournal {
           toRootHex(bid.executionRequestsRoot)
         )
           throw Error("COMMITMENT_EXECUTION_REQUESTS_MISMATCH");
-        bids.add(signed, "recovery");
+        bids.add(signed, "recovery", decoded.metadata);
       }
       recovered++;
     }
@@ -561,6 +565,12 @@ export class CommitmentJournal {
         this.revealFiles--;
       }
       this.sizes.delete(name);
+      if (match[1] === "bid") {
+        const slot = Number(match[2]);
+        const remaining = (this.admissionsBySlot.get(slot) ?? 1) - 1;
+        if (remaining > 0) this.admissionsBySlot.set(slot, remaining);
+        else this.admissionsBySlot.delete(slot);
+      }
       this.references.delete(name);
     }
     // Unsynced deletion can only restore expired records after a crash. Recovery
@@ -603,20 +613,51 @@ export class CommitmentJournal {
     if (!isOrderOfferAllowed(metadata)) throw Error("ORDER_OFFER_TOO_EARLY");
     this.checkExposureClock();
     const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signed));
-    const name = `bid-${signed.message.slot}-${root}.json`;
+    let name = `bid-${signed.message.slot}-${root}.json`;
+    let version = 2;
     if (this.sizes.has(name)) {
-      if (!sameOrderMetadata(decodeBidRecord(this.read(name)).metadata, metadata))
-        throw Error("ORDER_METADATA_CONFLICT");
-      return;
+      if (sameOrderMetadata(decodeBidRecord(this.read(name)).metadata, metadata)) return;
+      version = 3;
+      name = bidRecordName({signed, metadata, version});
+      if (this.sizes.has(name)) {
+        const prior = decodeBidRecord(this.read(name));
+        if (bidRecordName(prior) !== name || !sameOrderMetadata(prior.metadata, metadata))
+          throw Error("ORDER_METADATA_CONFLICT");
+        return;
+      }
     }
+    const count = this.admissionsBySlot.get(signed.message.slot) ?? 0;
+    this.assertAdmissionCapacity(signed, metadata);
+    // The original signature's attribution and exposure time are never rewritten.
+    // A fresh authorization for identical signed bytes is a separate admission.
     const data = {
-      version: 2,
+      version,
       signedBid: ssz.gloas.SignedExecutionPayloadBid.toJson(signed),
       orderMetadata: metadata,
       possibleExposureAtUnixMs: Date.now(),
     };
     this.write(name, data);
+    this.admissionsBySlot.set(signed.message.slot, count + 1);
     this.indexExposure(name, data, this.sizes.get(name) ?? 0);
+  }
+
+  /** A definite refusal before any payload, blob, link or bid write. Exact durable
+   * retries remain allowed; all journal mutations run serially on one owner. */
+  private assertAdmissionCapacity(signed: gloas.SignedExecutionPayloadBid, metadata: OrderMetadata | undefined): void {
+    if ((this.admissionsBySlot.get(signed.message.slot) ?? 0) < MAX_BID_REVISIONS_PER_SLOT) return;
+    const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signed));
+    const original = `bid-${signed.message.slot}-${root}.json`;
+    if (this.sizes.has(original)) {
+      if (sameOrderMetadata(decodeBidRecord(this.read(original)).metadata, metadata)) return;
+      const name = bidRecordName({signed, metadata, version: 3});
+      if (this.sizes.has(name)) {
+        const prior = decodeBidRecord(this.read(name));
+        if (bidRecordName(prior) !== name || !sameOrderMetadata(prior.metadata, metadata))
+          throw Error("ORDER_METADATA_CONFLICT");
+        return;
+      }
+    }
+    throw new CommitmentJournalError("COMMITMENT_SLOT_ADMISSION_LIMIT", false);
   }
 
   private checkExposureClock(): number {
@@ -639,10 +680,11 @@ export class CommitmentJournal {
       this.exposureIncomplete = true;
       return;
     }
-    const {signed, metadata, time} = decodeBidRecord(data);
+    const decoded = decodeBidRecord(data);
+    const {signed, metadata, time} = decoded;
     const bid = signed.message;
     const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signed));
-    if (name !== `bid-${bid.slot}-${root}.json`) throw Error("COMMITMENT_BID_MISMATCH");
+    if (name !== bidRecordName(decoded)) throw Error("COMMITMENT_BID_MISMATCH");
     this.exposure.set(name, {
       metadata,
       bytes,
@@ -794,6 +836,7 @@ function decodeBidRecord(value: unknown): {
   signed: gloas.SignedExecutionPayloadBid;
   metadata?: OrderMetadata;
   time: number | null;
+  version: number;
 } {
   const record = value as {
     version?: unknown;
@@ -801,16 +844,19 @@ function decodeBidRecord(value: unknown): {
     orderMetadata?: unknown;
     possibleExposureAtUnixMs?: unknown;
   };
-  if (record?.version === 2) {
+  if (record?.version === 2 || record?.version === 3) {
     const validTime =
       Number.isSafeInteger(record.possibleExposureAtUnixMs) && (record.possibleExposureAtUnixMs as number) >= 0;
     return {
       signed: ssz.gloas.SignedExecutionPayloadBid.fromJson(record.signedBid),
-      metadata: recoverOrderMetadata(record.orderMetadata),
+      version: record.version,
+      metadata:
+        record.version === 3 ? parseOrderMetadata(record.orderMetadata) : recoverOrderMetadata(record.orderMetadata),
       time: validTime ? (record.possibleExposureAtUnixMs as number) : null,
     };
   }
-  return {signed: ssz.gloas.SignedExecutionPayloadBid.fromJson(value), time: null};
+  if (record?.version !== undefined) throw Error("COMMITMENT_BID_UNSUPPORTED_VERSION");
+  return {signed: ssz.gloas.SignedExecutionPayloadBid.fromJson(value), time: null, version: 1};
 }
 
 function recoverOrderMetadata(value: unknown): OrderMetadata | undefined {
@@ -819,4 +865,15 @@ function recoverOrderMetadata(value: unknown): OrderMetadata | undefined {
   } catch {
     return undefined;
   }
+}
+
+function bidRecordName(record: {
+  signed: gloas.SignedExecutionPayloadBid;
+  metadata?: OrderMetadata;
+  version: number;
+}): string {
+  const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(record.signed));
+  const key =
+    record.version === 3 ? `0x${digest(`order-offer-v3:${root}:${JSON.stringify(record.metadata ?? null)}`)}` : root;
+  return `bid-${record.signed.message.slot}-${key}.json`;
 }

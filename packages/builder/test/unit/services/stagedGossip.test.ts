@@ -143,9 +143,9 @@ describe("staged P2P gossip", () => {
       retainCommitment:
         options.retain ??
         (journal
-          ? async (bid) => {
-              const stored = payloadStore.get(toRootHex(bid.message.blockHash));
-              if (!stored) throw Error("missing test payload");
+          ? async (bid, offered) => {
+              const stored = offered;
+              if (!stored) throw Error("missing test offer");
               journal.retain(bid, stored);
             }
           : undefined),
@@ -169,6 +169,45 @@ describe("staged P2P gossip", () => {
   function published() {
     return api.beacon.publishExecutionPayloadBid.mock.calls.map(([request]) => request.signedExecutionPayloadBid);
   }
+
+  it.each([2, 3])("journals current owner membership through the primary and stage %i", async (index) => {
+    const oldId = `0x${"11".repeat(32)}`;
+    const newId = `0x${"22".repeat(32)}`;
+    const lease = {generation: "0x0", ready: true, validUntil: Infinity, validUntilUnixMs: Infinity};
+    source.getPayload.mockImplementation(async () => ({
+      ...payload(1),
+      orderMetadata: {version: 1, orderIds: [lease.generation === "0x0" ? oldId : newId], doNotOfferBefore: 0},
+      offerEligibility: {generation: lease.generation, lease},
+    }));
+    const stage = identity(index, [], {durable: true});
+    const primary = identity(1, [stage.stage], {durable: true});
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(200);
+    expect(primary.journal?.queryExposure(oldId, Date.now()).commitmentCount).toBe(1);
+    expect(primary.journal?.queryExposure(newId, Date.now()).commitmentCount).toBe(0);
+    lease.generation = "0x1";
+    await vi.advanceTimersByTimeAsync(200);
+    expect(primary.journal?.queryExposure(newId, Date.now()).commitmentCount).toBe(1);
+    await vi.advanceTimersByTimeAsync(9700);
+    lease.ready = false;
+    const stageAt = index === 2 ? 11100 : 12000;
+    await vi.advanceTimersByTimeAsync(stageAt - 10100 - 1);
+    expect(published()).toHaveLength(0);
+    lease.ready = true;
+    await vi.advanceTimersByTimeAsync(101);
+    expect(published().map((bid) => bid.message.builderIndex)).toEqual([index]);
+    expect(stage.journal?.queryExposure(oldId, Date.now()).commitmentCount).toBe(0);
+    expect(stage.journal?.queryExposure(newId, Date.now()).commitmentCount).toBe(1);
+    expect(stage.bidStore.getOfferEligibility(published()[0])?.generation).toBe("0x1");
+    expect(primary.journal?.queryExposure(oldId, Date.now()).commitmentCount).toBe(1);
+    expect(payloadStore.size).toBe(1);
+    expect(payloadStore.get(toRootHex(published()[0].message.blockHash))?.payload.orderMetadata?.orderIds).toEqual([
+      oldId,
+    ]);
+    expect(logger.error).not.toHaveBeenCalled();
+    controller.abort();
+    await building;
+  });
 
   it("uses one construction session, distinct signing identities and increasing values at three deadlines", async () => {
     const second = identity(2, [], {durable: true});
@@ -257,6 +296,33 @@ describe("staged P2P gossip", () => {
     expect(second.ledger.getBidsForSlot(slot)).toHaveLength(0);
     expect(primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot))?.message.value).toBeGreaterThan(
       published()[0].message.value
+    );
+  });
+
+  it("reports a late 1.3% improvement below the gossip floor while retaining the higher API bid", async () => {
+    source.getPayload.mockImplementation(async () =>
+      payload(Date.now() >= 10800 ? 2 : 1, Date.now() >= 10800 ? 32_288_889 : 31_862_347)
+    );
+    const second = identity(2);
+    const primary = identity(1, [second.stage]);
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(13300);
+    await building;
+    const offered = published();
+    expect(offered).toHaveLength(1);
+    const latest = primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot));
+    if (!latest) throw Error("Missing higher API bid");
+    expect(latest.message.value).toBeGreaterThan(offered[0].message.value);
+    expect(latest.message.value).toBeLessThan(getMinGossipBidValue(offered[0].message.value));
+    expect(second.ledger.getBidsForSlot(slot)).toHaveLength(0);
+    expect(logger.info).toHaveBeenCalledWith(
+      "Skipped staged execution payload bid",
+      expect.objectContaining({
+        builderIndex: 2,
+        reason: "below_gossip_minimum",
+        computedValueGwei: latest.message.value,
+        minimumValueGwei: getMinGossipBidValue(offered[0].message.value),
+      })
     );
   });
 
@@ -471,10 +537,16 @@ describe("staged P2P gossip", () => {
       const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
       const first = primary.bidder.onPayloadAttributes(event());
       await vi.advanceTimersByTimeAsync(10200);
-      const pending = second.bidPublisher.prepare({...published()[0].message, builderIndex: 2}).then(
-        () => "retained",
-        () => "uncertain"
-      );
+      const pending = second.bidPublisher
+        .prepare(
+          {...published()[0].message, builderIndex: 2},
+          undefined,
+          payloadStore.get(toRootHex(published()[0].message.blockHash)) ?? undefined
+        )
+        .then(
+          () => "retained",
+          () => "uncertain"
+        );
       expect(second.bidPublisher.hasPendingRevisions(slot)).toBe(true);
       branchB = true;
       const next = event();
@@ -514,7 +586,11 @@ describe("staged P2P gossip", () => {
       const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
       const building = primary.bidder.onPayloadAttributes(event());
       await vi.advanceTimersByTimeAsync(12050);
-      const pending = second.bidPublisher.prepare({...published()[0].message, builderIndex: 2});
+      const pending = second.bidPublisher.prepare(
+        {...published()[0].message, builderIndex: 2},
+        undefined,
+        payloadStore.get(toRootHex(published()[0].message.blockHash)) ?? undefined
+      );
       await vi.advanceTimersByTimeAsync(1250);
       await building;
       expect(sign).toHaveBeenCalledOnce();
@@ -548,6 +624,19 @@ describe("staged P2P gossip", () => {
       await building;
       expect(sign).not.toHaveBeenCalled();
       expect(published().map((bid) => bid.message.builderIndex)).toEqual([1, 3]);
+      const skipped = vi
+        .mocked(logger.info)
+        .mock.calls.find(
+          ([message, context]) =>
+            message === "Skipped staged execution payload bid" &&
+            context !== null &&
+            typeof context === "object" &&
+            "builderIndex" in context &&
+            context.builderIndex === 2
+        )?.[1];
+      expect(skipped).toMatchObject({reason: "no_prepared_bid", phase: "after_preparation"});
+      expect(skipped).not.toHaveProperty("computedValueGwei");
+      expect(skipped).not.toHaveProperty("minimumValueGwei");
     });
 
     it.each(["acknowledged", "lost"])("bounds busy retention and never retries its late %s reply", async (reply) => {
@@ -901,7 +990,13 @@ describe("staged P2P gossip", () => {
     expect(staged[0].message.blockHash).toEqual(payload(2).executionPayload.blockHash);
     expect(retained).toBe(2);
     expect(second.ledger.getBidsForSlot(slot)).toHaveLength(1);
-    await expect(second.bidPublisher.prepare(staged[0].message, 2)).rejects.toMatchObject({
+    await expect(
+      second.bidPublisher.prepare(
+        staged[0].message,
+        2,
+        payloadStore.get(toRootHex(staged[0].message.blockHash)) ?? undefined
+      )
+    ).rejects.toMatchObject({
       type: {code: BidLedgerErrorCode.REVISION_LIMIT},
     });
     const recoveredPayloads = new PayloadStore();

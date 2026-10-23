@@ -2,6 +2,7 @@ import {RootHex, Slot, gloas, ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
 import {PAYLOAD_RETENTION_SLOTS} from "./commitmentLimits.js";
 import {type OfferEligibility, isOfferEligible, recoveredOfferEligibility} from "./offerEligibility.js";
+import {type OrderMetadata, parseOrderMetadata} from "./orderMetadata.js";
 
 /** Keep bids for this many slots after their slot, same as the payloads they commit to */
 const KEEP_SLOTS = PAYLOAD_RETENTION_SLOTS;
@@ -10,13 +11,23 @@ const KEEP_SLOTS = PAYLOAD_RETENTION_SLOTS;
 export class BidStore {
   private readonly revisions = new Map<RootHex, gloas.SignedExecutionPayloadBid>();
   private readonly eligibility = new Map<RootHex, OfferEligibility>();
+  private readonly offerMetadata = new Map<RootHex, OrderMetadata | undefined>();
   private readonly bySlotAndParent = new Map<string, Map<RootHex, gloas.SignedExecutionPayloadBid>>();
   private readonly subscribers = new Map<string, Set<() => void>>();
 
-  add(signedBid: gloas.SignedExecutionPayloadBid, eligibility?: OfferEligibility | "recovery"): void {
+  add(
+    signedBid: gloas.SignedExecutionPayloadBid,
+    eligibility?: OfferEligibility | "recovery",
+    metadata?: OrderMetadata
+  ): void {
     const {slot, parentBlockHash, parentBlockRoot} = signedBid.message;
     const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid));
+    const copiedMetadata = parseOrderMetadata(metadata);
     this.revisions.set(root, signedBid);
+    const previousEligibility = this.eligibility.get(root);
+    // An unqualified add must not mix new metadata with an existing live lease.
+    if (eligibility !== undefined || !previousEligibility || previousEligibility.generation === "recovered")
+      this.offerMetadata.set(root, copiedMetadata);
     if (eligibility !== undefined)
       this.eligibility.set(root, eligibility === "recovery" ? recoveredOfferEligibility() : eligibility);
     else if (this.eligibility.get(root)?.generation === "recovered")
@@ -70,6 +81,11 @@ export class BidStore {
     return this.eligibility.get(toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid)));
   }
 
+  /** Current admission only. Historical exposure belongs to immutable journal records. */
+  getOfferOrderMetadata(signedBid: gloas.SignedExecutionPayloadBid): OrderMetadata | undefined {
+    return this.offerMetadata.get(toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid)));
+  }
+
   canOffer(signedBid: gloas.SignedExecutionPayloadBid): boolean {
     const root = toRootHex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signedBid));
     return this.revisions.has(root) && isOfferEligible(this.eligibility.get(root));
@@ -84,6 +100,7 @@ export class BidStore {
       if (signedBid.message.slot + KEEP_SLOTS < currentSlot) {
         this.revisions.delete(root);
         this.eligibility.delete(root);
+        this.offerMetadata.delete(root);
         const {slot, parentBlockHash, parentBlockRoot} = signedBid.message;
         const key = getKey(slot, toRootHex(parentBlockHash), toRootHex(parentBlockRoot));
         const revisions = this.bySlotAndParent.get(key);
