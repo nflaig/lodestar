@@ -104,6 +104,8 @@ describe("staged P2P gossip", () => {
       status?: BuilderStatus;
       balance?: number;
       durable?: boolean;
+      deadlineBps?: number;
+      updateCutoffBps?: number;
       updateIntervalMs?: number;
       deferUnusedGossipStages?: boolean;
       retain?: (bid: gloas.SignedExecutionPayloadBid) => Promise<void>;
@@ -135,6 +137,8 @@ describe("staged P2P gossip", () => {
       index,
       updateOptions: {
         ...updateOptions,
+        ...(options.deadlineBps === undefined ? {} : {deadlineBps: options.deadlineBps}),
+        ...(options.updateCutoffBps === undefined ? {} : {updateCutoffBps: options.updateCutoffBps}),
         updateIntervalMs: options.updateIntervalMs ?? updateOptions.updateIntervalMs,
         deferUnusedGossipStages: options.deferUnusedGossipStages,
       },
@@ -169,6 +173,98 @@ describe("staged P2P gossip", () => {
   function published() {
     return api.beacon.publishExecutionPayloadBid.mock.calls.map(([request]) => request.signedExecutionPayloadBid);
   }
+
+  it.each([
+    {improving: false, deferred: false},
+    {improving: true, deferred: false},
+    {improving: false, deferred: true},
+    {improving: true, deferred: true},
+  ])("qualifies five stages through +720 ms: %j", async ({improving, deferred}) => {
+    const stages = [
+      identity(7, [], {durable: true}),
+      identity(9, [], {durable: true}),
+      identity(8, [], {durable: true}),
+      identity(10, [], {durable: true}),
+    ];
+    const deadlines = [10000, 10200, 10400, 10600];
+    for (const [i, stage] of stages.entries()) stage.stage.deadlineBps = deadlines[i];
+    source.getPayload.mockImplementation(async () =>
+      payload(
+        !improving
+          ? 1
+          : Date.now() >= 12650
+            ? 5
+            : Date.now() >= 12400
+              ? 4
+              : Date.now() >= 12150
+                ? 3
+                : Date.now() >= 11950
+                  ? 2
+                  : 1
+      )
+    );
+    const primary = identity(
+      1,
+      stages.map((stage) => stage.stage),
+      {
+        durable: true,
+        deadlineBps: 9850,
+        updateCutoffBps: 2100,
+        updateIntervalMs: 25,
+        deferUnusedGossipStages: deferred,
+      }
+    );
+    const sends: {index: number; at: number}[] = [];
+    api.beacon.publishExecutionPayloadBid.mockImplementation(async ({signedExecutionPayloadBid}) => {
+      sends.push({index: signedExecutionPayloadBid.message.builderIndex, at: Date.now() - 12000});
+      return mockApiResponse({});
+    });
+    const building = primary.bidder.onPayloadAttributes(event());
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot))).not.toBeNull();
+    expect(published()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(10819);
+    expect(published()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(901);
+    expect(sends).toEqual(
+      improving
+        ? [
+            {index: 1, at: -180},
+            {index: 7, at: 0},
+            {index: 9, at: 240},
+            {index: 8, at: 480},
+            {index: 10, at: 720},
+          ]
+        : [{index: 1, at: -180}]
+    );
+    await vi.advanceTimersByTimeAsync(1801);
+    await building;
+    const revisions = improving ? [1, 2, 3, 4, 5] : [1];
+    expect(published().map((bid) => toRootHex(bid.message.blockHash))).toEqual(
+      revisions.map((revision) => toRootHex(Buffer.alloc(32, 10 + revision)))
+    );
+    for (let i = 1; i < published().length; i++) {
+      expect(published()[i].message.value).toBeGreaterThan(published()[i - 1].message.value);
+    }
+    if (!improving) {
+      for (const stage of stages) {
+        const assertion = expect(logger.info);
+        const context = expect.objectContaining({builderIndex: stage.stage.builderIndex});
+        if (deferred) assertion.toHaveBeenCalledWith("Deferred staged execution payload bid", context);
+        else assertion.not.toHaveBeenCalledWith("Deferred staged execution payload bid", context);
+      }
+    }
+    expect(source.prepare).toHaveBeenCalledOnce();
+    expect(source.release).toHaveBeenCalledOnce();
+    for (const offered of published()) {
+      const owner = [primary, ...stages].find((item) => item.stage.builderIndex === offered.message.builderIndex);
+      expect(owner?.bidStore.has(offered)).toBe(true);
+      expect(payloadStore.has(toRootHex(offered.message.blockHash))).toBe(true);
+    }
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
   it.each([2, 3])("journals current owner membership through the primary and stage %i", async (index) => {
     const oldId = `0x${"11".repeat(32)}`;
