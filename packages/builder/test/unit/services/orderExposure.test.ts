@@ -608,19 +608,194 @@ describe("order exposure receipts", () => {
     expect(journal.queryExposure(otherId, admitted).coverageComplete).toBe(false);
   });
 
-  it("rejects metadata rebinding for a repeated payload or signed root, before and after recovery", () => {
+  it("retains separate immutable admissions for identical signed bytes before and after restart", () => {
+    vi.useFakeTimers();
     const {journal, directory} = setup();
     const old = fixture();
     journal.retain(old.bid, old.stored);
+    const before = new Map(
+      fs.readdirSync(directory).map((name) => [name, fs.readFileSync(path.join(directory, name))])
+    );
+    const firstTime = journal.queryExposure(orderId, Date.now()).commitments[0].possibleExposureAtUnixMs;
+    vi.advanceTimersByTime(25);
     const changed = fixture(0, [otherId]);
-    expect(() => journal.retain(changed.bid, changed.stored)).toThrow("ORDER_METADATA_CONFLICT");
+    journal.retain(changed.bid, changed.stored);
+    journal.retain(changed.bid, changed.stored);
+    expect(fs.readdirSync(directory).length).toBe(before.size + 1);
+    for (const [name, bytes] of before) expect(fs.readFileSync(path.join(directory, name))).toEqual(bytes);
     const restored = new CommitmentJournal(directory, identity);
-    expect(() => restored.retain(changed.bid, changed.stored)).toThrow("ORDER_METADATA_CONFLICT");
+    restored.retain(changed.bid, changed.stored);
+    expect(fs.readdirSync(directory).length).toBe(before.size + 1);
+    for (const current of [journal, restored]) {
+      const first = current.queryExposure(orderId, Date.now());
+      const second = current.queryExposure(otherId, Date.now());
+      expect(first).toMatchObject({coverageComplete: true, commitmentCount: 1});
+      expect(second).toMatchObject({coverageComplete: true, commitmentCount: 1});
+      expect(first.commitments[0].possibleExposureAtUnixMs).toBe(firstTime);
+      expect(second.commitments[0].possibleExposureAtUnixMs).toBe(firstTime + 25);
+      expect(first.commitments[0].signedBidRoot).toBe(second.commitments[0].signedBidRoot);
+    }
     const store = new PayloadStore();
-    store.add(old.stored);
-    expect(() => store.add(changed.stored)).toThrow("ORDER_METADATA_CONFLICT");
-    expect(restored.queryExposure(orderId, Date.now()).commitmentCount).toBe(1);
-    expect(restored.queryExposure(otherId, Date.now()).commitmentCount).toBe(0);
+    const bids = new BidStore();
+    const ledger = new BidLedger();
+    expect(restored.recover(100, store, bids, ledger)).toBe(2);
+    expect(ledger.getRevisionCount(100)).toBe(1);
+    expect(bids.has(old.bid)).toBe(true);
+    expect(bids.canOffer(old.bid)).toBe(false);
+    expect(store.get(old.stored.blockHash)?.payload.orderMetadata?.orderIds).toEqual([orderId]);
+  });
+
+  it("shares one immutable payload file across identities with separate admission membership", async () => {
+    vi.useFakeTimers();
+    const primary = setup();
+    const staged = setup(primary.directory);
+    const store = new PayloadStore();
+    const old = fixture();
+    const oldStored = store.add(old.stored);
+    const first = primary.worker.retain(old.bid, oldStored);
+    primary.thread.finish();
+    await first;
+    const oldReference = primary.worker.getReference(oldStored);
+    if (!oldReference) throw Error("Missing first reference");
+    const firstBytes = fs.readFileSync(path.join(primary.directory, oldReference.files[0].name));
+    const next = fixture(9, [otherId]);
+    const nextStored = store.add(next.stored);
+    const nextReference = primary.worker.getReference(nextStored);
+    expect(nextReference?.orderMetadata?.orderIds).toEqual([otherId]);
+    expect(oldReference.orderMetadata?.orderIds).toEqual([orderId]);
+    const retained = staged.worker.retainShared(next.bid, nextStored, nextReference);
+    staged.thread.finish();
+    expect(await retained).toBe("reference");
+    expect(fs.readFileSync(path.join(staged.directory, oldReference.files[0].name))).toEqual(firstBytes);
+    expect(fs.statSync(path.join(staged.directory, oldReference.files[0].name)).ino).toBe(
+      fs.statSync(path.join(primary.directory, oldReference.files[0].name)).ino
+    );
+    expect(staged.journal.queryExposure(orderId, Date.now()).commitmentCount).toBe(0);
+    expect(staged.journal.queryExposure(otherId, Date.now()).commitmentCount).toBe(1);
+    const recovered = new CommitmentJournal(staged.directory, identity);
+    expect(recovered.recover(100, new PayloadStore(), new BidStore(), new BidLedger())).toBe(1);
+    expect(recovered.queryExposure(otherId, Date.now()).commitmentCount).toBe(1);
+    await primary.worker.close();
+    await staged.worker.close();
+  });
+
+  it("does not offer new ownership before its floor or erase unknown historical attribution", () => {
+    vi.useFakeTimers();
+    const {journal, directory} = setup();
+    const old = fixture(0, null);
+    journal.retain(old.bid, old.stored);
+    const next = fixture(0, [otherId]);
+    next.stored.payload.orderMetadata = parseOrderMetadata({
+      version: 1,
+      orderIds: [otherId],
+      doNotOfferBefore: Date.now() + 100,
+    });
+    expect(() => journal.retain(next.bid, next.stored)).toThrow("ORDER_OFFER_TOO_EARLY");
+    expect(journal.queryExposure(otherId, Date.now())).toMatchObject({coverageComplete: false, commitmentCount: 0});
+    vi.advanceTimersByTime(100);
+    journal.retain(next.bid, next.stored);
+    const restored = new CommitmentJournal(directory, identity);
+    expect(restored.queryExposure(otherId, Date.now())).toMatchObject({coverageComplete: false, commitmentCount: 1});
+  });
+
+  it("rejects a v3 admission whose key no longer matches its membership", () => {
+    const {journal, directory} = setup();
+    const old = fixture();
+    journal.retain(old.bid, old.stored);
+    const next = fixture(0, [otherId]);
+    journal.retain(next.bid, next.stored);
+    for (const name of fs.readdirSync(directory).filter((name) => name.startsWith("bid-"))) {
+      const filename = path.join(directory, name);
+      const record = JSON.parse(fs.readFileSync(filename, "utf8"));
+      if (record.data.version !== 3) continue;
+      record.data.orderMetadata.orderIds = [orderId];
+      record.checksum = createHash("sha256").update(JSON.stringify(record.data)).digest("hex");
+      fs.writeFileSync(filename, JSON.stringify(record));
+    }
+    expect(() => new CommitmentJournal(directory, identity)).toThrow("COMMITMENT_BID_MISMATCH");
+  });
+
+  it.each([undefined, 2, 4])("recovers legacy and v2 bids but rejects unknown version %s", (version) => {
+    const {journal, directory} = setup();
+    const f = fixture();
+    journal.retain(f.bid, f.stored);
+    const name = fs.readdirSync(directory).find((name) => name.startsWith("bid-"));
+    if (!name) throw Error("Missing bid record");
+    const signedBid = ssz.gloas.SignedExecutionPayloadBid.toJson(f.bid);
+    const data =
+      version === undefined
+        ? signedBid
+        : {version, signedBid, orderMetadata: f.stored.payload.orderMetadata, possibleExposureAtUnixMs: Date.now()};
+    fs.writeFileSync(
+      path.join(directory, name),
+      JSON.stringify({data, checksum: createHash("sha256").update(JSON.stringify(data)).digest("hex")})
+    );
+    if (version === 4) {
+      expect(() => new CommitmentJournal(directory, identity)).toThrow("COMMITMENT_BID_UNSUPPORTED_VERSION");
+    } else {
+      const restored = new CommitmentJournal(directory, identity);
+      const bids = new BidStore();
+      expect(restored.recover(100, new PayloadStore(), bids, new BidLedger())).toBe(1);
+      expect(bids.has(f.bid)).toBe(true);
+      expect(restored.queryExposure(orderId, Date.now())).toMatchObject({
+        coverageComplete: version === 2,
+        commitmentCount: version === 2 ? 1 : 0,
+      });
+    }
+  });
+
+  it("bounds all same-signature admission files per slot across restart and keeps old reveals", () => {
+    const {journal, directory} = setup();
+    const f = fixture();
+    for (let i = 0; i < MAX_BID_REVISIONS_PER_SLOT; i++) {
+      const current = fixture(0, [`0x${i.toString(16).padStart(64, "0")}`]);
+      journal.retain(current.bid, current.stored);
+    }
+    const next = fixture(0, [otherId]);
+    expect(() => journal.retain(next.bid, next.stored)).toThrow("COMMITMENT_SLOT_ADMISSION_LIMIT");
+    const restored = new CommitmentJournal(directory, identity);
+    expect(() => restored.retain(next.bid, next.stored)).toThrow("COMMITMENT_SLOT_ADMISSION_LIMIT");
+    const firstId = `0x${"00".repeat(32)}`;
+    const first = fixture(0, [firstId]);
+    expect(() => restored.retain(first.bid, first.stored)).not.toThrow();
+    const payloads = new PayloadStore();
+    const ledger = new BidLedger();
+    expect(restored.recover(100, payloads, new BidStore(), ledger)).toBe(MAX_BID_REVISIONS_PER_SLOT);
+    expect(ledger.getRevisionCount(100)).toBe(1);
+    expect(payloads.has(f.stored.blockHash)).toBe(true);
+    expect(restored.queryExposure(firstId, Date.now()).commitmentCount).toBe(1);
+  });
+
+  it("keeps async exposure healthy after a recovered admission cap rejects before any write", async () => {
+    const primary = setup();
+    for (let i = 0; i < MAX_BID_REVISIONS_PER_SLOT; i++) {
+      const f = fixture(0, [`0x${i.toString(16).padStart(64, "0")}`]);
+      primary.journal.retain(f.bid, f.stored);
+    }
+    const restored = new CommitmentJournal(primary.directory, identity);
+    const thread = new Thread(restored);
+    const worker = new AsyncCommitmentJournal(thread);
+    thread.emit("message", {id: 0});
+    const names = fs.readdirSync(primary.directory).sort();
+    const fresh = distinctFixture(1234, [otherId]);
+    const refused = worker.retain(fresh.bid, fresh.stored);
+    thread.finish();
+    await expect(refused).rejects.toMatchObject({message: "COMMITMENT_SLOT_ADMISSION_LIMIT", uncertain: false});
+    expect(worker.isHealthy()).toBe(true);
+    expect(fs.readdirSync(primary.directory).sort()).toEqual(names);
+    const original = fixture(0, [`0x${"00".repeat(32)}`]);
+    const retry = worker.retain(original.bid, original.stored);
+    thread.finish();
+    await retry;
+    const next = distinctFixture(1235, [otherId], 101);
+    const admitted = worker.retain(next.bid, next.stored);
+    thread.finish();
+    await admitted;
+    const exposure = worker.queryExposure(otherId, Date.now());
+    thread.finish();
+    expect(await exposure).toMatchObject({coverageComplete: true, commitmentCount: 1});
+    expect(worker.isHealthy()).toBe(true);
+    await worker.close();
   });
 
   it("returns unknown on a bounded wait, then preserves a late durable positive", async () => {

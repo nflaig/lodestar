@@ -5,6 +5,45 @@ import {mockBuiltPayload} from "../utils/payload.js";
 describe("PayloadStore", () => {
   const blockHash = "0x" + "cc".repeat(32);
 
+  it("shares physical bytes while preserving original and current offer attribution", () => {
+    const store = new PayloadStore();
+    const metadata = {version: 1 as const, orderIds: [`0x${"11".repeat(32)}`], doNotOfferBefore: 0};
+    const first = {
+      slot: 5,
+      parentBlockRoot: Buffer.alloc(32),
+      blockHash,
+      payload: {...mockBuiltPayload(), orderMetadata: metadata},
+    };
+    const old = store.add(first);
+    const bytes = store.bytes;
+    const next = store.add({
+      ...first,
+      payload: {...first.payload, orderMetadata: {...metadata, orderIds: [`0x${"22".repeat(32)}`]}},
+    });
+    expect(old.payload.orderMetadata?.orderIds).toEqual(metadata.orderIds);
+    expect(next.payload.orderMetadata?.orderIds).toEqual([`0x${"22".repeat(32)}`]);
+    expect(next.payload.executionPayload).toBe(old.payload.executionPayload);
+    expect(next.payload.blobsBundle).toBe(old.payload.blobsBundle);
+    expect(store.get(blockHash)).toBe(old);
+    expect(store.size).toBe(1);
+    expect(store.bytes).toBe(bytes);
+    expect(() =>
+      store.add({
+        ...first,
+        payload: {...first.payload, executionPayload: {...first.payload.executionPayload, gasUsed: 1}},
+      })
+    ).toThrow("PAYLOAD_STORE_BODY_CONFLICT");
+    expect(() => store.add({...first, parentBlockRoot: Buffer.alloc(32, 1)})).toThrow("PAYLOAD_STORE_BODY_CONFLICT");
+    expect(() =>
+      store.add({
+        ...first,
+        payload: {...first.payload, orderMetadata: {...metadata, doNotOfferBefore: Date.now() + 10000}},
+      })
+    ).toThrow("ORDER_OFFER_TOO_EARLY");
+    expect(store.get(blockHash)).toBe(old);
+    expect(store.bytes).toBe(bytes);
+  });
+
   it("reserves primary byte and count headroom without evicting alternate commitments", () => {
     const first = {slot: 5, parentBlockRoot: Buffer.alloc(32), blockHash, payload: mockBuiltPayload()};
     const measured = new PayloadStore();
