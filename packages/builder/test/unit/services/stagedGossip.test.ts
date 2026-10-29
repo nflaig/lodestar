@@ -239,6 +239,21 @@ describe("staged P2P gossip", () => {
     );
     await vi.advanceTimersByTimeAsync(1801);
     await building;
+    const revisions = improving ? [1, 2, 3, 4, 5] : [1];
+    expect(published().map((bid) => toRootHex(bid.message.blockHash))).toEqual(
+      revisions.map((revision) => toRootHex(Buffer.alloc(32, 10 + revision)))
+    );
+    for (let i = 1; i < published().length; i++) {
+      expect(published()[i].message.value).toBeGreaterThan(published()[i - 1].message.value);
+    }
+    if (!improving) {
+      for (const stage of stages) {
+        const assertion = expect(logger.info);
+        const context = expect.objectContaining({builderIndex: stage.stage.builderIndex});
+        if (deferred) assertion.toHaveBeenCalledWith("Deferred staged execution payload bid", context);
+        else assertion.not.toHaveBeenCalledWith("Deferred staged execution payload bid", context);
+      }
+    }
     expect(source.prepare).toHaveBeenCalledOnce();
     expect(source.release).toHaveBeenCalledOnce();
     for (const offered of published()) {
@@ -247,6 +262,7 @@ describe("staged P2P gossip", () => {
       expect(payloadStore.has(toRootHex(offered.message.blockHash))).toBe(true);
     }
     expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.warn).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
 
