@@ -11,7 +11,9 @@ import {type BidIdentity, BidLedger, BidLedgerErrorCode} from "../../../src/serv
 import {BidPublisher, BidPublisherError, BidPublisherErrorCode} from "../../../src/services/bidPublisher.js";
 import {BuilderSigner} from "../../../src/services/builderSigner.js";
 import {CommitmentJournalError} from "../../../src/services/commitmentJournalError.js";
+import {PayloadStore} from "../../../src/services/payloadStore.js";
 import {getApiClientStub, mockApiErrorResponse, mockApiResponse} from "../utils/apiStub.js";
+import {mockBuiltPayload} from "../utils/payload.js";
 
 const builderIndex = 7;
 
@@ -34,6 +36,74 @@ describe("BidPublisher", () => {
     await expect(publisher.gossip(signed, new AbortController().signal)).rejects.toThrow("ORDER_OFFER_TOO_EARLY");
     expect(api.beacon.publishExecutionPayloadBid).not.toHaveBeenCalled();
     expect(retention).toHaveBeenCalledOnce();
+  });
+
+  it("passes each immutable offer attribution through concurrent retention", async () => {
+    const disk = defer<void>();
+    const store = new PayloadStore();
+    const firstId = `0x${"11".repeat(32)}`;
+    const secondId = `0x${"22".repeat(32)}`;
+    const payload = mockBuiltPayload({slot: 10});
+    const original = {
+      slot: 10,
+      parentBlockRoot: Buffer.alloc(32),
+      blockHash: toRootHex(payload.executionPayload.blockHash),
+      payload: {...payload, orderMetadata: {version: 1 as const, orderIds: [firstId], doNotOfferBefore: 0}},
+    };
+    const first = store.add(original);
+    const second = store.add({
+      ...original,
+      payload: {...original.payload, orderMetadata: {...original.payload.orderMetadata, orderIds: [secondId]}},
+    });
+    const retain = vi.fn(async (_bid, offered) => {
+      await disk.promise;
+      expect(offered?.payload.orderMetadata?.orderIds).toEqual(offered === first ? [firstId] : [secondId]);
+    }) satisfies NonNullable<ConstructorParameters<typeof BidPublisher>[0]["retainCommitment"]>;
+    const canSign = vi.fn((_identity, offered) => offered?.payload.orderMetadata?.doNotOfferBefore === 0);
+    const {publisher} = createPublisher({hasPayload: () => true, retainCommitment: retain, canSign});
+    const bid = createBid();
+    const one = publisher.prepare(bid, 256, first);
+    const two = publisher.prepare(bid, 256, second);
+    expect(retain.mock.calls[0][1]).toBe(first);
+    expect(retain.mock.calls[1][1]).toBe(second);
+    expect(store.get(original.blockHash)?.payload.orderMetadata?.orderIds).toEqual([firstId]);
+    disk.resolve();
+    await Promise.all([one, two]);
+  });
+
+  it("requires context before signing on production publishers and forwards it through publish", async () => {
+    const retain = vi.fn();
+    const {publisher, signer} = createPublisher({
+      hasPayload: () => true,
+      retainCommitment: retain,
+      requireOfferContext: true,
+    });
+    const sign = vi.spyOn(signer, "signExecutionPayloadBid");
+    await expect(publisher.prepare(createBid())).rejects.toThrow("COMMITMENT_OFFER_MISSING");
+    await expect(publisher.publish(createBid(), new AbortController().signal)).rejects.toThrow(
+      "COMMITMENT_OFFER_MISSING"
+    );
+    expect(sign).not.toHaveBeenCalled();
+    expect(retain).not.toHaveBeenCalled();
+    const payload = mockBuiltPayload();
+    const offered = {
+      slot: 10,
+      parentBlockRoot: Buffer.alloc(32),
+      blockHash: toRootHex(payload.executionPayload.blockHash),
+      payload,
+    };
+    await publisher.publish(createBid(), new AbortController().signal, undefined, offered);
+    expect(retain.mock.calls[0][1]).toBe(offered);
+  });
+
+  it("bounds repeated same-signature admissions independently of ledger deduplication", async () => {
+    const {publisher, ledger, signer} = createPublisher({hasPayload: () => true});
+    const sign = vi.spyOn(signer, "signExecutionPayloadBid");
+    const bid = createBid();
+    for (let i = 0; i < 4; i++) await publisher.prepare(bid, 4);
+    expect(ledger.getRevisionCount(bid.slot)).toBe(1);
+    await expect(publisher.prepare(bid, 4)).rejects.toMatchObject({type: {code: BidLedgerErrorCode.REVISION_LIMIT}});
+    expect(sign).toHaveBeenCalledTimes(4);
   });
 
   it("reserves primary revision headroom across pending and uncertain alternate writes", async () => {
@@ -371,10 +441,12 @@ function createPublisher({
   fork = ForkName.gloas,
   retainCommitment,
   canSign,
+  requireOfferContext,
 }: {
   hasPayload: (identity: BidIdentity) => boolean;
-  canSign?: (identity: BidIdentity) => boolean;
+  canSign?: ConstructorParameters<typeof BidPublisher>[0]["canSign"];
   fork?: ForkName;
+  requireOfferContext?: boolean;
   retainCommitment?: ConstructorParameters<typeof BidPublisher>[0]["retainCommitment"];
 }) {
   const config = createBeaconConfig(getConfig(fork), Buffer.alloc(32, 9));
@@ -393,6 +465,7 @@ function createPublisher({
     hasPayload,
     retainCommitment,
     canSign,
+    requireOfferContext,
   });
   return {api, config, keys, ledger, publisher, signer};
 }

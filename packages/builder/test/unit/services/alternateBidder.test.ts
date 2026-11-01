@@ -1976,7 +1976,11 @@ describe("alternate parent bidder", () => {
         blockHash: toRootHex(blockHash),
         payload: {...oldPayload, executionPayload: {...oldPayload.executionPayload, blockHash}},
       });
-      const other = await m.bidPublisher.prepare({...old.message, blockHash, value: old.message.value - 1});
+      const other = await m.bidPublisher.prepare(
+        {...old.message, blockHash, value: old.message.value - 1},
+        undefined,
+        m.payloadStore.get(toRootHex(blockHash)) ?? undefined
+      );
       const otherEligibility = {
         generation: "0x0",
         lease: {

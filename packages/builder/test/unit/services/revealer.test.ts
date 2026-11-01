@@ -74,20 +74,24 @@ describe("Revealer", () => {
     retainPayload = true,
     orderMetadata,
     offerEligibility,
+    parentHash,
+    parentRoot = Buffer.alloc(32, 4),
   }: {
     recordBid?: boolean;
     retainPayload?: boolean;
     orderMetadata?: OrderMetadata;
     offerEligibility?: OfferEligibility;
+    parentHash?: Uint8Array;
+    parentRoot?: Uint8Array;
   } = {}): ObservedBlock {
-    const payload = {...mockBuiltPayload({slot}), orderMetadata, offerEligibility};
+    const payload = {...mockBuiltPayload({slot, parentHash}), orderMetadata, offerEligibility};
     const block = ssz.gloas.SignedBeaconBlock.defaultValue();
     block.message.slot = slot;
     const signedBid = block.message.body.signedExecutionPayloadBid;
     signedBid.message.slot = slot;
     signedBid.message.builderIndex = builderIndex;
     signedBid.message.parentBlockHash = payload.executionPayload.parentHash;
-    signedBid.message.parentBlockRoot = Buffer.alloc(32, 4);
+    signedBid.message.parentBlockRoot = parentRoot;
     signedBid.message.blockHash = payload.executionPayload.blockHash;
     signedBid.message.executionRequestsRoot = ssz.gloas.ExecutionRequests.hashTreeRoot(payload.executionRequests);
     const blockHash = toRootHex(signedBid.message.blockHash);
@@ -116,7 +120,11 @@ describe("Revealer", () => {
     };
   }
 
-  it("reveals the exact old payload selected after a cancellation fence acknowledgement", async () => {
+  it.each([
+    {branch: "FULL", parentHash: Buffer.alloc(32, 10), parentRoot: Buffer.alloc(32, 4)},
+    {branch: "EMPTY", parentHash: Buffer.alloc(32, 9), parentRoot: Buffer.alloc(32, 4)},
+    {branch: "parent", parentHash: Buffer.alloc(32, 9), parentRoot: Buffer.alloc(32, 3)},
+  ])("reveals the exact old $branch payload selected after cancellation", async ({parentHash, parentRoot}) => {
     const orderId = `0x${"12".repeat(32)}`;
     const lease = {
       generation: "0x0",
@@ -126,6 +134,8 @@ describe("Revealer", () => {
     };
     const eligibility = {generation: "0x0", lease};
     const observed = selectedBlock({
+      parentHash,
+      parentRoot,
       orderMetadata: parseOrderMetadata({version: 1, orderIds: [orderId], doNotOfferBefore: 0}),
       offerEligibility: eligibility,
     });

@@ -2,7 +2,7 @@ import {vi} from "vitest";
 import {ApiClient} from "@lodestar/api";
 import {ChainForkConfig} from "@lodestar/config";
 import {IClock} from "@lodestar/state-transition";
-import {BuilderIndex, BuilderStatus, gloas} from "@lodestar/types";
+import {BuilderIndex, BuilderStatus} from "@lodestar/types";
 import {Logger, fromHex} from "@lodestar/utils";
 import {Bidder, type BidderOptions} from "../../../src/services/bidder.js";
 import {BidLedger} from "../../../src/services/bidLedger.js";
@@ -78,7 +78,7 @@ export function createBiddingModules({
   revealOptions?: Partial<RevealerOptions>;
   dryRun?: boolean;
   gossipStages?: GossipStage[];
-  retainCommitment?: (bid: gloas.SignedExecutionPayloadBid) => Promise<void>;
+  retainCommitment?: ConstructorParameters<typeof BidPublisher>[0]["retainCommitment"];
   updateOptions?: Partial<BidderOptions>;
   canRetainAlternate?: () => boolean;
 }): {ledger: BidLedger; bidStore: BidStore; bidder: Bidder; revealer: Revealer; bidPublisher: BidPublisher} {
@@ -92,6 +92,7 @@ export function createBiddingModules({
     builderIndex: index,
     hasPayload: ({blockHash}) => payloadStore.has(blockHash),
     retainCommitment,
+    requireOfferContext: true,
   });
   const bidder = new Bidder(
     {

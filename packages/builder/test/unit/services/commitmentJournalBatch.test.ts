@@ -1,3 +1,4 @@
+import {createHash} from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -80,9 +81,23 @@ function setup(blobs = 3) {
   stage.retainReveal(reveal);
   const previousFiles = snapshot(stageDirectory);
   const next = revision(2, blobs);
+  const primaryAdmissionStart = Date.now();
   const reference = primary.retain(next.signed, next.stored);
+  const primaryAdmissionEnd = Date.now();
   if (!reference) throw Error("Missing durable reference");
-  return {primaryDirectory, stageDirectory, primary, stage, previous, previousFiles, reveal, next, reference};
+  return {
+    primaryDirectory,
+    stageDirectory,
+    primary,
+    stage,
+    previous,
+    previousFiles,
+    reveal,
+    next,
+    reference,
+    primaryAdmissionStart,
+    primaryAdmissionEnd,
+  };
 }
 
 function expectPayload(actual: BuiltPayload | undefined, expected: BuiltPayload): void {
@@ -116,7 +131,9 @@ describe("CommitmentJournal reference durability barriers", () => {
       if (fs.fstatSync(fd).isDirectory())
         events.push(fs.readdirSync(state.stageDirectory).filter((name) => !state.previousFiles.has(name)));
     });
+    const stageAdmissionStart = Date.now();
     state.stage.retainReference(state.next.signed, state.reference);
+    const stageAdmissionEnd = Date.now();
     expect(events).toHaveLength(blobs ? 3 : 2);
     if (blobs) {
       expect(events[0]).toHaveLength(blobs);
@@ -126,8 +143,31 @@ describe("CommitmentJournal reference durability barriers", () => {
     expect(events.at(-2)?.some((name) => name.startsWith("bid-"))).toBe(false);
     expect(events.at(-1)?.filter((name) => name.startsWith("bid-"))).toHaveLength(1);
     vi.restoreAllMocks();
-    for (const [name, bytes] of snapshot(state.primaryDirectory))
-      expect(fs.readFileSync(path.join(state.stageDirectory, name)), name).toEqual(bytes);
+    for (const [name, bytes] of snapshot(state.primaryDirectory)) {
+      const stagedBytes = fs.readFileSync(path.join(state.stageDirectory, name));
+      if (!name.startsWith("bid-")) {
+        expect(stagedBytes, name).toEqual(bytes);
+        continue;
+      }
+      const primaryRecord = JSON.parse(bytes.toString()) as {
+        data: {possibleExposureAtUnixMs: number};
+        checksum: string;
+      };
+      const stageRecord = JSON.parse(stagedBytes.toString()) as typeof primaryRecord;
+      for (const [record, start, end] of [
+        [primaryRecord, state.primaryAdmissionStart, state.primaryAdmissionEnd],
+        [stageRecord, stageAdmissionStart, stageAdmissionEnd],
+      ] as const) {
+        expect(Number.isSafeInteger(record.data.possibleExposureAtUnixMs), name).toBe(true);
+        expect(record.data.possibleExposureAtUnixMs, name).toBeGreaterThanOrEqual(start);
+        expect(record.data.possibleExposureAtUnixMs, name).toBeLessThanOrEqual(end);
+        expect(record.checksum, name).toBe(createHash("sha256").update(JSON.stringify(record.data)).digest("hex"));
+      }
+      const data = {...primaryRecord.data, possibleExposureAtUnixMs: stageRecord.data.possibleExposureAtUnixMs};
+      expect(stagedBytes, name).toEqual(
+        Buffer.from(JSON.stringify({data, checksum: createHash("sha256").update(JSON.stringify(data)).digest("hex")}))
+      );
+    }
     fs.rmSync(state.primaryDirectory, {recursive: true, force: true});
     const recovered = expectPrevious(state);
     expect(recovered.bids.has(state.next.signed)).toBe(true);
