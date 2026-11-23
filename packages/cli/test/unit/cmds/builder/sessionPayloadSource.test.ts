@@ -17,6 +17,7 @@ import {
   PayloadOrchestrator,
   PayloadOrchestratorErrorCode,
 } from "../../../../../builder/src/services/payloadOrchestrator.js";
+import {createConstructorStatusReader} from "../../../../src/cmds/builder/constructorStatus.js";
 import {SessionPayloadErrorCode, SessionPayloadSource} from "../../../../src/cmds/builder/sessionPayloadSource.js";
 
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
@@ -79,19 +80,28 @@ describe("SessionPayloadSource", () => {
     boundedAlternates = false,
     beginReservations = false,
     retainedAlternateOffers = false,
-    primaryHandoff = false
+    primaryHandoff = false,
+    getConstructorStatus?: (signal: AbortSignal) => Promise<unknown>
   ) {
     const rpc = new JsonRpcHttpClient(["http://127.0.0.1:1"]);
     const fetch = vi.spyOn(rpc, "fetch");
     const warn = vi.fn<Logger["warn"]>();
     const signals: AbortSignal[] = [];
+    const options = {
+      boundedAlternates,
+      beginReservations,
+      retainedAlternateOffers,
+      primaryHandoff,
+      getConstructorStatus,
+      logger: {warn},
+    };
     const source = new SessionPayloadSource(
       "session",
       (callSignal) => {
         signals.push(callSignal);
         return rpc;
       },
-      {boundedAlternates, beginReservations, retainedAlternateOffers, primaryHandoff, logger: {warn}}
+      options
     );
     return {source, fetch, signals, warn, request: buildRequest()};
   }
@@ -1087,6 +1097,206 @@ describe("SessionPayloadSource", () => {
         );
         await expect(source.release(handle, signal)).rejects.toBeInstanceOf(ErrorJsonRpcResponse);
         expect(source.getResources()).toMatchObject({uncertain: 1});
+      }
+    });
+
+    it("recovers two old reservations only after a definite mismatch and fresh constructor identity", async () => {
+      const current = "cd".repeat(16);
+      const status = vi.fn().mockResolvedValue({ok: true, constructorInstance: current, beginRecoveryEnabled: true});
+      const {source, fetch, request} = setup(false, true, false, false, status);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce({...begun(), orderGenerationVersion: 1});
+      const first = await source.prepare(request, signal);
+      fetch.mockResolvedValueOnce({
+        generation: "0x7",
+        leaseMs: 250,
+        ready: true,
+        payload: payloadResponse(request),
+      });
+      const retained = await source.getPayload(first, signal);
+      const blockHash = toHex(retained.executionPayload.blockHash);
+      fetch.mockResolvedValueOnce(reservation(2)).mockResolvedValueOnce(begun(2));
+      const second = await source.prepare(request, signal);
+      expect(source.getResources()).toMatchObject({active: 2});
+      const mismatch = new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "BeginReservationInstanceMismatch"}},
+        "zbuilder_cancelBeginV1"
+      );
+      fetch.mockRejectedValue(mismatch);
+      await Promise.all([source.release(first, signal), source.release(second, signal)]);
+      expect(status).toHaveBeenCalledTimes(2);
+      expect(source.getResources()).toMatchObject({preparing: 0, active: 0, uncertain: 0, releasing: 0});
+      expect(toHex(retained.executionPayload.blockHash)).toBe(blockHash);
+      expect(retained.offerEligibility?.lease.ready).toBe(false);
+      const next = `begin-${current}-1`;
+      fetch
+        .mockResolvedValueOnce({...reservation(), reservationId: next})
+        .mockResolvedValueOnce({...begun(), sessionId: next});
+      await expect(source.prepare(request, signal)).resolves.toMatchObject({payloadId: next});
+      expect(fetch.mock.calls.some(([call]) => call.method === "zbuilder_releasePayloadOfferV1")).toBe(false);
+    });
+
+    it("recovers a restart between reservation and begin without accepting the failed begin", async () => {
+      const current = "cd".repeat(16);
+      const status = vi.fn().mockResolvedValue({ok: true, constructorInstance: current, beginRecoveryEnabled: true});
+      const {source, fetch, request} = setup(false, true, false, false, status);
+      const mismatch = new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "BeginReservationInstanceMismatch"}},
+        "zbuilder_beginReservedV1"
+      );
+      fetch.mockResolvedValueOnce(reservation()).mockRejectedValue(mismatch);
+      await expect(source.prepare(request, signal)).rejects.toBe(mismatch);
+      await source.reconcileResources(signal);
+      expect(source.getResources()).toMatchObject({preparing: 0, active: 0, uncertain: 0, releasing: 0});
+      expect(status).toHaveBeenCalledTimes(1);
+      expect(fetch.mock.calls.map(([call]) => call.method)).toEqual([
+        "zbuilder_reserveBeginV1",
+        "zbuilder_beginReservedV1",
+        "zbuilder_cancelBeginV1",
+      ]);
+    });
+
+    it.each([
+      undefined,
+      {},
+      {ok: true, constructorInstance: "ab".repeat(16), beginRecoveryEnabled: true},
+      {ok: true, constructorInstance: "cd".repeat(16), beginRecoveryEnabled: false},
+      {ok: true, constructorInstance: "malformed", beginRecoveryEnabled: true},
+      {ok: false, constructorInstance: "cd".repeat(16), beginRecoveryEnabled: true},
+    ])("does not retire a mismatched reservation with unproven current status %j", async (proof) => {
+      const status = vi.fn().mockResolvedValue(proof);
+      const {source, fetch, request} = setup(false, true, false, false, status);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+      const handle = await source.prepare(request, signal);
+      const mismatch = new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "BeginReservationInstanceMismatch"}},
+        "zbuilder_cancelBeginV1"
+      );
+      fetch.mockRejectedValueOnce(mismatch);
+      await expect(source.release(handle, signal)).rejects.toBe(mismatch);
+      expect(source.getResources()).toMatchObject({uncertain: 1});
+    });
+
+    it.each(["reject", "timeout", "abort"])(
+      "preserves mismatch ownership after a status reader %s and retries reconciliation",
+      async (failure) => {
+        vi.useFakeTimers({toFake: ["setTimeout", "clearTimeout", "performance"]});
+        try {
+          const status = vi
+            .fn<(signal: AbortSignal) => Promise<unknown>>()
+            .mockImplementationOnce(async () => {
+              if (failure === "reject") throw Error("status unavailable");
+              return new Promise(() => {});
+            })
+            .mockResolvedValue({ok: true, constructorInstance: "cd".repeat(16), beginRecoveryEnabled: true});
+          const {source, fetch, request} = setup(false, true, false, false, status);
+          fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce(begun());
+          const handle = await source.prepare(request, signal);
+          const mismatch = new ErrorJsonRpcResponse(
+            {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "BeginReservationInstanceMismatch"}},
+            "zbuilder_cancelBeginV1"
+          );
+          fetch.mockRejectedValue(mismatch);
+          const controller = new AbortController();
+          const rejected = expect(source.release(handle, controller.signal)).rejects.toBe(mismatch);
+          await vi.advanceTimersByTimeAsync(0);
+          expect(status).toHaveBeenCalledTimes(1);
+          if (failure === "abort") controller.abort();
+          if (failure === "timeout") await vi.advanceTimersByTimeAsync(1000);
+          await rejected;
+          expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 1});
+          await vi.advanceTimersByTimeAsync(1000);
+          await source.reconcileResources(signal);
+          expect(status).toHaveBeenCalledTimes(2);
+          expect(source.getResources()).toMatchObject({active: 0, releasing: 0, uncertain: 0});
+        } finally {
+          vi.useRealTimers();
+        }
+      }
+    );
+
+    it("cannot revive an old payload lease after proven reservation retirement", async () => {
+      const status = vi
+        .fn()
+        .mockResolvedValue({ok: true, constructorInstance: "cd".repeat(16), beginRecoveryEnabled: true});
+      const {source, fetch, request} = setup(false, true, false, false, status);
+      fetch.mockResolvedValueOnce(reservation()).mockResolvedValueOnce({...begun(), orderGenerationVersion: 1});
+      const handle = await source.prepare(request, signal);
+      const reply = defer<unknown>();
+      fetch.mockImplementationOnce(() => reply.promise);
+      const pending = source.getPayload(handle, signal);
+      const rejected = expect(pending).rejects.toMatchObject({type: {code: SessionPayloadErrorCode.UNKNOWN_HANDLE}});
+      fetch.mockRejectedValueOnce(
+        new ErrorJsonRpcResponse(
+          {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "BeginReservationInstanceMismatch"}},
+          "zbuilder_cancelBeginV1"
+        )
+      );
+      await source.release(handle, signal);
+      reply.resolve({generation: "0x7", leaseMs: 250, ready: true, payload: payloadResponse(request)});
+      await rejected;
+      expect(source.getResources()).toMatchObject({active: 0, uncertain: 0});
+    });
+
+    it("recovers both occupied slots through real HTTP after an unseen constructor replacement", async () => {
+      let instance = "ab".repeat(16);
+      let serial = 0;
+      const methods: string[] = [];
+      const server = createServer(async (request, response) => {
+        response.setHeader("content-type", "application/json");
+        if (request.url === "/healthz") {
+          methods.push("health");
+          response.end(JSON.stringify({ok: true, constructorInstance: instance, beginRecoveryEnabled: true}));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(Buffer.from(chunk));
+        const call = JSON.parse(Buffer.concat(chunks).toString()) as {id: number; method: string; params: string[]};
+        methods.push(call.method);
+        let result: unknown;
+        if (call.method === "zbuilder_reserveBeginV1")
+          result = {reservationId: `begin-${instance}-${++serial}`, beginReservationVersion: 1};
+        else if (call.method === "zbuilder_beginReservedV1") result = {...begun(), sessionId: call.params[0]};
+        else if (call.method === "zbuilder_cancelBeginV1" && !call.params[0].startsWith(`begin-${instance}-`)) {
+          response.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: call.id,
+              error: {code: -32000, message: "BeginReservationInstanceMismatch"},
+            })
+          );
+          return;
+        } else result = released;
+        response.end(JSON.stringify({jsonrpc: "2.0", id: call.id, result}));
+      });
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      try {
+        const address = server.address();
+        if (address === null || typeof address === "string") throw Error("invalid fixture address");
+        const url = `http://127.0.0.1:${address.port}`;
+        const source = new SessionPayloadSource(
+          url,
+          (callSignal) => new JsonRpcHttpClient([url], {signal: callSignal}),
+          {
+            beginReservations: true,
+            getConstructorStatus: createConstructorStatusReader(url),
+          }
+        );
+        const first = await source.prepare(buildRequest(), signal);
+        const second = await source.prepare(buildRequest(), signal);
+        expect(source.getResources()).toMatchObject({active: 2});
+        instance = "cd".repeat(16);
+        await Promise.all([source.release(first, signal), source.release(second, signal)]);
+        expect(source.getResources()).toMatchObject({active: 0, uncertain: 0, releasing: 0});
+        const next = await source.prepare(buildRequest(), signal);
+        expect(next.payloadId).toContain(instance);
+        expect(methods.filter((method) => method === "health")).toHaveLength(2);
+        expect(methods.indexOf("health")).toBeGreaterThan(methods.indexOf("zbuilder_cancelBeginV1"));
+        await source.release(next, signal);
+      } finally {
+        server.closeAllConnections();
+        server.close();
+        await once(server, "close");
       }
     });
 

@@ -25,6 +25,7 @@ import {
 import {CELLS_PER_EXT_BLOB, FIELD_ELEMENTS_PER_BLOB, ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
 import {ErrorAborted, LodestarError, type Logger, isFetchError, sleep, toHex, withTimeout} from "@lodestar/utils";
+import {CONSTRUCTOR_STATUS_TIMEOUT_MS, type ConstructorStatusReader} from "./constructorStatus.js";
 
 type Rpc = Pick<JsonRpcHttpClient, "fetch">;
 type PayloadResponse = EngineApiRpcReturnTypes["engine_getPayloadV6"];
@@ -139,6 +140,7 @@ export class SessionPayloadSource implements PayloadSource {
       beginReservations?: boolean;
       retainedAlternateOffers?: boolean;
       primaryHandoff?: boolean;
+      getConstructorStatus?: ConstructorStatusReader;
       logger?: {warn: Logger["warn"]};
     } = {}
   ) {}
@@ -495,7 +497,8 @@ export class SessionPayloadSource implements PayloadSource {
   /** Reserve an allocation identity before sending the non-idempotent begin.
    * A lost reserve reply cannot allocate a worker. Once known, the ticket stays
    * counted until the constructor proves neither queued nor attached work can
-   * survive. A timeout or a changed server instance is not that proof.
+   * survive. A timeout or an identity change alone is not that proof. Restart
+   * recovery also requires explicit rejection and fresh private-server status.
    */
   private async prepareReserved(request: BuildRequest, signal: AbortSignal): Promise<BuildHandle> {
     this.preparing++;
@@ -985,6 +988,44 @@ export class SessionPayloadSource implements PayloadSource {
       });
   }
 
+  private async confirmedReplacementInstance(
+    payloadId: string,
+    entry: SessionEntry,
+    error: unknown,
+    signal: AbortSignal
+  ): Promise<string | null> {
+    try {
+      const read = this.options.getConstructorStatus;
+      if (!entry.reserved || !read || !(error instanceof ErrorJsonRpcResponse)) return null;
+      const rejection = error.response.error;
+      if (rejection.code !== -32000 || rejection.message !== "BeginReservationInstanceMismatch") return null;
+      const previous = /^begin-([0-9a-f]{32})-[1-9][0-9]{0,19}$/.exec(payloadId)?.[1];
+      if (!previous) return null;
+      const check = AbortSignal.any([signal, AbortSignal.timeout(CONSTRUCTOR_STATUS_TIMEOUT_MS)]);
+      const status = await withTimeout(() => read(check), CONSTRUCTOR_STATUS_TIMEOUT_MS, check);
+      if (check.aborted || typeof status !== "object" || status === null) return null;
+      if (
+        !("ok" in status) ||
+        status.ok !== true ||
+        !("beginRecoveryEnabled" in status) ||
+        status.beginRecoveryEnabled !== true
+      )
+        return null;
+      if (
+        !("constructorInstance" in status) ||
+        typeof status.constructorInstance !== "string" ||
+        !/^[0-9a-f]{32}$/.test(status.constructorInstance) ||
+        status.constructorInstance === previous
+      )
+        return null;
+      return status.constructorInstance;
+    } catch {
+      // Malformed/failed status, cancellation and unreadable RPC diagnostics
+      // retain the original uncertain ownership and original cancellation error.
+      return null;
+    }
+  }
+
   async release(handle: BuildHandle, signal: AbortSignal): Promise<void> {
     const entry = this.requests.get(handle.payloadId);
     if (!this.tracksSessions) {
@@ -1044,8 +1085,26 @@ export class SessionPayloadSource implements PayloadSource {
           throw new SessionPayloadError({code: SessionPayloadErrorCode.RELEASE_UNCONFIRMED, reason: handle.payloadId});
         this.requests.delete(handle.payloadId);
       })
-      .catch((error: unknown) => {
+      .catch(async (error: unknown) => {
         entry.state = "uncertain";
+        const replacement = await this.confirmedReplacementInstance(handle.payloadId, entry, error, signal);
+        if (replacement !== null && this.requests.get(handle.payloadId) === entry) {
+          if (entry.lease) entry.lease.ready = false;
+          this.requests.delete(handle.payloadId);
+          // This retires only mutable capacity in the previous incarnation.
+          // Existing payload bytes, retained offers and durable signed reveals
+          // are independently owned and must never be dropped here.
+          try {
+            this.options.logger?.warn("Retired reservation from replaced constructor", {
+              code: "SESSION_PAYLOAD_INSTANCE_RETIRED",
+              sessionId: handle.payloadId,
+              constructorInstance: replacement,
+            });
+          } catch {
+            // Diagnostics cannot undo confirmed resource recovery.
+          }
+          return;
+        }
         try {
           if (
             entry.reserved &&
