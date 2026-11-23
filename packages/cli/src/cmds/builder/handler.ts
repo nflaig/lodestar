@@ -34,6 +34,7 @@ import {
 } from "../../util/index.js";
 import {getVersionData} from "../../util/version.js";
 import {BuilderRestApiServer, getBuilderApiBeforeInit} from "./apiServer.js";
+import {createConstructorStatusReader} from "./constructorStatus.js";
 import {ForkTransitionPayloadSource} from "./forkTransitionPayloadSource.js";
 import {loadGossipIdentities} from "./gossipIdentities.js";
 import {loadBuilderKeypair} from "./loadKeypair.js";
@@ -281,7 +282,14 @@ export async function builderHandler(args: IBuilderCliArgs & GlobalArgs): Promis
           signal,
           timeout: args["execution.timeout"],
         }),
-      {boundedAlternates: alternateBranches, beginReservations, retainedAlternateOffers, primaryHandoff, logger}
+      {
+        boundedAlternates: alternateBranches,
+        beginReservations,
+        retainedAlternateOffers,
+        primaryHandoff,
+        getConstructorStatus: createConstructorStatusReader(constructorUrl),
+        logger,
+      }
     );
     if (engineUntilSlot !== undefined) {
       payloadSource = new ForkTransitionPayloadSource(
