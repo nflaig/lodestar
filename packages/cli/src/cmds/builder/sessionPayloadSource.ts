@@ -954,11 +954,23 @@ export class SessionPayloadSource implements PayloadSource {
     const pauseEpoch = retained.pauseEpoch ?? 0;
     const started = performance.now();
     const startedUnix = Date.now();
+    const call = {method: "zbuilder_renewPayloadOfferV1", params: [retained.id]};
     try {
-      const result = await this.rpc(signal).fetch<RetainedResponse>(
-        {method: "zbuilder_renewPayloadOfferV1", params: [retained.id]},
-        {timeout: 250}
-      );
+      const rpc = this.rpc(signal);
+      let result: RetainedResponse;
+      try {
+        result = await rpc.fetch<RetainedResponse>(call, {timeout: 250});
+      } catch (error) {
+        if (!isFetchError(error) || (error.code !== "UND_ERR_SOCKET" && error.code !== "ECONNRESET")) throw error;
+        if (signal.aborted) throw new ErrorAborted();
+        const remaining = Math.floor(250 - Math.max(performance.now() - started, Date.now() - startedUnix));
+        if (remaining <= 0 || retained.closed || retained.paused || (retained.pauseEpoch ?? 0) !== pauseEpoch)
+          throw error;
+        // Renewal rechecks one existing token; it never creates a grant. Retry
+        // a closing pooled socket once, within the ORIGINAL deadline and lease
+        // clocks. Do not retry acquisition, release or application rejections.
+        result = await rpc.fetch<RetainedResponse>(call, {timeout: remaining});
+      }
       signal.throwIfAborted();
       this.applyRetainedLease(payload, result, started, startedUnix, pauseEpoch);
       return !retained.paused && (retained.pauseEpoch ?? 0) === pauseEpoch && eligibility.lease.ready;
