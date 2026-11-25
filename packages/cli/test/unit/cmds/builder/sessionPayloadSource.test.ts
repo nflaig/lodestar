@@ -12,7 +12,7 @@ import {
 import {type BuildRequest, PayloadSourceNotReady} from "@lodestar/builder";
 import {ForkName} from "@lodestar/params";
 import {ssz} from "@lodestar/types";
-import {ErrorAborted, FetchError, type Logger, defer, sleep, toHex, toRootHex} from "@lodestar/utils";
+import {ErrorAborted, FetchError, type Logger, TimeoutError, defer, sleep, toHex, toRootHex} from "@lodestar/utils";
 import {
   PayloadOrchestrator,
   PayloadOrchestratorErrorCode,
@@ -95,15 +95,12 @@ describe("SessionPayloadSource", () => {
       getConstructorStatus,
       logger: {warn},
     };
-    const source = new SessionPayloadSource(
-      "session",
-      (callSignal) => {
-        signals.push(callSignal);
-        return rpc;
-      },
-      options
-    );
-    return {source, fetch, signals, warn, request: buildRequest()};
+    const rpcFactory = vi.fn((callSignal: AbortSignal) => {
+      signals.push(callSignal);
+      return rpc;
+    });
+    const source = new SessionPayloadSource("session", rpcFactory, options);
+    return {source, fetch, signals, rpcFactory, warn, request: buildRequest()};
   }
 
   describe("retained alternate offers", () => {
@@ -512,6 +509,247 @@ describe("SessionPayloadSource", () => {
       await expect(source.getPayload(handle, signal)).rejects.toMatchObject({
         type: {code: SessionPayloadErrorCode.RESPONSE_MISMATCH},
       });
+    });
+
+    it.each(["UND_ERR_SOCKET", "ECONNRESET"])(
+      "retries one %s renewal within the original lease budget",
+      async (code) => {
+        const {source, fetch, request, handle} = await prepared();
+        fetch.mockResolvedValueOnce(grant(request));
+        const payload = await source.getPayload(handle, signal);
+        fetch.mockClear();
+        let now = 8_000;
+        const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+        try {
+          fetch.mockImplementationOnce(async () => {
+            now += 50;
+            throw transportError(code);
+          });
+          fetch.mockResolvedValueOnce(grant(request));
+          expect(await source.renewOffer(payload, signal)).toBe(true);
+          expect(fetch.mock.calls).toEqual([
+            [{method: "zbuilder_renewPayloadOfferV1", params: [offerId]}, {timeout: 250}],
+            [{method: "zbuilder_renewPayloadOfferV1", params: [offerId]}, {timeout: 200}],
+          ]);
+          expect(payload.offerEligibility?.lease.validUntil).toBe(8_250);
+        } finally {
+          clock.mockRestore();
+        }
+      }
+    );
+
+    it("limits failed renewal transport recovery to two attempts without closing the retained reveal", async () => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      fetch.mockClear();
+      const error = transportError("UND_ERR_SOCKET");
+      fetch.mockRejectedValue(error);
+      await expect(source.renewOffer(payload, signal)).rejects.toBe(error);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(payload.offerEligibility?.lease.ready).toBe(false);
+      expect(payload.offerEligibility?.retained?.closed).toBe(false);
+    });
+
+    it.each(["elapsed", "cancelled", "paused", "epoch", "released"])(
+      "does not retry a renewal after its budget or context changed: %s",
+      async (change) => {
+        const {source, fetch, request, handle} = await prepared();
+        fetch.mockResolvedValueOnce(grant(request));
+        const payload = await source.getPayload(handle, signal);
+        const retained = payload.offerEligibility?.retained;
+        if (!retained) throw Error("Missing grant");
+        fetch.mockClear();
+        const controller = new AbortController();
+        let now = 8_000;
+        const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+        try {
+          fetch.mockImplementationOnce(async () => {
+            if (change === "elapsed") now += 251;
+            if (change === "cancelled") controller.abort();
+            if (change === "paused") retained.paused = true;
+            if (change === "epoch") retained.pauseEpoch = (retained.pauseEpoch ?? 0) + 1;
+            if (change === "released") retained.closed = true;
+            throw transportError("UND_ERR_SOCKET");
+          });
+          await expect(source.renewOffer(payload, controller.signal)).rejects.toBeInstanceOf(Error);
+          expect(fetch).toHaveBeenCalledTimes(1);
+          if (change !== "epoch") expect(payload.offerEligibility?.lease.ready).toBe(false);
+        } finally {
+          clock.mockRestore();
+        }
+      }
+    );
+
+    it.each([
+      transportError("ETIMEDOUT"),
+      new Error("application failure", {cause: Object.assign(new Error("closed"), {code: "UND_ERR_SOCKET"})}),
+      new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "StaleOrderGeneration"}},
+        "zbuilder_renewPayloadOfferV1"
+      ),
+    ])("does not retry a non-socket renewal failure: %s", async (error) => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      fetch.mockClear();
+      fetch.mockRejectedValueOnce(error);
+      await expect(source.renewOffer(payload, signal)).rejects.toBe(error);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(payload.offerEligibility?.lease.ready).toBe(false);
+    });
+
+    it.each(["success", "timeout", "cancelled"])("handles %s after a real HTTP renewal socket closes", async (mode) => {
+      const request = buildRequest();
+      const renewalTokens: unknown[] = [];
+      let closeRenewal = true;
+      let firstRenewalAt = 0;
+      const controller = new AbortController();
+      const server = createServer(async (req, res) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(Buffer.from(chunk));
+        const call = JSON.parse(Buffer.concat(chunks).toString()) as {
+          id: number;
+          method: string;
+          params: unknown[];
+        };
+        if (call.method === "zbuilder_renewPayloadOfferV1") {
+          renewalTokens.push(call.params[0]);
+          if (closeRenewal) {
+            firstRenewalAt = performance.now();
+            closeRenewal = false;
+            await sleep(120);
+            req.socket.destroy();
+            return;
+          }
+          if (mode === "timeout") return;
+          if (mode === "cancelled") {
+            controller.abort("caller cancelled");
+            return;
+          }
+        }
+        const result =
+          call.method === "zbuilder_beginV1"
+            ? {sessionId: session, ...capabilities}
+            : call.method === "zbuilder_beginAlternateV2"
+              ? {sessionId: alternate, ...capabilities, alternateSessionVersion: 2}
+              : grant(request);
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({jsonrpc: "2.0", id: call.id, result}));
+      });
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Missing listener address");
+        const source = new SessionPayloadSource(
+          "socket",
+          (callSignal) => new JsonRpcHttpClient([`http://127.0.0.1:${address.port}`], {signal: callSignal}),
+          {boundedAlternates: true, retainedAlternateOffers: true}
+        );
+        await source.prepare(request, signal);
+        const handle = await source.prepare({...request, requireRetainedOffer: true}, signal);
+        const payload = await source.getPayload(handle, signal);
+        const started = performance.now();
+        const renewing = source.renewOffer(payload, controller.signal);
+        if (mode === "success") {
+          expect(await renewing).toBe(true);
+          expect(payload.offerEligibility?.lease.validUntil).toBeLessThanOrEqual(firstRenewalAt + 250);
+        } else {
+          await expect(renewing).rejects.toBeInstanceOf(mode === "timeout" ? TimeoutError : ErrorAborted);
+          expect(payload.offerEligibility?.lease.ready).toBe(false);
+        }
+        expect(renewalTokens).toEqual([offerId, offerId]);
+        expect(payload.offerEligibility?.retained?.closed).toBe(false);
+        expect(performance.now() - started).toBeLessThan(320);
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      }
+    });
+
+    it("clears ready if constructing the renewal client fails", async () => {
+      const {source, fetch, request, handle, rpcFactory} = await prepared();
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      rpcFactory.mockImplementationOnce(() => {
+        throw new Error("client creation failed");
+      });
+      await expect(source.renewOffer(payload, signal)).rejects.toThrow("client creation failed");
+      expect(payload.offerEligibility?.lease.ready).toBe(false);
+      expect(payload.offerEligibility?.retained?.closed).toBe(false);
+    });
+
+    it("preserves definite revocation when its reply races caller cancellation", async () => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      fetch.mockClear();
+      const controller = new AbortController();
+      const rejected = new ErrorJsonRpcResponse(
+        {jsonrpc: "2.0", id: 1, error: {code: -32000, message: "StaleOrderGeneration"}},
+        "zbuilder_renewPayloadOfferV1"
+      );
+      fetch.mockImplementationOnce(async () => {
+        controller.abort();
+        throw rejected;
+      });
+      await expect(source.renewOffer(payload, controller.signal)).rejects.toBe(rejected);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(payload.offerEligibility?.retained?.closed).toBe(true);
+      expect(payload.offerEligibility?.lease.ready).toBe(false);
+    });
+
+    it.each([false, true])(
+      "handles a lost renewal during slow acquisition (second attempt succeeds %s)",
+      async (succeeds) => {
+        const {source, fetch, request, handle} = await prepared();
+        const socketError = transportError("UND_ERR_SOCKET");
+        fetch.mockImplementationOnce(async () => {
+          await sleep(270);
+          return grant(request);
+        });
+        fetch.mockRejectedValueOnce(socketError);
+        if (succeeds) fetch.mockResolvedValueOnce(grant(request));
+        else fetch.mockRejectedValueOnce(socketError).mockResolvedValueOnce(true);
+        const acquiring = source.getPayload(handle, signal);
+        if (succeeds) expect((await acquiring).offerEligibility?.lease.ready).toBe(true);
+        else {
+          await expect(acquiring).rejects.toBe(socketError);
+          expect(fetch).toHaveBeenLastCalledWith(
+            {method: "zbuilder_releasePayloadOfferV1", params: [offerId]},
+            {timeout: 1000}
+          );
+        }
+      }
+    );
+
+    it.each(["release", "pause"])("does not revive a permission after %s during the second attempt", async (change) => {
+      const {source, fetch, request, handle} = await prepared();
+      fetch.mockResolvedValueOnce(grant(request));
+      const payload = await source.getPayload(handle, signal);
+      const response = defer<ReturnType<typeof grant>>();
+      const secondStarted = defer<void>();
+      fetch.mockRejectedValueOnce(transportError("UND_ERR_SOCKET")).mockImplementationOnce(() => {
+        secondStarted.resolve();
+        return response.promise;
+      });
+      const renewing = source.renewOffer(payload, signal);
+      await secondStarted.promise;
+      if (change === "release") {
+        fetch.mockResolvedValueOnce(true);
+        await source.releaseOffer(payload, signal);
+      } else {
+        const eligibility = payload.offerEligibility;
+        const retained = eligibility?.retained;
+        if (!eligibility || !retained) throw Error("Missing grant");
+        retained.paused = true;
+        retained.pauseEpoch = 1;
+        eligibility.lease.ready = false;
+      }
+      response.resolve(grant(request));
+      expect(await renewing).toBe(false);
+      expect(payload.offerEligibility?.lease.ready).toBe(false);
     });
 
     it("does not resurrect a released permission when an earlier renewal completes", async () => {
