@@ -1,6 +1,6 @@
 // Profiles actual Lodestar decoding/signing/durable retention of captured
 // isolated native-control fixtures. No live endpoint, execution or KZG claim.
-// node scripts/qualification/native-handoff.mjs LODESTAR_ROOT CAPTURE_ROOT OUTPUT_JSON
+// node scripts/qualification/native-handoff.mjs LODESTAR_ROOT CAPTURE_ROOT OUTPUT_JSON [WORK_PARENT]
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -10,7 +10,8 @@ import {Worker} from 'node:worker_threads';
 import {pathToFileURL} from 'node:url';
 import {setTimeout as delay} from 'node:timers/promises';
 
-const [root, captures, output] = process.argv.slice(2).map(p => path.resolve(p));
+assert(process.argv.length === 5 || process.argv.length === 6, 'expected LODESTAR_ROOT CAPTURE_ROOT OUTPUT_JSON [WORK_PARENT]');
+const [root, captures, output, workParent = os.tmpdir()] = process.argv.slice(2).map(p => path.resolve(p));
 const load = p => import(pathToFileURL(path.join(root, p)));
 const {ssz} = await load('packages/types/lib/index.js');
 const {SessionPayloadSource} = await load('packages/cli/lib/cmds/builder/sessionPayloadSource.js');
@@ -24,13 +25,16 @@ const {BidStore} = await load('packages/builder/lib/services/bidStore.js');
 const {BidLedger} = await load('packages/builder/lib/services/bidLedger.js');
 const {createBeaconConfig} = await load('packages/config/lib/index.js');
 const {getConfig} = await load('packages/config/lib/testUtils/index.js');
-const {SecretKey} = await load('bindings/src/blst.js');
+const {SecretKey, Signature, verify} = await load('bindings/src/blst.js');
+const {getExecutionPayloadBidSigningRoot} = await load('packages/state-transition/lib/index.js');
 const hex = bytes => `0x${Buffer.from(bytes).toString('hex')}`;
 const secretKey = SecretKey.fromBytes(Buffer.alloc(32, 1)); // Public fixture key only.
 const genesis = Buffer.alloc(32, 9);
-const signer = new BuilderSigner(createBeaconConfig(getConfig('gloas'), genesis), {secretKey, publicKey: secretKey.toPublicKey()});
+const beaconConfig = createBeaconConfig(getConfig('gloas'), genesis);
+const signer = new BuilderSigner(beaconConfig, {secretKey, publicKey: secretKey.toPublicKey()});
 const identity = {genesisValidatorsRoot: hex(genesis), pubkey: signer.getPubkeyHex()};
-const work = fs.mkdtempSync(path.join(os.tmpdir(), 'native-handoff-profile-'));
+const work = fs.mkdtempSync(path.join(workParent, 'native-handoff-profile-'));
+const filesystemType = `0x${fs.statfsSync(work).type.toString(16)}`;
 const summary = values => {
   const s = [...values].sort((a, b) => a - b);
   return {n: s.length, p50: s[Math.ceil(s.length * .5) - 1], p90: s[Math.ceil(s.length * .9) - 1], p95: s[Math.ceil(s.length * .95) - 1], max: s.at(-1)};
@@ -72,6 +76,7 @@ try {
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
       const rpc = new JsonRpcHttpClient([`http://127.0.0.1:${server.address().port}`]);
       const rows = [];
+      const expectedBids = [];
       const txs = ssz.gloas.ExecutionPayload.serialize(ep);
       const blobs = ssz.gloas.BlobsBundle.serialize(parsed.blobsBundle);
       const requests = ssz.gloas.ExecutionRequests.serialize(parsed.executionRequests);
@@ -108,20 +113,34 @@ try {
           started = performance.now();
           const signed = signer.signExecutionPayloadBid(bid);
           const signingMs = performance.now() - started;
+          expectedBids.push(signed);
+          const expectedPayload = ssz.gloas.ExecutionPayload.serialize(storedPayload.executionPayload);
+          replyProfile = undefined;
           started = performance.now();
-          await journal.retain(signed, stored);
+          const retention = journal.retain(signed, stored);
+          const retainSynchronousMs = performance.now() - started;
+          await retention;
           const retainRoundtripMs = performance.now() - started;
+          assert(replyProfile && Number.isFinite(replyProfile.retainMs), 'missing worker retention timing');
+          assert(replyProfile.fsyncSyncCalls > 0 && replyProfile.writeFileSyncCalls > 0 && replyProfile.renameSyncCalls > 0,
+            'missing worker write/rename/fsync instrumentation');
+          assert.deepEqual(ssz.gloas.ExecutionPayload.serialize(storedPayload.executionPayload), expectedPayload);
+          assert.deepEqual(ssz.gloas.BlobsBundle.serialize(storedPayload.blobsBundle), blobs);
           rows.push({iteration: i, warmup: i < 4, jsonParseMs, validateDecodeMs, loopbackHttpJsonMs,
-            sszDecodeMs, signingMs, retainRoundtripMs, worker: replyProfile});
+            sszDecodeMs, signingMs, retainSynchronousMs, retainRoundtripMs, worker: replyProfile});
           await delay(1);
         }
       } finally {
-        await journal.close();
+        // Terminate immediately after acknowledgement, without graceful close.
+        // Recovery must not depend on a shutdown flush. This is not power-loss testing.
+        await worker.terminate();
         server.closeAllConnections();
         await new Promise(resolve => server.close(resolve));
       }
       const payloads = new PayloadStore(), bids = new BidStore(), ledger = new BidLedger();
       assert.equal(new CommitmentJournal(directory, identity).recover(ep.slotNumber, payloads, bids, ledger), rows.length);
+      assert.equal(ledger.getRevisionCount(ep.slotNumber), rows.length);
+      const recoveredLedger = ledger.getBidsForSlot(ep.slotNumber);
       for (let i = 0; i < rows.length; i++) {
         const hash = Buffer.alloc(32); hash.writeUInt32BE(i + 1, 28);
         const restored = payloads.get(hex(hash)).payload;
@@ -131,7 +150,18 @@ try {
         assert.equal(restored.executionPayloadValue, parsed.executionPayloadValue);
         assert(ssz.gloas.BlobsBundle.equals(restored.blobsBundle, parsed.blobsBundle));
         assert.deepEqual(Array.from(restored.executionPayload.transactions), Array.from(ep.transactions));
+        const signed = expectedBids[i];
+        assert(bids.has(signed)); // BidStore hashes the complete signed-bid SSZ, including the signature.
+        assert(verify(getExecutionPayloadBidSigningRoot(beaconConfig, signed.message),
+          secretKey.toPublicKey(), Signature.fromBytes(signed.signature, true)));
+        const signedBidRoot = hex(ssz.gloas.SignedExecutionPayloadBid.hashTreeRoot(signed));
+        assert.deepEqual(recoveredLedger.find(record => record.signedBidRoot === signedBidRoot), {
+          slot: signed.message.slot, parentBlockHash: hex(signed.message.parentBlockHash),
+          parentBlockRoot: hex(signed.message.parentBlockRoot), blockHash: hex(signed.message.blockHash),
+          signedBidRoot, valueGwei: signed.message.value, wonBlockRoots: [],
+        });
       }
+      await journal.close(); // The worker is already dead; release wrapper state only.
       trials.push({round, blobs: count, jsonBytes: Buffer.byteLength(body), componentSszBytes: txs.length + blobs.length + requests.length,
         transactions: Array.from(ep.transactions).length, recovery: 'full execution payload SSZ, execution requests, value, transactions and ordered sidecars recovered exactly', rows});
       fs.rmSync(directory, {recursive: true});
@@ -139,12 +169,12 @@ try {
   }
   const totals = Object.fromEntries([0, 12, 21].map(count => {
     const rows = trials.filter(t => t.blobs === count).flatMap(t => t.rows.filter(r => !r.warmup));
-    const fields = ['jsonParseMs', 'validateDecodeMs', 'loopbackHttpJsonMs', 'sszDecodeMs', 'signingMs', 'retainRoundtripMs'];
+      const fields = ['jsonParseMs', 'validateDecodeMs', 'loopbackHttpJsonMs', 'sszDecodeMs', 'signingMs', 'retainSynchronousMs', 'retainRoundtripMs'];
     return [count, {...Object.fromEntries(fields.map(k => [k, summary(rows.map(r => r[k]))])),
       workerRetainMs: summary(rows.map(r => r.worker.retainMs)),
-      workerFsyncMs: summary(rows.map(r => r.worker.fsyncSync ?? 0))}];
+      workerFsyncMs: summary(rows.map(r => r.worker.fsyncSync))}];
   }));
-  fs.writeFileSync(output, JSON.stringify({at: new Date().toISOString(), node: process.version, root,
+  fs.writeFileSync(output, JSON.stringify({at: new Date().toISOString(), node: process.version, root, workParent, filesystemType,
     scope: 'isolated component qualification, actual Lodestar code; synthetic zero-polynomial captured fixtures; stable sidecars across revisions; no native encoder or live queue wait included',
     totals, trials}, null, 2) + '\n');
   console.log(JSON.stringify(totals, null, 2));

@@ -242,7 +242,7 @@ export class AsyncCommitmentJournal {
                 transactions:
                   transactionBytes.byteLength === transactionBytes.buffer.byteLength
                     ? transactionBytes
-                    : transactionBytes.slice(),
+                    : new Uint8Array(transactionBytes),
               },
             },
           },
