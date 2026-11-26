@@ -172,6 +172,8 @@ export class CommitmentJournal {
 
   retain(signedBid: gloas.SignedExecutionPayloadBid, stored: StoredPayload): DurablePayload | undefined {
     const {slot, blockHash, parentBlockRoot, payload} = stored;
+    if (typeof payload.executionPayload.transactions[Symbol.iterator] !== "function")
+      throw Error("COMMITMENT_TRANSACTION_LIST");
     const orderMetadata = parseOrderMetadata(payload.orderMetadata);
     if (!isOrderOfferAllowed(orderMetadata)) throw Error("ORDER_OFFER_TOO_EARLY");
     if (

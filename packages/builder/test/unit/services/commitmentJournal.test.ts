@@ -61,6 +61,16 @@ afterEach(() => {
 });
 
 describe("CommitmentJournal", () => {
+  it("rejects an unrestored structured clone before writing an incomplete payload", () => {
+    const {directory, journal} = setup();
+    const original = revision(1);
+    original.stored.payload.executionPayload.transactions = SerializedList.fromArray([Uint8Array.of(2, 1, 7)]);
+    const clone = structuredClone(original.stored);
+    expect(() => journal.retain(original.signed, clone)).toThrow("COMMITMENT_TRANSACTION_LIST");
+    expect(fs.readdirSync(directory)).toEqual(["identity.json"]);
+    expect(Array.from(original.stored.payload.executionPayload.transactions)).toEqual([Uint8Array.of(2, 1, 7)]);
+  });
+
   it.each(["requests", "parent", "payload hash", "payload slot"])(
     "rejects an unrevealable %s binding before acknowledging a commitment",
     (field) => {

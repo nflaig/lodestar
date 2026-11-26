@@ -33,7 +33,7 @@ class Thread extends EventEmitter {
     threads.push(this);
   }
   postMessage(request: JournalRequest): void {
-    this.pending.push(request);
+    this.pending.push(structuredClone(request));
   }
   finish(): void {
     const request = this.pending.shift();
@@ -41,7 +41,21 @@ class Thread extends EventEmitter {
     const reply: JournalReply = {id: request.id};
     try {
       const operation = request.operation;
-      if (operation.kind === "retain") reply.reference = this.journal.retain(operation.bid, operation.stored);
+      if (operation.kind === "retain") {
+        const stored = operation.stored;
+        reply.reference = this.journal.retain(operation.bid, {
+          ...stored,
+          payload: {
+            ...stored.payload,
+            executionPayload: {
+              ...stored.payload.executionPayload,
+              transactions: ssz.gloas.ExecutionPayload.fields.transactions.deserialize(
+                stored.payload.executionPayload.transactions
+              ),
+            },
+          },
+        });
+      }
       if (operation.kind === "retainReference") this.journal.retainReference(operation.bid, operation.reference);
       if (operation.kind === "prune") this.journal.prune(operation.slot);
       if (operation.kind === "reveal") this.journal.retainReveal(operation.record);
