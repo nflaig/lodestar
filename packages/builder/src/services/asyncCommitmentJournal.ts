@@ -228,22 +228,26 @@ export class AsyncCommitmentJournal {
     try {
       // Structured clone drops SerializedList's iterator and length getter.
       // Send its canonical SSZ bytes; the worker validates and restores it.
-      const message: JournalRequest["operation"] =
-        operation.kind === "retain"
-          ? {
-              ...operation,
-              stored: {
-                ...operation.stored,
-                payload: {
-                  ...operation.stored.payload,
-                  executionPayload: {
-                    ...operation.stored.payload.executionPayload,
-                    transactions: operation.stored.payload.executionPayload.transactions.bytes,
-                  },
-                },
+      let message: JournalRequest["operation"];
+      if (operation.kind === "retain") {
+        const transactionBytes = operation.stored.payload.executionPayload.transactions.bytes;
+        message = {
+          ...operation,
+          stored: {
+            ...operation.stored,
+            payload: {
+              ...operation.stored.payload,
+              executionPayload: {
+                ...operation.stored.payload.executionPayload,
+                transactions:
+                  transactionBytes.byteLength === transactionBytes.buffer.byteLength
+                    ? transactionBytes
+                    : transactionBytes.slice(),
               },
-            }
-          : operation;
+            },
+          },
+        };
+      } else message = operation;
       // Clone, never transfer: old snapshots must remain available for reveal.
       this.worker.postMessage({id, operation: message} satisfies JournalRequest);
     } catch (error) {

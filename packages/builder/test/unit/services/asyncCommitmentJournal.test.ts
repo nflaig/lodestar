@@ -39,7 +39,12 @@ describe("AsyncCommitmentJournal", () => {
   it("preserves nonempty transactions across the structured-clone worker boundary", async () => {
     const {thread, journal, bid, stored} = setup();
     const transactions = [Uint8Array.of(2, 1, 7), new Uint8Array(65537).fill(0x42), Uint8Array.of(3, 9)];
-    const original = SerializedList.fromArray(transactions);
+    const canonical = SerializedList.fromArray(transactions);
+    const backing = new Uint8Array(canonical.bytes.length + 1024).fill(0xa5);
+    backing.set(canonical.bytes, 512);
+    const original = ssz.gloas.ExecutionPayload.fields.transactions.deserialize(
+      backing.subarray(512, 512 + canonical.bytes.length)
+    );
     stored.payload.executionPayload.transactions = original;
     const retained = journal.retain(bid, stored);
     const request = structuredClone(thread.sent[0]);
@@ -47,6 +52,7 @@ describe("AsyncCommitmentJournal", () => {
     const serialized = request.operation.stored.payload.executionPayload.transactions;
     expect(serialized).toBeInstanceOf(Uint8Array);
     expect(serialized).toEqual(original.bytes);
+    expect(serialized.byteLength).toBe(serialized.buffer.byteLength);
     expect(ssz.gloas.ExecutionPayload.fields.transactions.deserialize(serialized).toArray()).toEqual(transactions);
     expect(stored.payload.executionPayload.transactions).toBe(original);
     expect(original.toArray()).toEqual(transactions);
@@ -89,7 +95,20 @@ describe("AsyncCommitmentJournal", () => {
     const offer = journal.retainShared(bid, stored, reference);
     thread.finish("COMMITMENT_REFERENCE_UNAVAILABLE");
     await Promise.resolve();
-    expect(thread.sent.at(-1)?.operation).toMatchObject({kind: "retain", bid});
+    expect(thread.sent.at(-1)?.operation).toEqual({
+      kind: "retain",
+      bid,
+      stored: {
+        ...stored,
+        payload: {
+          ...stored.payload,
+          executionPayload: {
+            ...stored.payload.executionPayload,
+            transactions: stored.payload.executionPayload.transactions.bytes,
+          },
+        },
+      },
+    });
     thread.finish();
     expect(await offer).toBe("snapshot");
     const retained = journal.retainShared(bid, stored, reference);

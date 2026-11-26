@@ -414,6 +414,7 @@ export class CommitmentJournal {
       if (!name.startsWith("payload-")) continue;
       const record = this.read(name) as PayloadRecord;
       const payload = ssz.gloas.ExecutionPayload.fromJson(record.payload);
+      if (payload.gasUsed > 0 && payload.transactions.length === 0) throw Error("COMMITMENT_EMPTY_TRANSACTIONS");
       if (
         name !== `payload-${record.slot}-${record.blockHash}.json` ||
         record.slot !== payload.slotNumber ||
