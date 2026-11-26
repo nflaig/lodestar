@@ -1,4 +1,5 @@
 import {parentPort, workerData} from "node:worker_threads";
+import {ssz} from "@lodestar/types";
 import type {JournalReply, JournalRequest, JournalWorkerData} from "./asyncCommitmentJournal.js";
 import {CommitmentJournal, type DurablePayload} from "./commitmentJournal.js";
 import type {JournalExposure} from "./orderExposure.js";
@@ -14,7 +15,18 @@ port.on("message", ({id, operation}: JournalRequest) => {
   try {
     switch (operation.kind) {
       case "retain":
-        reference = journal.retain(operation.bid, operation.stored);
+        reference = journal.retain(operation.bid, {
+          ...operation.stored,
+          payload: {
+            ...operation.stored.payload,
+            executionPayload: {
+              ...operation.stored.payload.executionPayload,
+              transactions: ssz.gloas.ExecutionPayload.fields.transactions.deserialize(
+                operation.stored.payload.executionPayload.transactions
+              ),
+            },
+          },
+        });
         break;
       case "retainReference":
         journal.retainReference(operation.bid, operation.reference);

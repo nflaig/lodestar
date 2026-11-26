@@ -48,6 +48,7 @@ it("accounts for partial blob links at capacity and preserves reveal headroom", 
   stage.retain(previousRevision, stored);
   const next = structuredClone(previous),
     nextStored = structuredClone(stored);
+  nextStored.payload.executionPayload = ssz.gloas.ExecutionPayload.clone(stored.payload.executionPayload);
   next.message.blockHash = Buffer.alloc(32, 3);
   nextStored.payload.executionPayload.blockHash = next.message.blockHash;
   nextStored.blockHash = toRootHex(next.message.blockHash);

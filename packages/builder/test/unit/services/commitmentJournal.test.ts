@@ -61,6 +61,31 @@ afterEach(() => {
 });
 
 describe("CommitmentJournal", () => {
+  it("fails closed on a live checksum-valid payload missing transactions and prunes it after expiry", () => {
+    const {directory, journal} = setup();
+    const original = revision(1);
+    original.stored.payload.executionPayload.gasUsed = 21000;
+    original.stored.payload.executionPayload.transactions = SerializedList.fromArray([Uint8Array.of(2, 1, 7)]);
+    journal.retain(original.signed, original.stored);
+    const filename = path.join(directory, `payload-${slot}-${original.stored.blockHash}.json`);
+    const {data} = JSON.parse(fs.readFileSync(filename, "utf8"));
+    data.payload.transactions = [];
+    const checksum = createHash("sha256").update(JSON.stringify(data)).digest("hex");
+    fs.writeFileSync(filename, JSON.stringify({data, checksum}));
+    expect(() => recover(directory)).toThrow("COMMITMENT_EMPTY_TRANSACTIONS");
+    expect(recover(directory, slot + 3).payloads.size).toBe(0);
+  });
+
+  it("rejects an unrestored structured clone before writing an incomplete payload", () => {
+    const {directory, journal} = setup();
+    const original = revision(1);
+    original.stored.payload.executionPayload.transactions = SerializedList.fromArray([Uint8Array.of(2, 1, 7)]);
+    const clone = structuredClone(original.stored);
+    expect(() => journal.retain(original.signed, clone)).toThrow("COMMITMENT_TRANSACTION_LIST");
+    expect(fs.readdirSync(directory)).toEqual(["identity.json"]);
+    expect(Array.from(original.stored.payload.executionPayload.transactions)).toEqual([Uint8Array.of(2, 1, 7)]);
+  });
+
   it.each(["requests", "parent", "payload hash", "payload slot"])(
     "rejects an unrevealable %s binding before acknowledging a commitment",
     (field) => {

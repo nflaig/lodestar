@@ -1,5 +1,6 @@
 import {EventEmitter} from "node:events";
 import {describe, expect, it, vi} from "vitest";
+import {SerializedList} from "@chainsafe/ssz";
 import {ssz} from "@lodestar/types";
 import {toRootHex} from "@lodestar/utils";
 import {AsyncCommitmentJournal, type JournalRequest} from "../../../src/services/asyncCommitmentJournal.js";
@@ -35,6 +36,38 @@ function setup() {
 }
 
 describe("AsyncCommitmentJournal", () => {
+  it.each(["Uint8Array", "Buffer"])(
+    "preserves %s-backed transactions across the structured-clone worker boundary",
+    async (kind) => {
+      const {thread, journal, bid, stored} = setup();
+      const transactions = [Uint8Array.of(2, 1, 7), new Uint8Array(65537).fill(0x42), Uint8Array.of(3, 9)];
+      const canonical = SerializedList.fromArray(transactions);
+      const backing = (
+        kind === "Buffer" ? Buffer.alloc(canonical.bytes.length + 1024) : new Uint8Array(canonical.bytes.length + 1024)
+      ).fill(0xa5);
+      backing.set(canonical.bytes, 512);
+      // Deserialization currently copies. Construct the equivalent canonical
+      // list explicitly so this fixture exercises an oversized borrowed view.
+      const original = new SerializedList(backing.subarray(512, 512 + canonical.bytes.length), canonical.offsets);
+      expect(original.bytes.buffer.byteLength).toBeGreaterThan(original.bytes.byteLength);
+      expect(Buffer.isBuffer(original.bytes)).toBe(kind === "Buffer");
+      stored.payload.executionPayload.transactions = original;
+      const retained = journal.retain(bid, stored);
+      const request = structuredClone(thread.sent[0]);
+      if (request.operation.kind !== "retain") throw Error("Expected retained payload");
+      const serialized = request.operation.stored.payload.executionPayload.transactions;
+      expect(serialized).toBeInstanceOf(Uint8Array);
+      expect(serialized).toEqual(new Uint8Array(original.bytes));
+      expect(serialized.byteLength).toBe(serialized.buffer.byteLength);
+      expect(ssz.gloas.ExecutionPayload.fields.transactions.deserialize(serialized).toArray()).toEqual(transactions);
+      expect(stored.payload.executionPayload.transactions).toBe(original);
+      expect(Array.from(original, (transaction) => new Uint8Array(transaction))).toEqual(transactions);
+      thread.finish();
+      await retained;
+      await journal.close();
+    }
+  );
+
   it("admits alternate retention only while the initialized journal is idle", async () => {
     const thread = new Thread();
     const journal = new AsyncCommitmentJournal(thread);
@@ -69,7 +102,20 @@ describe("AsyncCommitmentJournal", () => {
     const offer = journal.retainShared(bid, stored, reference);
     thread.finish("COMMITMENT_REFERENCE_UNAVAILABLE");
     await Promise.resolve();
-    expect(thread.sent.at(-1)?.operation).toEqual({kind: "retain", bid, stored});
+    expect(thread.sent.at(-1)?.operation).toEqual({
+      kind: "retain",
+      bid,
+      stored: {
+        ...stored,
+        payload: {
+          ...stored.payload,
+          executionPayload: {
+            ...stored.payload.executionPayload,
+            transactions: stored.payload.executionPayload.transactions.bytes,
+          },
+        },
+      },
+    });
     thread.finish();
     expect(await offer).toBe("snapshot");
     const retained = journal.retainShared(bid, stored, reference);

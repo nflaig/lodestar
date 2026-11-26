@@ -172,6 +172,8 @@ export class CommitmentJournal {
 
   retain(signedBid: gloas.SignedExecutionPayloadBid, stored: StoredPayload): DurablePayload | undefined {
     const {slot, blockHash, parentBlockRoot, payload} = stored;
+    if (typeof payload.executionPayload.transactions[Symbol.iterator] !== "function")
+      throw Error("COMMITMENT_TRANSACTION_LIST");
     const orderMetadata = parseOrderMetadata(payload.orderMetadata);
     if (!isOrderOfferAllowed(orderMetadata)) throw Error("ORDER_OFFER_TOO_EARLY");
     if (
@@ -412,6 +414,7 @@ export class CommitmentJournal {
       if (!name.startsWith("payload-")) continue;
       const record = this.read(name) as PayloadRecord;
       const payload = ssz.gloas.ExecutionPayload.fromJson(record.payload);
+      if (payload.gasUsed > 0 && payload.transactions.length === 0) throw Error("COMMITMENT_EMPTY_TRANSACTIONS");
       if (
         name !== `payload-${record.slot}-${record.blockHash}.json` ||
         record.slot !== payload.slotNumber ||

@@ -14,7 +14,17 @@ export type JournalOperation =
   | {kind: "reveal"; record: RevealRecord}
   | {kind: "prune"; slot: number}
   | {kind: "exposure"; orderId: string; admittedAtUnixMs: number};
-export type JournalRequest = {id: number; operation: JournalOperation};
+type JournalStoredPayload = Omit<StoredPayload, "payload"> & {
+  payload: Omit<BuiltPayload, "executionPayload"> & {
+    executionPayload: Omit<BuiltPayload["executionPayload"], "transactions"> & {transactions: Uint8Array};
+  };
+};
+export type JournalRequest = {
+  id: number;
+  operation:
+    | Exclude<JournalOperation, {kind: "retain"}>
+    | {kind: "retain"; bid: gloas.SignedExecutionPayloadBid; stored: JournalStoredPayload};
+};
 export type JournalReply = {
   id: number;
   error?: string;
@@ -37,7 +47,9 @@ const MAX_PENDING_OPERATIONS = 16;
 const OPERATION_TIMEOUT = 10_000;
 const STARTUP_TIMEOUT = 30_000;
 
-type Pending = JournalRequest & {
+type Pending = {
+  id: number;
+  operation: JournalOperation;
   bytes: number;
   result: ReturnType<typeof defer<JournalExposure | undefined>>;
   timedOut?: boolean;
@@ -214,8 +226,30 @@ export class AsyncCommitmentJournal {
       }
     }, OPERATION_TIMEOUT);
     try {
+      // Structured clone drops SerializedList's iterator and length getter.
+      // Send its canonical SSZ bytes; the worker validates and restores it.
+      let message: JournalRequest["operation"];
+      if (operation.kind === "retain") {
+        const transactionBytes = operation.stored.payload.executionPayload.transactions.bytes;
+        message = {
+          ...operation,
+          stored: {
+            ...operation.stored,
+            payload: {
+              ...operation.stored.payload,
+              executionPayload: {
+                ...operation.stored.payload.executionPayload,
+                transactions:
+                  transactionBytes.byteLength === transactionBytes.buffer.byteLength
+                    ? transactionBytes
+                    : new Uint8Array(transactionBytes),
+              },
+            },
+          },
+        };
+      } else message = operation;
       // Clone, never transfer: old snapshots must remain available for reveal.
-      this.worker.postMessage({id, operation} satisfies JournalRequest);
+      this.worker.postMessage({id, operation: message} satisfies JournalRequest);
     } catch (error) {
       this.fail(error instanceof Error ? error : Error(String(error)));
     }
