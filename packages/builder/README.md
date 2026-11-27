@@ -630,9 +630,11 @@ choosing a schedule. A stage at or after the boundary may miss an early proposer
 There is one construction session. Each extra stage uses the latest durable primary
 snapshot, computes a bid under its own balance and unsettled liabilities, and signs
 with its own identity. The configured pricing policy applies to every identity.
-A later stage must exceed the largest previously attempted value by Lodestar's gossip
-increment: 3%, with a 100,000 gwei floor and 10,000,000 gwei cap. Competitors may already
-have a higher bid. API requests continue to return revisions signed by the primary.
+A later stage must exceed the largest previously attempted value for the same slot
+and parents by at least 1 Gwei after pricing and collateral limits. Each identity
+still gets at most one gossip attempt per slot and parents. Competitors may already
+have a higher bid, and peers running older gossip rules may ignore small increases.
+API requests continue to return revisions signed by the primary.
 If the primary's balance caps its API revisions, this also limits the staged snapshot
 feed, even if an additional identity has more balance.
 
