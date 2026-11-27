@@ -40,10 +40,9 @@ export function validateGossipStages(
   }
 }
 
-/** Match Lodestar's gossip forwarding floor; peers may already have a higher competing bid. */
+/** Each staged identity gets one attempt, with a strictly higher integer-Gwei bid. */
 export function getMinGossipBidValue(previous: number): number {
-  const increment = Math.min(Math.max(100_000, Math.floor(previous / 10_000) * 300), 10_000_000);
-  return previous + increment;
+  return previous + 1;
 }
 
 export function gossipJournalDirectory(commitmentDir: string): string {
