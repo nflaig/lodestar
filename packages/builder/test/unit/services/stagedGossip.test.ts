@@ -395,6 +395,15 @@ describe("staged P2P gossip", () => {
       expect(primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot))?.message.value).toBe(
         published()[0].message.value
       );
+      expect(logger.info).toHaveBeenCalledWith(
+        "Skipped staged execution payload bid",
+        expect.objectContaining({
+          builderIndex: 2,
+          reason: "below_gossip_minimum",
+          computedValueGwei: 900_000_000,
+          minimumValueGwei: 900_000_001,
+        })
+      );
     }
   );
 
@@ -503,13 +512,20 @@ describe("staged P2P gossip", () => {
     }
 
     it("uses exact integer values and wakes once at the floor, not one Gwei below", async () => {
-      source.getPayload.mockImplementation(async () =>
-        Date.now() >= 12100 ? payload(3, 1_000_000_002) : Date.now() >= 12050 ? payload(2, 1_000_000_001) : payload(1)
-      );
+      const fetchedAt: number[] = [];
+      source.getPayload.mockImplementation(async () => {
+        fetchedAt.push(Date.now());
+        return Date.now() >= 12100
+          ? payload(3, 1_000_000_002)
+          : Date.now() >= 12050
+            ? payload(2, 1_000_000_001)
+            : payload(1);
+      });
       const {second, primary} = setup();
       const sign = vi.spyOn(second.signer, "signExecutionPayloadBid");
       const building = primary.bidder.onPayloadAttributes(event());
       await vi.advanceTimersByTimeAsync(12075);
+      expect(fetchedAt).toContain(12050);
       expect(primary.bidStore.get(slot, toRootHex(parentHash), toRootHex(parentRoot))?.message.value).toBe(900_000_000);
       expect(sign).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(25);
